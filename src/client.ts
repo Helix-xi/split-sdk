@@ -238,6 +238,15 @@ import {
   WrongMilestoneError,
   NothingToClaimError,
 } from "./errors.js";
+import {
+  InvoiceModule,
+  PaymentModule,
+  DisputeModule,
+  AdminModule,
+  GroupModule,
+  TemplateModule,
+  MilestoneModule,
+} from "./client/modules/index.js";
 import { hashInvoice, verifyInvoiceHash } from "./invoiceHashVerifier.js";
 import { buildFeeBump } from "./feeBumpBuilder.js";
 import type { FeeBumpConfig } from "./feeBumpBuilder.js";
@@ -670,6 +679,21 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   private _queue = new PriorityQueue();
   private contract: Contract;
   private config: StellarSplitClientConfig;
+
+  /** Modular sub-client for invoice operations (#1079). */
+  readonly invoices: InvoiceModule;
+  /** Modular sub-client for payment operations (#1079). */
+  readonly payments: PaymentModule;
+  /** Modular sub-client for dispute and arbitration operations (#1079). */
+  readonly disputes: DisputeModule;
+  /** Modular sub-client for admin operations (#1079). */
+  readonly admin: AdminModule;
+  /** Modular sub-client for invoice grouping operations (#1079). */
+  readonly groups: GroupModule;
+  /** Modular sub-client for template and recurring invoice operations (#1079). */
+  readonly templates: TemplateModule;
+  /** Modular sub-client for milestone and funding round operations (#1079). */
+  readonly milestones: MilestoneModule;
   private _plugins = new Set<string>();
   private _pluginInstances: StellarSplitPlugin[] = [];
   private _pluginRegistry = new PluginRegistry();
@@ -1264,6 +1288,15 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       on: (event, handler) => this.on(event as keyof SplitClientEventMap, handler as never),
       off: (event, handler) => this.off(event as keyof SplitClientEventMap, handler as never),
     });
+
+    // Initialize logical modules (#1079)
+    this.invoices = new InvoiceModule(this);
+    this.payments = new PaymentModule(this);
+    this.disputes = new DisputeModule(this);
+    this.admin = new AdminModule(this);
+    this.groups = new GroupModule(this);
+    this.templates = new TemplateModule(this);
+    this.milestones = new MilestoneModule(this);
   }
 
   /**
@@ -11416,3 +11449,8 @@ function toBigInt(value: unknown): bigint {
   if (typeof value === "string" && value !== "") return BigInt(value);
   return 0n;
 }
+
+// ---------------------------------------------------------------------------
+// Client modules (issue #1079)
+// ---------------------------------------------------------------------------
+export * from "./client/modules/index.js";
