@@ -162,6 +162,8 @@ export class OptimisticCache<T = unknown> {
   /** Per-invoice FIFO queue of pending (uncommitted, unrolled-back) predictions. */
   private readonly pending = new Map<string, OptimisticEntry<T>[]>();
   private readonly rollbackHandlers = new Set<(event: RollbackEvent<T>) => void>();
+  private readonly eventHandlers = new Set<(event: CacheEvent<T>) => void>();
+  private readonly expiries = new Map<string, number>();
   private readonly versionCounters = new Map<string, number>();
   /** Freshness bookkeeping for values written through read()/set(). */
   private readonly freshness = new Map<string, FreshnessEntry<T>>();
