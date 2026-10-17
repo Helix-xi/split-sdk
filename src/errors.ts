@@ -2356,3 +2356,186 @@ export function isBatchTooLargeError(err: unknown): err is BatchTooLargeError {
   return err instanceof BatchTooLargeError;
 }
 
+// ---------------------------------------------------------------------------
+// Invoice versioning errors (#1056)
+// ---------------------------------------------------------------------------
+
+/** Thrown when a requested invoice version does not exist. */
+export class InvoiceVersionNotFoundError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly version: number;
+
+  constructor(invoiceId: string, version: number) {
+    super(
+      `Version ${version} not found for invoice "${invoiceId}"`,
+      "INVOICE_VERSION_NOT_FOUND",
+      { invoiceId, version },
+    );
+    this.name = "InvoiceVersionNotFoundError";
+    this.invoiceId = invoiceId;
+    this.version = version;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isInvoiceVersionNotFoundError(err: unknown): err is InvoiceVersionNotFoundError {
+  return err instanceof InvoiceVersionNotFoundError;
+}
+
+/** Thrown when an invoice rollback operation fails safety checks. */
+export class UnsafeRollbackError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly targetVersion: number;
+  readonly reason: string;
+
+  constructor(invoiceId: string, targetVersion: number, reason: string) {
+    super(
+      `Cannot safely roll back invoice "${invoiceId}" to version ${targetVersion}: ${reason}`,
+      "UNSAFE_ROLLBACK",
+      { invoiceId, targetVersion, reason },
+    );
+    this.name = "UnsafeRollbackError";
+    this.invoiceId = invoiceId;
+    this.targetVersion = targetVersion;
+    this.reason = reason;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isUnsafeRollbackError(err: unknown): err is UnsafeRollbackError {
+  return err instanceof UnsafeRollbackError;
+}
+
+/** Thrown when an invalid version identifier or vector is encountered. */
+export class InvalidVersionError extends StellarSplitError {
+  readonly version: unknown;
+
+  constructor(message: string, version?: unknown) {
+    super(message, "INVALID_VERSION", { version });
+    this.name = "InvalidVersionError";
+    this.version = version;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isInvalidVersionError(err: unknown): err is InvalidVersionError {
+  return err instanceof InvalidVersionError;
+}
+
+// ---------------------------------------------------------------------------
+// Smart contract ABI cache errors (#1054)
+// ---------------------------------------------------------------------------
+
+/** Thrown when fetching a contract ABI fails. */
+export class AbiFetchError extends StellarSplitError {
+  readonly contractId: string;
+
+  constructor(contractId: string, cause?: unknown) {
+    const causeMsg = cause instanceof Error ? cause.message : String(cause ?? "Unknown error");
+    super(
+      `Failed to fetch ABI for contract "${contractId}": ${causeMsg}`,
+      "ABI_FETCH_FAILED",
+      { contractId, cause: causeMsg },
+    );
+    this.name = "AbiFetchError";
+    this.contractId = contractId;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isAbiFetchError(err: unknown): err is AbiFetchError {
+  return err instanceof AbiFetchError;
+}
+
+/** Thrown when an ABI cannot be found for a given contract. */
+export class AbiNotFoundError extends StellarSplitError {
+  readonly contractId: string;
+
+  constructor(contractId: string) {
+    super(
+      `No ABI found for contract "${contractId}"`,
+      "ABI_NOT_FOUND",
+      { contractId },
+    );
+    this.name = "AbiNotFoundError";
+    this.contractId = contractId;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isAbiNotFoundError(err: unknown): err is AbiNotFoundError {
+  return err instanceof AbiNotFoundError;
+}
+
+// ---------------------------------------------------------------------------
+// Invoice collaboration errors (#1053)
+// ---------------------------------------------------------------------------
+
+/** Base error for invoice collaboration workflows. */
+export class CollaborationError extends StellarSplitError {
+  constructor(message: string, code: string = "COLLABORATION_ERROR", context?: Record<string, unknown>) {
+    super(message, code, context);
+    this.name = "CollaborationError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isCollaborationError(err: unknown): err is CollaborationError {
+  return err instanceof CollaborationError;
+}
+
+/** Thrown when an invoice comment is not found. */
+export class CommentNotFoundError extends CollaborationError {
+  readonly commentId: string;
+
+  constructor(commentId: string) {
+    super(`Comment not found: ${commentId}`, "COMMENT_NOT_FOUND", { commentId });
+    this.name = "CommentNotFoundError";
+    this.commentId = commentId;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isCommentNotFoundError(err: unknown): err is CommentNotFoundError {
+  return err instanceof CommentNotFoundError;
+}
+
+/** Thrown when an approval request is not found. */
+export class ApprovalRequestNotFoundError extends CollaborationError {
+  readonly requestId: string;
+
+  constructor(requestId: string) {
+    super(`Approval request not found: ${requestId}`, "APPROVAL_REQUEST_NOT_FOUND", { requestId });
+    this.name = "ApprovalRequestNotFoundError";
+    this.requestId = requestId;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isApprovalRequestNotFoundError(err: unknown): err is ApprovalRequestNotFoundError {
+  return err instanceof ApprovalRequestNotFoundError;
+}
+
+/** Thrown when an actor is unauthorized to perform a collaboration action. */
+export class UnauthorizedCollaborationError extends CollaborationError {
+  readonly actor: string;
+  readonly action: string;
+
+  constructor(actor: string, action: string, reason?: string) {
+    super(
+      `Actor "${actor}" is not authorized to ${action}${reason ? `: ${reason}` : ""}`,
+      "UNAUTHORIZED_COLLABORATION",
+      { actor, action, reason },
+    );
+    this.name = "UnauthorizedCollaborationError";
+    this.actor = actor;
+    this.action = action;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isUnauthorizedCollaborationError(err: unknown): err is UnauthorizedCollaborationError {
+  return err instanceof UnauthorizedCollaborationError;
+}
+
+

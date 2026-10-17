@@ -237,6 +237,27 @@ export {
   // Batch operations errors (issue #855)
   BatchTooLargeError,
   isBatchTooLargeError,
+  // Invoice versioning errors (#1056)
+  InvoiceVersionNotFoundError,
+  isInvoiceVersionNotFoundError,
+  UnsafeRollbackError,
+  isUnsafeRollbackError,
+  InvalidVersionError,
+  isInvalidVersionError,
+  // Smart contract ABI cache errors (#1054)
+  AbiFetchError,
+  isAbiFetchError,
+  AbiNotFoundError,
+  isAbiNotFoundError,
+  // Invoice collaboration errors (#1053)
+  CollaborationError,
+  isCollaborationError,
+  CommentNotFoundError,
+  isCommentNotFoundError,
+  ApprovalRequestNotFoundError,
+  isApprovalRequestNotFoundError,
+  UnauthorizedCollaborationError,
+  isUnauthorizedCollaborationError,
 } from "./errors.js";
 
 // Invoice metadata JSON Schema validator (issue #533)
@@ -1714,3 +1735,84 @@ export type {
   RetirementManagerOptions,
   RetirementEventMap,
 } from "./invoiceRetirement.js";
+
+// ---------------------------------------------------------------------------
+// Invoice Versioning System (#1056)
+// ---------------------------------------------------------------------------
+export {
+  InvoiceVersionTracker,
+  InvoiceVersionManager,
+  InMemoryVersionStore,
+  computeChecksum,
+  detectVersionConflict,
+  ConflictError,
+} from "./invoiceVersioning.js";
+export type {
+  InvoiceVersion,
+  InvoiceVersionDiff,
+  VersionStore,
+  InvoiceVersionTrackerOptions,
+  RollbackOptions,
+  InvoiceRollbackResult,
+  ChangeLogEntry,
+  VersionVector,
+} from "./invoiceVersioning.js";
+
+// ---------------------------------------------------------------------------
+// Payment Analytics & Performance Engine (#1055)
+// ---------------------------------------------------------------------------
+export { PaymentAnalyticsEngine } from "./paymentAnalytics.js";
+export type {
+  PaymentAnalyticsFilter,
+  StatusDistribution,
+  TokenDistribution,
+  PaymentDistributionStats,
+  PaymentTimingMetrics,
+  PaymentAnalyticsSummary,
+  PayerAnalyticsRecord,
+  PayerCohortSummary,
+  TimeSeriesDataPoint,
+  InvoicePerformanceRecord,
+  PaymentAnalyticsReport,
+  StructuredChartData,
+} from "./paymentAnalytics.js";
+
+// ---------------------------------------------------------------------------
+// Smart Contract ABI Caching Layer (#1054)
+// ---------------------------------------------------------------------------
+export {
+  ContractAbiCache,
+  MemoryAbiStorage,
+  AdapterAbiStorage,
+  StaticContractAbiFetcher,
+  RpcContractAbiFetcher,
+} from "./abiCache.js";
+export type {
+  ContractAbi,
+  AbiFunctionSpec,
+  AbiParamSpec,
+  AbiTypeSpec,
+  CachedAbiEntry,
+  AbiCacheStats,
+  AbiStorage,
+  ContractAbiFetcher,
+  AbiCacheOptions,
+} from "./abiCache.js";
+
+// ---------------------------------------------------------------------------
+// Invoice Collaboration & Approvals (#1053)
+// ---------------------------------------------------------------------------
+export { InvoiceCollaborationManager } from "./invoiceCollaboration.js";
+export type {
+  InvoiceComment,
+  ThreadedComment,
+  ApprovalDecision,
+  ApprovalRequestStatus,
+  ApprovalRequest,
+  InvoiceApprovalSummary,
+  CollaborationNotificationType,
+  CollaborationNotification,
+  CollaborationNotificationHandler,
+  CollaborationEventMap,
+} from "./invoiceCollaboration.js";
+

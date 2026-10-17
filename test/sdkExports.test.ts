@@ -24,4 +24,36 @@ describe("public API surface (issues #586, #588, #589)", () => {
     expect(typeof sdk.WalletConnectionTimeoutError).toBe("function");
     expect(typeof sdk.isWalletConnectionTimeoutError).toBe("function");
   });
+
+  it("exports invoice versioning components (#1056)", () => {
+    expect(typeof sdk.InvoiceVersionTracker).toBe("function");
+    expect(typeof sdk.InvoiceVersionManager).toBe("function");
+    expect(typeof sdk.InMemoryVersionStore).toBe("function");
+    expect(typeof sdk.computeChecksum).toBe("function");
+    expect(typeof sdk.InvoiceVersionNotFoundError).toBe("function");
+    expect(typeof sdk.UnsafeRollbackError).toBe("function");
+    expect(typeof sdk.InvalidVersionError).toBe("function");
+  });
+
+  it("exports payment analytics components (#1055)", () => {
+    expect(typeof sdk.PaymentAnalyticsEngine).toBe("function");
+  });
+
+  it("exports smart contract ABI caching components (#1054)", () => {
+    expect(typeof sdk.ContractAbiCache).toBe("function");
+    expect(typeof sdk.MemoryAbiStorage).toBe("function");
+    expect(typeof sdk.AdapterAbiStorage).toBe("function");
+    expect(typeof sdk.StaticContractAbiFetcher).toBe("function");
+    expect(typeof sdk.RpcContractAbiFetcher).toBe("function");
+    expect(typeof sdk.AbiFetchError).toBe("function");
+    expect(typeof sdk.AbiNotFoundError).toBe("function");
+  });
+
+  it("exports invoice collaboration components (#1053)", () => {
+    expect(typeof sdk.InvoiceCollaborationManager).toBe("function");
+    expect(typeof sdk.CollaborationError).toBe("function");
+    expect(typeof sdk.CommentNotFoundError).toBe("function");
+    expect(typeof sdk.ApprovalRequestNotFoundError).toBe("function");
+    expect(typeof sdk.UnauthorizedCollaborationError).toBe("function");
+  });
 });
