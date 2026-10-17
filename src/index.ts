@@ -1714,3 +1714,88 @@ export type {
   RetirementManagerOptions,
   RetirementEventMap,
 } from "./invoiceRetirement.js";
+
+// Error Logging (#1069)
+export {
+  ErrorLogger,
+  MemoryLogStorage,
+  ConsoleLogStorage,
+  MultiLogStorage,
+  TextLogFormatter,
+  JsonLogFormatter,
+  LogLevelPriority,
+  isLogLevelEnabled,
+  parseLogLevel,
+  getDefaultErrorLogger,
+  setDefaultErrorLogger,
+  resetDefaultErrorLogger,
+  logError,
+} from "./errorLogger.js";
+export type {
+  LogLevel,
+  LogEntry,
+  LogFilter,
+  LogFormatter,
+  LogStorage,
+  ErrorLoggerOptions,
+} from "./errorLogger.js";
+
+// Breadcrumb Tracking (#1070)
+export {
+  BreadcrumbTracker,
+  RingBufferBreadcrumbStorage,
+  getDefaultBreadcrumbTracker,
+  setDefaultBreadcrumbTracker,
+  resetDefaultBreadcrumbTracker,
+  addBreadcrumb,
+  getBreadcrumbs,
+  clearBreadcrumbs,
+} from "./breadcrumbTracker.js";
+export type {
+  Breadcrumb,
+  BreadcrumbCategory,
+  BreadcrumbLevel,
+  BreadcrumbStorage,
+  BreadcrumbFilter,
+  BreadcrumbTrackerOptions,
+} from "./breadcrumbTracker.js";
+
+// Error Context (#1071)
+export {
+  ERROR_CONTEXT_SYMBOL,
+  sanitizeContext,
+  mergeContext,
+  attachErrorContext,
+  getErrorContext,
+  hasErrorContext,
+  serializeError,
+  serializeErrorContext,
+  ErrorContextBuilder,
+  createErrorContext,
+  withErrorContext,
+  wrapError,
+} from "./errorContext.js";
+export type {
+  ErrorContext,
+  SerializedError,
+} from "./errorContext.js";
+
+// Error Aggregation (#1072)
+export {
+  ErrorAggregator,
+  normalizeErrorMessage,
+  getDefaultErrorAggregator,
+  setDefaultErrorAggregator,
+  resetDefaultErrorAggregator,
+  aggregateError,
+} from "./errorAggregator.js";
+export type {
+  GroupingStrategyType,
+  CustomGroupingResolver,
+  ErrorGroupingStrategy,
+  AggregatedErrorGroup,
+  ErrorPattern,
+  ReportOptions,
+  ErrorAggregationReport,
+  ErrorAggregatorOptions,
+} from "./errorAggregator.js";
