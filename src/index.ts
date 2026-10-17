@@ -404,7 +404,7 @@ export { watchContractUpgrade } from "./upgrade.js";
 
 export { calculateFee } from "./fee.js";
 
-export { formatAddress } from "./utils.js";
+export { formatAddress, parseAmount, formatAmount } from "./utils.js";
 
 export { resolveToken } from "./token.js";
 
@@ -1714,3 +1714,50 @@ export type {
   RetirementManagerOptions,
   RetirementEventMap,
 } from "./invoiceRetirement.js";
+
+// Real-time invoice state subscription (#1034)
+export {
+  InvoiceStateSubscriber,
+  matchesFilter,
+} from "./invoiceStateSubscription.js";
+export type {
+  InvoiceStateUpdate,
+  InvoiceStateFilter,
+  InvoiceStateSubscriberConfig,
+  InvoiceStateSubscriptionHandle,
+  ReconnectConfig,
+} from "./invoiceStateSubscription.js";
+
+// Webhook client library (#1035)
+export {
+  WebhookClient,
+  WebhookError,
+  WebhookVerificationError,
+  WebhookTimestampError,
+  WebhookPayloadMalformedError,
+} from "./webhookClient.js";
+export type {
+  WebhookClientConfig,
+  WebhookEventPayload,
+  WebhookProcessResult,
+  WebhookHandler,
+  WebhookErrorHandler,
+  WebhookClientMiddleware,
+} from "./webhookClient.js";
+
+// Analytics tracking & privacy controls (#1036)
+export {
+  AnalyticsTracker,
+  PrivacyController,
+  AnalyticsCollector,
+  wrapClientWithAnalytics,
+} from "./analyticsTracking.js";
+export type {
+  PrivacyLevel,
+  AnalyticsPrivacyConfig,
+  AnalyticsEventInput,
+  AnalyticsEvent,
+  MethodMetric,
+  AnalyticsReport,
+  AnalyticsTrackerOptions,
+} from "./analyticsTracking.js";
