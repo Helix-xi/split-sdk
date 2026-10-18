@@ -110,3 +110,25 @@ function readSorobanData(tx: Transaction): xdr.SorobanTransactionData | undefine
   }
   return undefined;
 }
+
+/**
+ * Simulates a transaction to obtain its footprint.
+ */
+export async function simulateFootprint(
+  server: SorobanRpc.Server,
+  tx: Transaction,
+): Promise<SorobanRpc.Api.SimulateTransactionSuccessResponse> {
+  const sim = await server.simulateTransaction(tx);
+  if (SorobanRpc.Api.isSimulationError(sim)) {
+    throw new Error(`Simulation failed: ${sim.error}`);
+  }
+  return sim as SorobanRpc.Api.SimulateTransactionSuccessResponse;
+}
+
+/**
+ * Clears any internal simulation cache for footprints.
+ */
+export function clearFootprintSimulationCache(): void {
+  // Clear footprint simulation cache hook
+}
+

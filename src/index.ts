@@ -12,6 +12,13 @@ import type { ExportFormat } from "./export.js";
 export { StellarSplitClient } from "./client.js";
 export { FinalityChecker } from "./finalityChecker.js";
 export { buildPaymentMemo, parsePaymentMemo } from "./memoBuilder.js";
+export {
+  parseAmount,
+  formatAmount,
+  isValidStellarAddress,
+  truncateAddress,
+  isExpired,
+} from "./utils.js";
 export type {
   StellarSplitClientConfig,
   NetworkConfig,
@@ -37,6 +44,24 @@ export type {
 
 export { PluginRegistry, LoggingPlugin, MetricsPlugin } from "./plugin.js";
 export type { SdkPlugin, SdkMethodName, PluginArgs, PluginResult, StellarSplitClientContext } from "./plugin.js";
+
+export {
+  LogLevel,
+  SdkLogger,
+  parseLogLevel,
+  logLevelToString,
+  sanitizeLogValue,
+  defaultLogFormatter,
+  defaultConsoleSink,
+} from "./logger.js";
+export type {
+  Logger,
+  LoggerOptions,
+  LogLevelString,
+  LogEntry,
+  LogFormatter,
+  LogSink,
+} from "./logger.js";
 
 export {
   serializeInvoiceTemplate,
@@ -222,7 +247,7 @@ export {
   // New: Horizon Error Classifier
   ClassifiedHorizonError,
   isClassifiedHorizonError,
-  HorizonErrorClassification,
+  type HorizonErrorClassification,
   FinalityTimeoutError,
   isFinalityTimeoutError,
   ApprovalTimeoutError,
@@ -540,7 +565,9 @@ export { checkPayerReadiness, checkInvoiceExpiry, checkSponsorReserve, checkReci
 export type { PayerReadinessResult, PayerReadinessReason, InvoiceExpiryResult, InvoiceExpiryReason, SponsorReserveCheck, RecipientFlagsCheck, RunPreflightOptions } from "./preflightChecker.js";
 
 export { inspectFlags, hasAnyRestrictiveFlag } from "./accountFlagsInspector.js";
-export type { AccountFlagSet } from "./types.js";
+export { detectLockState, assertAccountUnlocked } from "./accountStateDetector.js";
+export { AccountFrozenError, AccountLockedError } from "./errors.js";
+export type { AccountFlagSet, AccountLockState } from "./types.js";
 
 export { getSuggestion } from "./errorSuggestions.js";
 
@@ -1679,7 +1706,7 @@ export {
   TemplateNotFoundError,
   TemplateAccessDeniedError,
 } from "./templates.js";
-export type { InvoiceTemplate, CreateFromTemplateParams, SaveTemplateParams } from "./types/templates.js";
+export type { CreateFromTemplateParams, SaveTemplateParams } from "./types/templates.js";
 
 // Recurring subscriptions
 export {
@@ -1692,7 +1719,7 @@ export {
   SubscriptionNotFoundError,
   TooEarlyToTriggerError,
 } from "./subscriptions.js";
-export type { Subscription, SubscriptionStatus, CreateSubscriptionParams } from "./types/subscriptions.js";
+export type { SubscriptionStatus, CreateSubscriptionParams } from "./types/subscriptions.js";
 
 // Invoice recommendation AI (#980)
 export { InvoiceRecommendationEngine } from "./invoiceRecommendation.js";

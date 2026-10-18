@@ -21,15 +21,178 @@ export interface MethodCacheEntry {
   expiresAt: number;
 }
 
-export type CacheEventType = "set" | "hit" | "miss" | "expire" | "invalidate" | "evict";
+export type CacheEventType =
+  | "hit"
+  | "miss"
+  | "set"
+  | "evict"
+  | "invalidate"
+  | "clear"
+  | "compress"
+  | "decompress"
+  | "expire";
 
 export interface CacheEvent {
   type: CacheEventType;
-  key: string;
-  timestamp: number;
+  key?: string;
+  size?: number;
+  bytesSaved?: number;
+  timestamp?: number;
 }
 
 export type CacheEventListener = (event: CacheEvent) => void;
+
+export interface CompressionOptions {
+  /** Enable compression of cached values. Defaults to false. */
+  enabled?: boolean;
+  /** Minimum serialized byte length before a value is compressed. Defaults to 1024. */
+  threshold?: number;
+}
+
+/**
+ * Lightweight, dependency-free compression codec.
+ */
+export class CacheCompressor {
+  private readonly threshold: number;
+
+  constructor(threshold = 1024) {
+    this.threshold = threshold;
+  }
+
+  shouldCompress(payload: string): boolean {
+    return payload.length >= this.threshold;
+  }
+
+  compress(input: string): string {
+    const dictionary: Record<string, string> = {
+      '"': "\u0001",
+      "{": "\u0002",
+      "}": "\u0003",
+      "[": "\u0004",
+      "]": "\u0005",
+      ",": "\u0006",
+      ":": "\u0007",
+      "true": "\u0008",
+      "false": "\u0009",
+      "null": "\u000a",
+    };
+
+    let out = input;
+    for (const [token, code] of Object.entries(dictionary)) {
+      out = out.split(token).join(code);
+    }
+
+    let rle = "";
+    let i = 0;
+    while (i < out.length) {
+      const ch = out[i]!;
+      let run = 1;
+      while (i + run < out.length && out[i + run] === ch) run++;
+      if (run > 3) {
+        rle += `\u000b${run}${ch}`;
+      } else {
+        rle += ch.repeat(run);
+      }
+      i += run;
+    }
+
+    return `\u0000${rle}`;
+  }
+
+  decompress(input: string): string {
+    if (!input.startsWith("\u0000")) return input;
+    const body = input.slice(1);
+
+    let expanded = "";
+    let i = 0;
+    while (i < body.length) {
+      if (body[i] === "\u000b") {
+        i++;
+        let countStr = "";
+        while (i < body.length && body[i]! >= "0" && body[i]! <= "9") {
+          countStr += body[i]!;
+          i++;
+        }
+        const ch = body[i] ?? "";
+        i++;
+        expanded += ch.repeat(parseInt(countStr, 10));
+      } else {
+        expanded += body[i]!;
+        i++;
+      }
+    }
+
+    const dictionary: Record<string, string> = {
+      "\u0001": '"',
+      "\u0002": "{",
+      "\u0003": "}",
+      "\u0004": "[",
+      "\u0005": "]",
+      "\u0006": ",",
+      "\u0007": ":",
+      "\u0008": "true",
+      "\u0009": "false",
+      "\u000a": "null",
+    };
+
+    let out = expanded;
+    for (const [code, token] of Object.entries(dictionary)) {
+      out = out.split(code).join(token);
+    }
+
+    return out;
+  }
+}
+
+export interface DebugModeOptions {
+  enabled?: boolean;
+  logger?: (message: string, ...args: any[]) => void;
+}
+
+export class DebugMode {
+  private enabled: boolean;
+  private readonly logger: (message: string, ...args: any[]) => void;
+  private readonly listeners = new Set<(enabled: boolean) => void>();
+
+  constructor(options?: DebugModeOptions) {
+    this.enabled = options?.enabled ?? false;
+    this.logger =
+      options?.logger ??
+      ((message: string, ...args: any[]) => console.debug(message, ...args));
+  }
+
+  get isEnabled(): boolean {
+    return this.enabled;
+  }
+
+  setEnabled(enabled: boolean): void {
+    if (this.enabled === enabled) return;
+    this.enabled = enabled;
+    for (const listener of this.listeners) {
+      listener(enabled);
+    }
+  }
+
+  enable(): void {
+    this.setEnabled(true);
+  }
+
+  disable(): void {
+    this.setEnabled(false);
+  }
+
+  onChange(listener: (enabled: boolean) => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  log(message: string, ...args: any[]): void {
+    if (!this.enabled) return;
+    this.logger(message, ...args);
+  }
+}
 
 export class SimpleCache<T> {
   private readonly store = new Map<string, MethodCacheEntry>();
@@ -42,16 +205,31 @@ export class SimpleCache<T> {
   private decompressions = 0;
   private bytesSaved = 0;
   private maxEntries: number;
+  private readonly compressor?: CacheCompressor;
   private readonly listeners = new Set<CacheEventListener>();
+  private readonly debug: DebugMode;
 
-  constructor(config?: number | { enabled?: boolean; ttl?: Record<string, number>; ttlMs?: number; maxEntries?: number; debug?: boolean | DebugModeOptions }) {
+  constructor(
+    config?:
+      | number
+      | {
+          enabled?: boolean;
+          ttl?: Record<string, number>;
+          ttlMs?: number;
+          maxEntries?: number;
+          compression?: boolean | CompressionOptions;
+          debug?: boolean | DebugModeOptions;
+        },
+  ) {
     if (typeof config === "number") {
       this.enabled = true;
       this.maxEntries = 1000;
       this.ttlConfig = { default: config };
       this.compressor = undefined;
     } else {
-      this.enabled = config?.enabled ?? (config?.ttl !== undefined || config?.ttlMs !== undefined);
+      this.enabled =
+        config?.enabled ??
+        (config?.ttl !== undefined || config?.ttlMs !== undefined);
       this.maxEntries = config?.maxEntries ?? (this.enabled ? 1000 : 0);
       this.ttlConfig = config?.ttl ?? {};
       if (config?.ttlMs !== undefined) {
@@ -60,12 +238,23 @@ export class SimpleCache<T> {
       const compression = config?.compression;
       if (compression === true) {
         this.compressor = new CacheCompressor();
-      } else if (compression && typeof compression === "object" && compression.enabled) {
+      } else if (
+        compression &&
+        typeof compression === "object" &&
+        compression.enabled
+      ) {
         this.compressor = new CacheCompressor(compression.threshold);
       } else {
         this.compressor = undefined;
       }
     }
+    this.debug = new DebugMode(
+      typeof config === "object" && config?.debug !== undefined
+        ? typeof config.debug === "boolean"
+          ? { enabled: config.debug }
+          : config.debug
+        : undefined,
+    );
   }
 
   /** Register a listener for cache lifecycle events. */
@@ -79,41 +268,20 @@ export class SimpleCache<T> {
     this.listeners.delete(listener);
   }
 
-  private emit(event: CacheEvent): void {
+  private emit(eventOrType: CacheEvent | CacheEventType, key?: string): void {
+    if (this.listeners.size === 0) return;
+    const event: CacheEvent =
+      typeof eventOrType === "string"
+        ? { type: eventOrType, key, timestamp: Date.now() }
+        : eventOrType;
     for (const listener of this.listeners) {
       listener(event);
     }
-    this.debug = new DebugMode(
-      typeof config === "object" && config?.debug !== undefined
-        ? typeof config.debug === "boolean"
-          ? { enabled: config.debug }
-          : config.debug
-        : undefined
-    );
   }
 
   /** Access the debug-mode controller for this cache instance. */
   getDebugMode(): DebugMode {
     return this.debug;
-  }
-
-  /**
-   * Subscribe to cache lifecycle events (set, hit, miss, expire, invalidate,
-   * evict).  Returns an unsubscribe function.
-   */
-  on(listener: CacheEventListener): () => void {
-    this.listeners.add(listener);
-    return () => {
-      this.listeners.delete(listener);
-    };
-  }
-
-  private emit(type: CacheEventType, key: string): void {
-    if (this.listeners.size === 0) return;
-    const event: CacheEvent = { type, key, timestamp: Date.now() };
-    for (const listener of this.listeners) {
-      listener(event);
-    }
   }
 
   get(key: string): T | undefined {
@@ -192,6 +360,10 @@ export class SimpleCache<T> {
       }
     }
     this.debug.log(`[cache] invalidate ${methodOrKey}`);
+  }
+
+  delete(key: string): void {
+    this.invalidate(key);
   }
 
   clear(): void {
@@ -292,6 +464,7 @@ export class Cache<V> {
   private readonly store = new Map<string, CacheEntry<V>>();
   private readonly ttlMs: number | undefined;
   private readonly listeners = new Set<CacheEventListener>();
+  private readonly debug: DebugMode;
 
   /**
    * @param ttlMs  Time-to-live in milliseconds.  Omit (or pass `undefined`)

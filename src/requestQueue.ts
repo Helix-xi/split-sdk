@@ -23,12 +23,12 @@ export interface QueueStats {
 export class RequestQueue {
   private readonly maxConcurrent: number;
   private activeCount = 0;
-  private queue: Map<PriorityLane, QueuedRequest<unknown>[]> = new Map([
+  private queue: Map<PriorityLane, QueuedRequest<any>[]> = new Map([
     ["high", []],
     ["normal", []],
     ["low", []],
   ]);
-  private stats: Record<PriorityLane, { completed: number; failed: number }> = {
+  private _stats: Record<PriorityLane, { completed: number; failed: number }> = {
     high: { completed: 0, failed: 0 },
     normal: { completed: 0, failed: 0 },
     low: { completed: 0, failed: 0 },
@@ -70,11 +70,11 @@ export class RequestQueue {
     request
       .fn()
       .then((result) => {
-        this.stats[request.priority].completed++;
+        this._stats[request.priority].completed++;
         request.resolve(result);
       })
       .catch((err) => {
-        this.stats[request.priority].failed++;
+        this._stats[request.priority].failed++;
         request.reject(err);
       })
       .finally(() => {
@@ -98,20 +98,20 @@ export class RequestQueue {
       high: {
         pending: this.queue.get("high")?.length ?? 0,
         active: this.activeCount,
-        completed: this.stats.high.completed,
-        failed: this.stats.high.failed,
+        completed: this._stats.high.completed,
+        failed: this._stats.high.failed,
       },
       normal: {
         pending: this.queue.get("normal")?.length ?? 0,
         active: this.activeCount,
-        completed: this.stats.normal.completed,
-        failed: this.stats.normal.failed,
+        completed: this._stats.normal.completed,
+        failed: this._stats.normal.failed,
       },
       low: {
         pending: this.queue.get("low")?.length ?? 0,
         active: this.activeCount,
-        completed: this.stats.low.completed,
-        failed: this.stats.low.failed,
+        completed: this._stats.low.completed,
+        failed: this._stats.low.failed,
       },
     };
   }

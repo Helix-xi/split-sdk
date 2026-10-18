@@ -48,6 +48,9 @@ const KNOWN_CONFIG_KEYS = new Set([
   "dexContractId",
   "circuitBreaker",
   "optimisticCache",
+  "logger",
+  "logLevel",
+  "debug",
 ]);
 
 export class UnknownConfigKeyError extends StellarSplitError {

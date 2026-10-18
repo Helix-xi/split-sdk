@@ -115,7 +115,7 @@ function decodeTransactionEnvelope(
         ),
         timeBounds: (() => {
           try {
-            const tb = v1.tx().timeBounds();
+            const tb = (v1.tx() as any).timeBounds?.();
             if (tb) {
               return {
                 minTime: tb.minTime().toString(),
@@ -165,7 +165,7 @@ function decodeTransactionResult(
 
   try {
     resultCode = result.result().switch().name;
-    const inner = result.result().innerResult();
+    const inner = (result.result() as any).innerResult?.();
     if (inner) {
       innerResult = {
         switch: inner.value().switch().name,
@@ -198,7 +198,7 @@ function decodeTransactionMeta(
     for (const opMeta of opsMeta) {
       const changes = (opMeta.changes() ?? []).map((change) => ({
         type: change.switch().name,
-        key: change.key()?.toXDR("base64") ?? "unknown",
+        key: (change as any).key?.()?.toXDR("base64") ?? "unknown",
       }));
       operations.push({ changes });
     }
@@ -227,10 +227,11 @@ function decodeLedgerEntry(
         key: s.key().toXDR("base64"),
         weight: s.weight(),
       }));
+      const thresholds = account.thresholds();
       data.thresholds = {
-        low: account.thresholds()[0],
-        med: account.thresholds()[1],
-        high: account.thresholds()[2],
+        low: thresholds[0] ?? 0,
+        med: thresholds[1] ?? 0,
+        high: thresholds[2] ?? 0,
       };
     }
   } catch {

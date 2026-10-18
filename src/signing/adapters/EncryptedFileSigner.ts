@@ -65,8 +65,8 @@ export async function writeEncryptedSigningKeyFile(
  * {@link clearCache} was called), the next `sign` call re-reads the file.
  */
 export class EncryptedFileSigner implements Signer {
-  readonly filePath: string;
-  private readonly aesKey: Buffer;
+  filePath: string;
+  private aesKey: Buffer;
   /** Weak reference to the decrypted keypair — cleared by GC or clearCache(). */
   private cachedKeypairRef: WeakRef<Keypair> | null = null;
   /** Promise-based lock serialising key rotation and sign operations. */

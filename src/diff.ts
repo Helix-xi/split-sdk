@@ -236,19 +236,19 @@ export function mergeInvoices(base: Invoice, local: Invoice, remote: Invoice): I
 
     if (localChanged && !remoteChanged) {
       // Only local changed — take local value.
-      (merged as Record<string, unknown>)[field] = localVal;
+      (merged as unknown as Record<string, unknown>)[field] = localVal;
       continue;
     }
 
     if (!localChanged && remoteChanged) {
       // Only remote changed — take remote value.
-      (merged as Record<string, unknown>)[field] = remoteVal;
+      (merged as unknown as Record<string, unknown>)[field] = remoteVal;
       continue;
     }
 
     // Both changed — conflict unless they converged to the same value.
     if (valuesEqual(localVal, remoteVal)) {
-      (merged as Record<string, unknown>)[field] = localVal;
+      (merged as unknown as Record<string, unknown>)[field] = localVal;
     } else {
       throw new MergeConflictError(field, baseVal, localVal, remoteVal);
     }

@@ -239,7 +239,7 @@ export class CloudKmsSigner extends TypedEventEmitter<CloudKmsSignerEventMap> im
     let lastError: unknown;
 
     for (let i = 0; i < regions.length; i++) {
-      const currentRegion = regions[i];
+      const currentRegion = regions[i]!;
       try {
         return await this.kmsClient.sign(this.keyId, txHash, { region: currentRegion });
       } catch (error) {
@@ -247,7 +247,7 @@ export class CloudKmsSigner extends TypedEventEmitter<CloudKmsSignerEventMap> im
 
         const hasNextRegion = i + 1 < regions.length;
         if (hasNextRegion && isRegionError(error)) {
-          const nextRegion = regions[i + 1];
+          const nextRegion = regions[i + 1]!;
           this.emit("regionFallback", { from: currentRegion, to: nextRegion });
           continue;
         }

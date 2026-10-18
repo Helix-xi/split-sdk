@@ -15,6 +15,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { OraclePriceError, NoReturnValueError } from "./errors.js";
 import { RateCache } from "./rateCache.js";
+import type { PriceOracleAdapter } from "./types.js";
 
 export interface ConvertedAmount {
   original: bigint;

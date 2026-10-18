@@ -139,10 +139,12 @@ function medianOf(amounts: bigint[]): bigint {
 
   const sorted = [...amounts].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const mid = sorted.length >> 1;
+  const midVal = sorted[mid] ?? 0n;
+  const prevVal = sorted[mid - 1] ?? 0n;
 
   return sorted.length % 2 === 1
-    ? sorted[mid]
-    : (sorted[mid - 1] + sorted[mid]) / 2n;
+    ? midVal
+    : (prevVal + midVal) / 2n;
 }
 
 /**

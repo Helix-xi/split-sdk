@@ -1926,6 +1926,44 @@ export class InsufficientSponsorReserveError extends StellarSplitError {
   }
 }
 
+/** Thrown when an account's trustline has been frozen by the asset issuer. */
+export class AccountFrozenError extends StellarSplitError {
+  readonly accountId: string;
+  readonly assetCode: string;
+
+  constructor(accountId: string, assetCode: string, raw?: string) {
+    super(
+      `Account ${accountId} is frozen for asset ${assetCode}`,
+      "ACCOUNT_FROZEN",
+      { accountId, assetCode },
+      raw
+    );
+    this.name = "AccountFrozenError";
+    this.accountId = accountId;
+    this.assetCode = assetCode;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/** Thrown when an account is permanently locked out of authorization (auth_immutable without auth). */
+export class AccountLockedError extends StellarSplitError {
+  readonly accountId: string;
+  readonly assetCode: string;
+
+  constructor(accountId: string, assetCode: string, raw?: string) {
+    super(
+      `Account ${accountId} is locked for asset ${assetCode}`,
+      "ACCOUNT_LOCKED",
+      { accountId, assetCode },
+      raw
+    );
+    this.name = "AccountLockedError";
+    this.accountId = accountId;
+    this.assetCode = assetCode;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 /** Thrown when a fee-bump inner transaction is not a v1 transaction. */
 export class InvalidTransactionTypeError extends StellarSplitError {
   readonly typeName: string;
@@ -2355,4 +2393,342 @@ export class BatchTooLargeError extends StellarSplitError {
 export function isBatchTooLargeError(err: unknown): err is BatchTooLargeError {
   return err instanceof BatchTooLargeError;
 }
+
+/** Thrown when closeRound is called before round_end has passed. */
+export class RoundNotEndedError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly roundEnd: number;
+
+  constructor(invoiceId: string, roundEnd: number, raw?: string) {
+    super(
+      `Fundraising round has not yet ended for invoice ${invoiceId} (round end: ${roundEnd})`,
+      "ROUND_NOT_ENDED",
+      { invoiceId, roundEnd },
+      raw
+    );
+    this.name = "RoundNotEndedError";
+    this.invoiceId = invoiceId;
+    this.roundEnd = roundEnd;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isRoundNotEndedError(err: unknown): err is RoundNotEndedError {
+  return err instanceof RoundNotEndedError;
+}
+
+/** Thrown when completeMilestone is called for an index that is not active. */
+export class WrongMilestoneError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly requestedIndex: number;
+  readonly activeIndex: number;
+
+  constructor(invoiceId: string, requestedIndex: number, activeIndex: number, raw?: string) {
+    super(
+      `Milestone ${requestedIndex} is not active for invoice ${invoiceId} (active: ${activeIndex})`,
+      "WRONG_MILESTONE",
+      { invoiceId, requestedIndex, activeIndex },
+      raw
+    );
+    this.name = "WrongMilestoneError";
+    this.invoiceId = invoiceId;
+    this.requestedIndex = requestedIndex;
+    this.activeIndex = activeIndex;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isWrongMilestoneError(err: unknown): err is WrongMilestoneError {
+  return err instanceof WrongMilestoneError;
+}
+
+/** Thrown when claimReferralRewards is called with a zero balance. */
+export class NothingToClaimError extends StellarSplitError {
+  readonly address: string;
+
+  constructor(address: string, raw?: string) {
+    super(
+      `No referral rewards to claim for address ${address}`,
+      "NOTHING_TO_CLAIM",
+      { address },
+      raw
+    );
+    this.name = "NothingToClaimError";
+    this.address = address;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isNothingToClaimError(err: unknown): err is NothingToClaimError {
+  return err instanceof NothingToClaimError;
+}
+
+/** Thrown when an invoice is expired (round_end / deadline already passed). */
+export class InvoiceExpiredError extends StellarSplitError {
+  readonly invoiceId: string;
+
+  constructor(invoiceId: string, raw?: string) {
+    super(`Invoice ${invoiceId} has expired`, "INVOICE_EXPIRED", { invoiceId }, raw);
+    this.name = "InvoiceExpiredError";
+    this.invoiceId = invoiceId;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isInvoiceExpiredError(err: unknown): err is InvoiceExpiredError {
+  return err instanceof InvoiceExpiredError;
+}
+
+/** Thrown when payer is not on the whitelist for a restricted invoice. */
+export class PayerNotWhitelistedError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly payer: string;
+
+  constructor(invoiceId: string, payer: string, raw?: string) {
+    super(
+      `Payer ${payer} is not whitelisted for invoice ${invoiceId}`,
+      "PAYER_NOT_WHITELISTED",
+      { invoiceId, payer },
+      raw
+    );
+    this.name = "PayerNotWhitelistedError";
+    this.invoiceId = invoiceId;
+    this.payer = payer;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isPayerNotWhitelistedError(err: unknown): err is PayerNotWhitelistedError {
+  return err instanceof PayerNotWhitelistedError;
+}
+
+/** Thrown when a payer's contribution exceeds their per-payer cap. */
+export class ContributionCapExceededError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly payer: string;
+  readonly cap: bigint;
+  readonly attempted: bigint;
+
+  constructor(invoiceId: string, payer: string, cap: bigint, attempted: bigint, raw?: string) {
+    super(
+      `Contribution cap exceeded for payer ${payer} on invoice ${invoiceId}: cap ${cap}, attempted ${attempted}`,
+      "CONTRIBUTION_CAP_EXCEEDED",
+      { invoiceId, payer, cap: cap.toString(), attempted: attempted.toString() },
+      raw
+    );
+    this.name = "ContributionCapExceededError";
+    this.invoiceId = invoiceId;
+    this.payer = payer;
+    this.cap = cap;
+    this.attempted = attempted;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isContributionCapExceededError(err: unknown): err is ContributionCapExceededError {
+  return err instanceof ContributionCapExceededError;
+}
+
+/**
+ * Thrown when a payment is attempted during an active cooldown window.
+ * Includes retryAfter so callers know when they may try again.
+ */
+export class PaymentCooldownActiveError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly payer: string;
+  /** The earliest time after which the payer may retry. */
+  readonly retryAfter: Date;
+
+  constructor(invoiceId: string, payer: string, retryAfterTimestamp: number, raw?: string) {
+    const retryAfter = new Date(retryAfterTimestamp * 1000);
+    super(
+      `Payment cooldown active for payer ${payer} on invoice ${invoiceId}. Retry after ${retryAfter.toISOString()}`,
+      "PAYMENT_COOLDOWN_ACTIVE",
+      { invoiceId, payer, retryAfterTimestamp },
+      raw
+    );
+    this.name = "PaymentCooldownActiveError";
+    this.invoiceId = invoiceId;
+    this.payer = payer;
+    this.retryAfter = retryAfter;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isPaymentCooldownActiveError(err: unknown): err is PaymentCooldownActiveError {
+  return err instanceof PaymentCooldownActiveError;
+}
+
+/** Thrown when the contract is administratively frozen for all operations. */
+export class ContractFrozenError extends StellarSplitError {
+  constructor(raw?: string) {
+    super("Contract is frozen and not accepting operations", "CONTRACT_FROZEN", undefined, raw);
+    this.name = "ContractFrozenError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isContractFrozenError(err: unknown): err is ContractFrozenError {
+  return err instanceof ContractFrozenError;
+}
+
+/** Thrown when an invoice has been fully funded and cannot receive more payments. */
+export class InvoiceFullyFundedError extends StellarSplitError {
+  readonly invoiceId: string;
+
+  constructor(invoiceId: string, raw?: string) {
+    super(`Invoice ${invoiceId} is already fully funded`, "INVOICE_FULLY_FUNDED", { invoiceId }, raw);
+    this.name = "InvoiceFullyFundedError";
+    this.invoiceId = invoiceId;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isInvoiceFullyFundedError(err: unknown): err is InvoiceFullyFundedError {
+  return err instanceof InvoiceFullyFundedError;
+}
+
+/** Thrown when attempting to rate an invoice that is not yet released. */
+export class InvoiceNotReleasedForRatingError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly status: string;
+
+  constructor(invoiceId: string, status: string, raw?: string) {
+    super(
+      `Invoice ${invoiceId} is not released and cannot be rated (current: ${status})`,
+      "INVOICE_NOT_RELEASED_FOR_RATING",
+      { invoiceId, status },
+      raw
+    );
+    this.name = "InvoiceNotReleasedForRatingError";
+    this.invoiceId = invoiceId;
+    this.status = status;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isInvoiceNotReleasedForRatingError(err: unknown): err is InvoiceNotReleasedForRatingError {
+  return err instanceof InvoiceNotReleasedForRatingError;
+}
+
+/** Thrown when a payer has already rated an invoice. */
+export class AlreadyRatedError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly payer: string;
+
+  constructor(invoiceId: string, payer: string, raw?: string) {
+    super(
+      `Payer ${payer} has already rated invoice ${invoiceId}`,
+      "ALREADY_RATED",
+      { invoiceId, payer },
+      raw
+    );
+    this.name = "AlreadyRatedError";
+    this.invoiceId = invoiceId;
+    this.payer = payer;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isAlreadyRatedError(err: unknown): err is AlreadyRatedError {
+  return err instanceof AlreadyRatedError;
+}
+
+/** Thrown when a non-contributor attempts to vote on a deadline extension. */
+export class NotEligibleToVoteError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly caller: string;
+
+  constructor(invoiceId: string, caller: string, raw?: string) {
+    super(
+      `Caller ${caller} is not eligible to vote on invoice ${invoiceId} (must be a contributor)`,
+      "NOT_ELIGIBLE_TO_VOTE",
+      { invoiceId, caller },
+      raw
+    );
+    this.name = "NotEligibleToVoteError";
+    this.invoiceId = invoiceId;
+    this.caller = caller;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isNotEligibleToVoteError(err: unknown): err is NotEligibleToVoteError {
+  return err instanceof NotEligibleToVoteError;
+}
+
+// ---------------------------------------------------------------------------
+// Price oracle adapter errors
+// ---------------------------------------------------------------------------
+
+/** Thrown when a price oracle request is rate-limited by the upstream provider. */
+export class RateLimitError extends StellarSplitError {
+  /** Seconds the caller should wait before retrying, if known. */
+  readonly retryAfterSeconds?: number;
+
+  constructor(message: string, retryAfterSeconds?: number) {
+    super(message, "RATE_LIMITED", { retryAfterSeconds });
+    this.name = "RateLimitError";
+    this.retryAfterSeconds = retryAfterSeconds;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isRateLimitError(err: unknown): err is RateLimitError {
+  return err instanceof RateLimitError;
+}
+
+/** Thrown when a price oracle request fails for a reason other than rate limiting. */
+export class PriceOracleFetchError extends StellarSplitError {
+  constructor(message: string) {
+    super(message, "PRICE_ORACLE_FETCH_FAILED", undefined, message);
+    this.name = "PriceOracleFetchError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isPriceOracleFetchError(err: unknown): err is PriceOracleFetchError {
+  return err instanceof PriceOracleFetchError;
+}
+
+/** Thrown when delegate limit is reached. */
+export class DelegateLimitReachedError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly limit: number;
+
+  constructor(invoiceId: string, limit: number = 3) {
+    super(
+      `Invoice ${invoiceId} has reached the delegate limit of ${limit}`,
+      "DELEGATE_LIMIT_REACHED",
+      { invoiceId, limit },
+    );
+    this.name = "DelegateLimitReachedError";
+    this.invoiceId = invoiceId;
+    this.limit = limit;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isDelegateLimitReachedError(err: unknown): err is DelegateLimitReachedError {
+  return err instanceof DelegateLimitReachedError;
+}
+
+/** Structured classification of a Horizon transaction/operation result code. */
+export interface HorizonErrorClassification {
+  /** The primary result code string. */
+  code: string;
+  /** Whether the error is safe to retry. */
+  isRetryable: boolean;
+  /** Severity level of the error. */
+  severity: "low" | "medium" | "high" | "critical" | "unknown";
+  /** Human-readable description of what went wrong. */
+  description: string;
+  /** Recommended action for the caller to take. */
+  suggestedAction: string;
+  /** The specific operation result code, if available. */
+  operationCode?: string;
+}
+
+
+
 

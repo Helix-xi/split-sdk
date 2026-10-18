@@ -27,7 +27,7 @@ export class AbortError extends Error {
   }
 }
 
-export type EventMap = Record<string, unknown>;
+export type EventMap = Record<string, any>;
 export type WildcardEventHandler<T extends EventMap> = (
   event: keyof T,
   payload: T[keyof T],

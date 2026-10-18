@@ -432,6 +432,8 @@ export interface InvoiceStats {
   totalPayers: number;
   /** Mean payment size in stroops (0 when there are no payments). */
   avgPayment: bigint;
+  /** Median payment size in stroops (0 when there are no payments). */
+  medianAmount?: bigint;
   /**
    * Stroops funded per day across the payment window, i.e. the sum of payment
    * amounts divided by the span between the first and last payment.
@@ -495,6 +497,8 @@ export interface CreateInvoiceParams {
   deadline: number;
   /** Optional memo / description. */
   memo?: string;
+  /** Optional JSON metadata object attached to invoice. */
+  metadata?: Record<string, unknown>;
   /**
    * When `true`, simulate the transaction against Soroban RPC instead of
    * submitting it, and resolve with a {@link SimulationResult} (issue #844).
@@ -1588,6 +1592,15 @@ export interface AccountFlagSet {
   isCompatibleWith(operation: string): boolean;
 }
 
+/** Result of checking an account's freeze / lock state for an asset. */
+export interface AccountLockState {
+  isFrozen: boolean;
+  isLocked: boolean;
+  trustlineAuthorized: boolean;
+  revocableByIssuer: boolean;
+  reason?: "no_trustline" | "frozen" | "immutable" | string;
+}
+
 /** Declarative description of a claimable-balance claim predicate, buildable via `PredicateBuilder.build()`. */
 export type PredicateConfig =
   | { type: "unconditional" }
@@ -2275,4 +2288,382 @@ export interface Attestation {
   timestamp: bigint;
   /** Whether the attestation has been revoked. */
   revoked: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Price Oracle Adapter Types
+// ---------------------------------------------------------------------------
+
+/**
+ * Pluggable adapter contract for resolving fiat-to-asset conversion rates.
+ * Implementations may call an external REST API, an on-chain oracle
+ * contract, or a static table; the SDK ships {@link CoinGeckoPriceOracle}
+ * (see priceOracle.ts) as the default REST-backed implementation.
+ */
+export interface PriceOracleAdapter {
+  /**
+   * Resolve the price of one unit of `base` denominated in `quote`
+   * (e.g. `getPrice("XLM", "USD")` resolves to how many USD one XLM is worth).
+   */
+  getPrice(base: string, quote: string): Promise<number>;
+}
+
+// ---------------------------------------------------------------------------
+// Path Query Builder Types
+// ---------------------------------------------------------------------------
+
+/** A validated strict-send Horizon path query, built by PathQueryBuilder. */
+export interface StrictSendPathQuery {
+  kind: "strictSend";
+  sourceAsset: import("@stellar/stellar-sdk").Asset;
+  sourceAmount: bigint;
+  /** A specific destination account, or a fixed list of acceptable destination assets. */
+  destination: string | import("@stellar/stellar-sdk").Asset[];
+}
+
+/** A validated strict-receive Horizon path query, built by PathQueryBuilder. */
+export interface StrictReceivePathQuery {
+  kind: "strictReceive";
+  /** A specific source account, or a fixed list of acceptable source assets. */
+  source: string | import("@stellar/stellar-sdk").Asset[];
+  destinationAsset: import("@stellar/stellar-sdk").Asset;
+  destinationAmount: bigint;
+}
+
+/** A path query built by PathQueryBuilder, ready to execute. */
+export type PathQuery = StrictSendPathQuery | StrictReceivePathQuery;
+
+/** A single resolved conversion path returned by executing a PathQuery. */
+export interface PathQueryResult {
+  /** Ordered list of intermediate assets forming the conversion route. */
+  path: Array<{ asset_code: string; asset_issuer: string; asset_type: string }>;
+  /** Amount sent from the source, in the source asset's base unit. */
+  sourceAmount: bigint;
+  /** Amount the destination receives, in the destination asset's base unit. */
+  destinationAmount: bigint;
+}
+
+// ---------------------------------------------------------------------------
+// Payment Workflow Utilities
+// ---------------------------------------------------------------------------
+
+export interface FinalityStatus {
+  finalized: boolean;
+  confirmations: number;
+  ledgerSequence: number;
+}
+
+export interface FinalityCheckConfig {
+  minConfirmations?: number;
+  pollIntervalMs?: number;
+  maxWaitMs?: number;
+}
+
+export interface MultiSigPolicy {
+  threshold: number;
+  timeoutMs: number;
+  signers: Array<{
+    publicKey: string;
+    weight: number;
+  }>;
+}
+
+export interface ApprovalSessionResult {
+  complete: boolean;
+  weight: number;
+}
+
+export interface BatchPaymentResult {
+  succeeded: Array<{
+    chunkIndex: number;
+    txHash: string;
+  }>;
+  failed: {
+    chunkIndex: number;
+    error: Error;
+  } | null;
+}
+
+export type ChunkSubmitter<T> = (
+  operations: T[],
+  chunkIndex: number,
+) => Promise<{ txHash: string }>;
+
+// ---------------------------------------------------------------------------
+// Effect Aggregator Types
+// ---------------------------------------------------------------------------
+
+/** Net balance change for a single asset within an account's effect summary. */
+export interface AssetDelta {
+  /** Asset identifier: "native" or "CODE:ISSUER". */
+  asset: string;
+  /** Net change in stroops; positive = credited, negative = debited. */
+  delta: bigint;
+}
+
+/** Net effect summary for one account, aggregated across a transaction's effects. */
+export interface AccountEffectSummary {
+  /** Stellar account ID affected. */
+  accountId: string;
+  /** Net asset balance changes for this account. */
+  assetDeltas: AssetDelta[];
+}
+
+// ---------------------------------------------------------------------------
+// Pause/Resume Types (Issue #866)
+// ---------------------------------------------------------------------------
+
+export interface PauseStatus {
+  paused: boolean;
+  autoResumeAt?: Date;
+}
+
+// ---------------------------------------------------------------------------
+// Pledge Match Types (Issue #867)
+// ---------------------------------------------------------------------------
+
+export interface MatchPledge {
+  matcher: string;
+  pledgedAmount: bigint;
+  matchedAmount: bigint;
+  unmatched: bigint;
+}
+
+// ---------------------------------------------------------------------------
+// Streaming Types (Issue #868)
+// ---------------------------------------------------------------------------
+
+export interface Stream {
+  id: string;
+  invoiceId: string;
+  payer: string;
+  amountPerLedger: bigint;
+  startLedger: number;
+  status: "active" | "settled" | "cancelled";
+}
+
+// ---------------------------------------------------------------------------
+// Payment Progress Tracker Types
+// ---------------------------------------------------------------------------
+
+export interface RecipientPaymentState {
+  accountId: string;
+  status: string;
+  settledAmount: bigint;
+  lastUpdatedAt: number;
+}
+
+export interface InvoicePaymentProgress {
+  invoiceId: string;
+  percentComplete: number;
+  recipientStates: RecipientPaymentState[];
+  trancheProgress?: import("./trancheProgress.js").TrancheProgressReport;
+}
+
+// ---------------------------------------------------------------------------
+// Issues #878 — Round types
+// ---------------------------------------------------------------------------
+
+export interface PayerRefund {
+  /** Stellar address of the payer. */
+  payer: string;
+  /** Amount (in stroops) that was kept / credited toward the invoice. */
+  amountKept: bigint;
+  /** Amount (in stroops) refunded to this payer due to over-subscription. */
+  amountRefunded: bigint;
+}
+
+/** Result returned by closeRound. */
+export interface RoundCloseResult {
+  /** Total amount raised (in stroops) before overflow trimming. */
+  totalRaised: bigint;
+  /** Maximum amount the round was capped at (in stroops). */
+  hardCap: bigint;
+  /** Overflow amount distributed back as refunds (in stroops). */
+  overflow: bigint;
+  /** Per-payer refund breakdown. */
+  refunds: PayerRefund[];
+  /** Transaction hash of the close_round call. */
+  txHash: string;
+}
+
+/** Current state of a fundraising round. */
+export interface RoundInfo {
+  /** Invoice identifier. */
+  invoiceId: string;
+  /** Total raised so far (in stroops). */
+  totalRaised: bigint;
+  /** Round hard cap (in stroops). */
+  hardCap: bigint;
+  /** Unix timestamp when the round ends. */
+  roundEnd: number;
+  /** Whether the round has ended and been closed. */
+  closed: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Issues #879 — Milestone types
+// ---------------------------------------------------------------------------
+
+/** Status of a milestone. */
+export type MilestoneStatus = 'locked' | 'active' | 'completed';
+
+/** A single milestone in an invoice's milestone schedule. */
+export interface Milestone {
+  /** Zero-based milestone index. */
+  index: number;
+  /** Human-readable description of what this milestone represents. */
+  description: string;
+  /** Target amount required to complete this milestone (in stroops). */
+  targetAmount: bigint;
+  /** Amount currently funded toward this milestone (in stroops). */
+  fundedAmount: bigint;
+  /** Current lifecycle status of this milestone. */
+  status: MilestoneStatus;
+}
+
+/** Result returned by completeMilestone. */
+export interface MilestoneResult {
+  /** Index of the milestone that was completed. */
+  index: number;
+  /** Amount released to recipients upon completion (in stroops). */
+  amountReleased: bigint;
+  /** Index of the next milestone, if any. */
+  nextMilestoneIndex?: number;
+  /** Transaction hash. */
+  txHash: string;
+}
+
+// ---------------------------------------------------------------------------
+// Issues #880 — Referral types
+// ---------------------------------------------------------------------------
+
+/** Result returned by claimReferralRewards. */
+export interface ReferralClaimResult {
+  /** Amount of referral rewards claimed (in stroops). */
+  amountClaimed: bigint;
+  /** Transaction hash. */
+  txHash: string;
+}
+
+/** Result returned by payWithReferral. */
+export interface ReferralPayResult {
+  /** Transaction hash. */
+  txHash: string;
+  /** Referrer address credited for this payment. */
+  referrer: string;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #876 — Protocol stats
+// ---------------------------------------------------------------------------
+
+/** Protocol statistics and aggregate metrics across invoices. */
+export interface ProtocolStats {
+  /** Total number of invoices created on-chain. */
+  totalInvoices: number;
+  /** Total amount released in stroops. */
+  totalReleased?: bigint;
+  /** Number of currently pending invoices. */
+  pendingInvoices?: number;
+  /** Total amount paid in stroops. */
+  totalPaidAmount?: bigint;
+  /** Total amount released in stroops. */
+  totalReleasedAmount?: bigint;
+  /** Total amount refunded in stroops. */
+  totalRefundedAmount?: bigint;
+  /** Unique creator count. */
+  uniqueCreators?: number;
+  /** Unique payer count. */
+  uniquePayers?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #875 — Notes
+// ---------------------------------------------------------------------------
+
+/** Note attached to an invoice. */
+export interface Note {
+  index: number;
+  content: string;
+  timestamp: Date;
+}
+
+export type { SdkLogger } from "./logger.js";
+
+// ---------------------------------------------------------------------------
+// Split Rounding Auditor Types (Issue #590)
+// ---------------------------------------------------------------------------
+
+/**
+ * One input line in a split: a recipient and their ratio of the total.
+ */
+export interface SplitLine {
+  /** Unique identifier for this recipient (e.g. Stellar address). */
+  recipientId: string;
+  /**
+   * Fraction of the invoice total owed to this recipient (0 < ratio ≤ 1).
+   * The sum of all ratios in a split should be 1.0.
+   */
+  ratio: number;
+}
+
+/**
+ * A single stroop-level adjustment applied by the rounding auditor.
+ */
+export interface RoundingAdjustment {
+  /** Recipient whose computed amount was adjusted. */
+  recipientId: string;
+  /**
+   * Signed stroop delta applied to the raw floor amount.
+   * Positive means one stroop was added; negative means one was removed.
+   */
+  delta: bigint;
+}
+
+/**
+ * Result returned by `auditSplitRounding`.
+ *
+ * Guarantees that `amounts` values sum exactly to the original `total`.
+ */
+export interface AuditedSplitResult {
+  /**
+   * Final per-recipient amounts in stroops, keyed by recipientId.
+   * These are guaranteed to sum exactly to `total`.
+   */
+  amounts: Record<string, bigint>;
+  /**
+   * Adjustments applied by the largest-remainder correction.
+   * Empty when the raw floor amounts already sum to `total`.
+   */
+  adjustments: RoundingAdjustment[];
+  /** The original invoice total, in stroops. */
+  total: bigint;
+}
+
+// ---------------------------------------------------------------------------
+// Offer tracking types
+// ---------------------------------------------------------------------------
+
+/** The lifecycle status of a tracked DEX offer. */
+export type OfferStatus = "open" | "partially_filled" | "filled" | "cancelled" | "stale";
+
+/** A DEX offer tracked by the OfferTracker. */
+export interface OfferRecord {
+  /** Stellar offer ID (u64 from Horizon). */
+  offerId: string;
+  /** Stellar address of the account that owns the offer. */
+  account: string;
+  /** Asset being sold (e.g. "native" or "USDC:G..."). */
+  selling: string;
+  /** Asset being bought (e.g. "native" or "USDC:G..."). */
+  buying: string;
+  /** Amount of the selling asset still available on the order book. */
+  amount: string;
+  /** Offer price as a ratio string (e.g. "2.5"). */
+  price: string;
+  /** Current lifecycle status. */
+  status: OfferStatus;
+  /** Unix timestamp in milliseconds when the offer was created. */
+  createdAt: number;
 }

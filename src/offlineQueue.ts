@@ -15,7 +15,7 @@ export interface OfflineQueueConfig {
 
 export class OfflineQueue {
   private queue: QueuedOperation[] = [];
-  private config: OfflineQueueConfig;
+  public config: OfflineQueueConfig;
   private client: StellarSplitClient;
   private readonly storageKey = "stellar_split_offline_queue";
 

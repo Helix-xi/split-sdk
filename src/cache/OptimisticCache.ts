@@ -71,6 +71,34 @@ export interface RevalidateErrorEvent {
   error: unknown;
 }
 
+export interface CompressedRecord {
+  __compressed: true;
+  data: string;
+  originalBytes: number;
+}
+
+export type CacheEventType =
+  | "hit"
+  | "miss"
+  | "set"
+  | "expire"
+  | "invalidate"
+  | "eviction"
+  | "compression"
+  | "decompression";
+
+export interface CacheEvent<T = unknown> {
+  type: CacheEventType;
+  invoiceId: string;
+  value?: T;
+  timestamp?: number;
+  compressedBytes?: number;
+  originalBytes?: number;
+  ratio?: number;
+}
+
+export type CacheEventHandler<T = unknown> = (event: CacheEvent<T>) => void;
+
 /** Bookkeeping for a value written through `read()`/`set()`. */
 interface FreshnessEntry<T> {
   value: T;
@@ -168,6 +196,8 @@ export class OptimisticCache<T = unknown> {
   /** In-flight background revalidations, keyed by cache key. */
   private readonly revalidations = new Map<string, Promise<void>>();
   private readonly revalidateErrorHandlers = new Set<(event: RevalidateErrorEvent) => void>();
+  private readonly expiries = new Map<string, number>();
+  private readonly eventHandlers = new Set<CacheEventHandler<T>>();
   private readonly defaultTtlMs: number;
   private readonly staleWhileRevalidateMs: number;
   private readonly now: () => number;
@@ -213,14 +243,20 @@ export class OptimisticCache<T = unknown> {
    * Write a committed value into the base cache with an optional TTL
    * (milliseconds). Emits a `set` event.
    */
-  set(invoiceId: string, value: T, ttlMs?: number): void {
+  set(invoiceId: string, value: T, ttlMs: number = this.defaultTtlMs): void {
+    const now = this.now();
+    this.freshness.set(invoiceId, {
+      value,
+      freshUntil: now + ttlMs,
+      staleUntil: now + ttlMs + this.staleWhileRevalidateMs,
+    });
     this.base.set(invoiceId, value);
-    if (ttlMs !== undefined && ttlMs > 0) {
-      this.expiries.set(invoiceId, Date.now() + ttlMs);
+    if (ttlMs > 0) {
+      this.expiries.set(invoiceId, now + ttlMs);
     } else {
       this.expiries.delete(invoiceId);
     }
-    this._emit({ type: "set", invoiceId, value, timestamp: Date.now() });
+    this._emit({ type: "set", invoiceId, value, timestamp: now });
   }
 
   /**
@@ -272,27 +308,6 @@ export class OptimisticCache<T = unknown> {
   onRevalidateError(handler: (event: RevalidateErrorEvent) => void): () => void {
     this.revalidateErrorHandlers.add(handler);
     return () => this.revalidateErrorHandlers.delete(handler);
-  }
-
-  /**
-   * Write a value into the cache with a freshness window.
-   *
-   * The value is served fresh for `ttlMs`, then — when
-   * `staleWhileRevalidateMs` is configured — continues to be served stale for
-   * the remainder of that extra window while a background refresh runs.
-   *
-   * @param key    - Cache key.
-   * @param value  - Value to cache.
-   * @param ttlMs  - Freshness window in ms. Defaults to `defaultTtlMs`.
-   */
-  set(key: string, value: T, ttlMs: number = this.defaultTtlMs): void {
-    const now = this.now();
-    this.freshness.set(key, {
-      value,
-      freshUntil: now + ttlMs,
-      staleUntil: now + ttlMs + this.staleWhileRevalidateMs,
-    });
-    this.base.set(key, value);
   }
 
   /**

@@ -81,6 +81,25 @@ export interface OperationBuilderConfig {
   fee?: string;
 }
 
+export interface AddSignerOptions {
+  key: string;
+  weight?: number;
+}
+
+export interface SetThresholdsOptions {
+  masterWeight?: number;
+  low?: number;
+  medium?: number;
+  high?: number;
+}
+
+export type MultiSigEvent =
+  | { type: "signerAdded"; key: string; weight: number }
+  | { type: "signerRemoved"; key: string }
+  | { type: "thresholdsSet"; thresholds: Required<SetThresholdsOptions> };
+
+export type MultiSigEventListener = (event: MultiSigEvent) => void;
+
 // ---------------------------------------------------------------------------
 // Lifecycle events
 // ---------------------------------------------------------------------------
@@ -155,7 +174,7 @@ export class OperationBuilder {
     medium: 0,
     high: 0,
   };
-  private readonly listeners = new Set<MultiSigEventListener>();
+  private readonly multiSigListeners = new Set<MultiSigEventListener>();
 
   constructor(config: OperationBuilderConfig) {
     this.config = config;
@@ -325,14 +344,14 @@ export class OperationBuilder {
    * Subscribes to builder lifecycle events. Returns an unsubscribe function.
    */
   onEvent(listener: MultiSigEventListener): () => void {
-    this.listeners.add(listener);
+    this.multiSigListeners.add(listener);
     return () => {
-      this.listeners.delete(listener);
+      this.multiSigListeners.delete(listener);
     };
   }
 
   private _emit(event: MultiSigEvent): void {
-    for (const listener of this.listeners) {
+    for (const listener of this.multiSigListeners) {
       listener(event);
     }
   }
