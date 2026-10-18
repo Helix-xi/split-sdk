@@ -309,8 +309,12 @@ export class UnauthorizedError extends StellarSplitError {
 
 /** Thrown when validation fails for input data (e.g., template deserialization). */
 export class ValidationError extends StellarSplitError {
-  constructor(message: string, context?: Record<string, unknown>) {
-    super(message, "VALIDATION_ERROR", context, message);
+  constructor(
+    message: string,
+    context?: Record<string, unknown>,
+    code: string = "VALIDATION_ERROR"
+  ) {
+    super(message, code, context, message);
     this.name = "ValidationError";
     Object.setPrototypeOf(this, new.target.prototype);
   }
@@ -2355,4 +2359,61 @@ export class BatchTooLargeError extends StellarSplitError {
 export function isBatchTooLargeError(err: unknown): err is BatchTooLargeError {
   return err instanceof BatchTooLargeError;
 }
+
+// ---------------------------------------------------------------------------
+// Validation errors (issues #1061, #1062, #1063, #1064)
+// ---------------------------------------------------------------------------
+
+/** Thrown when deadline validation fails. */
+export class DeadlineValidationError extends ValidationError {
+  constructor(message: string, context?: Record<string, unknown>) {
+    super(message, context, "DEADLINE_VALIDATION_ERROR");
+    this.name = "DeadlineValidationError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isDeadlineValidationError(err: unknown): err is DeadlineValidationError {
+  return err instanceof DeadlineValidationError;
+}
+
+/** Thrown when token or payment amount validation fails. */
+export class AmountValidationError extends ValidationError {
+  constructor(message: string, context?: Record<string, unknown>) {
+    super(message, context, "AMOUNT_VALIDATION_ERROR");
+    this.name = "AmountValidationError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isAmountValidationError(err: unknown): err is AmountValidationError {
+  return err instanceof AmountValidationError;
+}
+
+/** Thrown when Stellar address format or checksum validation fails. */
+export class AddressValidationError extends ValidationError {
+  constructor(message: string, context?: Record<string, unknown>) {
+    super(message, context, "ADDRESS_VALIDATION_ERROR");
+    this.name = "AddressValidationError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isAddressValidationError(err: unknown): err is AddressValidationError {
+  return err instanceof AddressValidationError;
+}
+
+/** Thrown when cryptographic or webhook signature validation fails. */
+export class SignatureValidationError extends ValidationError {
+  constructor(message: string, context?: Record<string, unknown>) {
+    super(message, context, "SIGNATURE_VALIDATION_ERROR");
+    this.name = "SignatureValidationError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isSignatureValidationError(err: unknown): err is SignatureValidationError {
+  return err instanceof SignatureValidationError;
+}
+
 
