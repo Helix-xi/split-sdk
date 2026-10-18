@@ -1269,6 +1269,48 @@ export type {
 } from "./types.js";
 
 // ---------------------------------------------------------------------------
+// #1049 — Internationalization (i18n)
+// ---------------------------------------------------------------------------
+
+export {
+  DEFAULT_LOCALE,
+  SUPPORTED_LOCALES,
+  detectLanguage,
+  setLocale,
+  getLocale,
+  listLocales,
+  t,
+  translateErrorCode,
+  translateStatus,
+  tp,
+  registerTranslations,
+  registerLocale,
+} from "./i18n.js";
+export type { SupportedLocale, LocaleCode, TranslationDict } from "./i18n.js";
+
+// ---------------------------------------------------------------------------
+// #1048 — Invoice export (PDF, CSV, JSON, text)
+// ---------------------------------------------------------------------------
+
+export {
+  exportAsPdf,
+  exportAsCsv,
+  exportAsText,
+  exportAsJson,
+  renderInvoiceTable,
+  registerExportBuilder,
+  listExportBuilders,
+} from "./export.js";
+export type { ExportFormat, InvoiceTableRow, ExportBuilder } from "./export.js";
+
+// ---------------------------------------------------------------------------
+// #1047 — QR code generation
+// ---------------------------------------------------------------------------
+
+export { encode, isErrorCorrectionLevel, matrixToString } from "./qr/qrMatrix.js";
+export type { QRErrorCorrection, QRCapacity, QROptions } from "./qr/qrData.js";
+
+// ---------------------------------------------------------------------------
 // UI Components (React)
 // ---------------------------------------------------------------------------
 
