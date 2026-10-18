@@ -1714,3 +1714,67 @@ export type {
   RetirementManagerOptions,
   RetirementEventMap,
 } from "./invoiceRetirement.js";
+
+// Request timeout and retry logic (#1030)
+export {
+  RequestRetryManager,
+  RequestTimeoutError,
+  MaxRetriesExceededError,
+  calculateBackoffDelay,
+  isRetryableError,
+  executeWithTimeoutAndRetry,
+} from "./requestRetry.js";
+export type {
+  BackoffOptions,
+  RetryLimits,
+  RequestTimeoutConfig,
+  RequestRetryConfig,
+} from "./requestRetry.js";
+
+// Currency conversion utilities (#1031)
+export {
+  CurrencyConverter,
+  convertCurrency,
+  convertAmount,
+  clearPriceCache,
+} from "./currencyConverter.js";
+export type {
+  ConversionRequest,
+  ConversionResult,
+  CurrencyConverterOptions,
+  ExchangeRateProvider,
+} from "./currencyConverter.js";
+
+// Batch operation support (#1032)
+export {
+  BatchOperationBuilder,
+  BatchExecutor,
+  validateBatchOperation,
+  validateBatchOperations,
+  MAX_OPERATIONS_PER_BATCH,
+} from "./batchOperations.js";
+export type {
+  BatchOperation,
+  PaymentBatchOp,
+  CreateAccountBatchOp,
+  ManageDataBatchOp,
+  ChangeTrustBatchOp,
+  CustomBatchOp,
+  BatchExecutionResult,
+  BatchExecutorConfig,
+} from "./batchOperations.js";
+
+// Offline transaction building (#1033)
+export {
+  OfflineTransactionBuilder,
+} from "./offlineTransaction.js";
+export type {
+  OfflineTransactionConfig,
+  OfflinePaymentParams,
+  OfflineCreateAccountParams,
+  OfflineManageDataParams,
+  OfflineChangeTrustParams,
+  OfflineTxPackage,
+  TimeboundsConfig,
+  OfflineMemoInput,
+} from "./offlineTransaction.js";
