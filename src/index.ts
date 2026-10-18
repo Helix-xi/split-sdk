@@ -544,6 +544,56 @@ export type { AccountFlagSet } from "./types.js";
 
 export { getSuggestion } from "./errorSuggestions.js";
 
+// Comprehensive error codes — descriptions and retryability (issue #1067)
+export {
+  SDK_ERROR_CODE_DESCRIPTIONS,
+  RETRYABLE_ERROR_CODES,
+  describeSdkErrorCode,
+  isRetryableErrorCode,
+  InvalidContractAddressError,
+  isInvalidContractAddressError,
+  TransactionVerificationError,
+  isTransactionVerificationError,
+} from "./errors.js";
+
+// Soroban contract address validation (issue #1065)
+export {
+  validateContractAddress,
+  isValidContractAddress,
+  assertValidContractAddress,
+  CONTRACT_ADDRESS_LENGTH,
+  CONTRACT_ADDRESS_PREFIX,
+} from "./contractAddressValidator.js";
+export type { ContractAddressValidationResult } from "./contractAddressValidator.js";
+
+// Pre-submit transaction verification (issue #1066)
+export {
+  verifyTransaction,
+  verifyTransactionSignatures,
+  assertTransactionVerified,
+} from "./transactionVerifier.js";
+export type {
+  TransactionCheckName,
+  TransactionCheckResult,
+  TransactionVerificationOptions,
+  TransactionVerificationResult,
+  SignatureVerificationResult,
+} from "./transactionVerifier.js";
+
+// Error recovery strategies (issue #1068)
+export {
+  RECOVERY_STRATEGY_TABLE,
+  getRecoveryStrategy,
+  getRecoveryPlan,
+  executeWithRecovery,
+} from "./errorRecovery.js";
+export type {
+  RecoveryAction,
+  RecoveryStrategy,
+  RecoveryPlan,
+  RecoveryRunOptions,
+} from "./errorRecovery.js";
+
 // ---------------------------------------------------------------------------
 // XDR Decoder — structured logging of Stellar XDR
 // ---------------------------------------------------------------------------
