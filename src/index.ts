@@ -1696,6 +1696,18 @@ export type { Subscription, SubscriptionStatus, CreateSubscriptionParams } from 
 
 // Invoice recommendation AI (#980)
 export { InvoiceRecommendationEngine } from "./invoiceRecommendation.js";
+
+// Recipient suggestions API (#1051)
+export {
+  suggestRecipients,
+  interactionFromRecipient,
+  DEFAULT_SUGGESTION_LIMIT,
+} from "./recipientSuggestions.js";
+export type {
+  RecipientInteraction,
+  RecipientSuggestion,
+  SuggestRecipientsOptions,
+} from "./recipientSuggestions.js";
 export type {
   RecommendationSignal,
   RecommendationContext,
