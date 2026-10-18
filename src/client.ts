@@ -386,6 +386,15 @@ export interface StellarSplitClientConfig {
   /** Optional retry configuration. Enables automatic retry with exponential backoff and jitter. */
   retry?: RetryOptions;
   /**
+   * Optional outbound rate-limiting configuration (issue #1058). When
+   * provided, the client creates a token-bucket {@link RateLimiter} that
+   * gates transaction submission, protecting the RPC endpoint (and shared
+   * budget) from abuse and self-inflicted DoS. Accepts a global
+   * `maxRequestsPerSecond`, an optional `perKeyLimit`, the `windowMs`
+   * refill period, and a `maxTrackedKeys` storage bound.
+   */
+  rateLimit?: import("./rateLimiter.js").RateLimiterConfig;
+  /**
    * Optional Horizon API base URL (e.g. "https://horizon.stellar.org").
    * When provided, read-only account lookups fall back to Horizon automatically
    * if the primary Soroban RPC endpoint throws or times out.
@@ -992,6 +1001,12 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    */
     if (config.optimisticCache) {
       this._optimisticCache = new OptimisticCache<Invoice>();
+    }
+
+    // Outbound request rate limiting (Issue #1058): gates transaction
+    // submission so a misbehaving caller cannot flood the RPC endpoint.
+    if (config.rateLimit) {
+      this._rateLimiter = new RateLimiter(config.rateLimit);
     }
 
     this._stateMachine = new InvoiceStateMachine(config.stateMachine);

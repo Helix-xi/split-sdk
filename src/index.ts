@@ -1714,3 +1714,48 @@ export type {
   RetirementManagerOptions,
   RetirementEventMap,
 } from "./invoiceRetirement.js";
+
+// Input sanitization and validation (#1057)
+export {
+  InputSanitizationError,
+  sanitizeString,
+  validateAmount,
+  validateAndParseAmount,
+  validateAddress,
+  sanitizeObject,
+} from "./inputSanitizer.js";
+export type {
+  SanitizeStringOptions,
+  AmountValidationOptions,
+  AddressValidationOptions,
+  SanitizeObjectOptions,
+} from "./inputSanitizer.js";
+
+// Outbound request rate limiting (#1058)
+export { RateLimiter, RateLimitStore } from "./rateLimiter.js";
+export type { RateLimiterConfig, RateLimitCheck } from "./rateLimiter.js";
+
+// CSRF protection utilities (#1059)
+export {
+  CsrfTokenManager,
+  CsrfError,
+  generateCsrfToken,
+  hashCsrfToken,
+  csrfTokensMatch,
+  extractCsrfToken,
+  CSRF_HEADER_NAME,
+  CSRF_COOKIE_NAME,
+} from "./csrf.js";
+export type { CsrfTokenManagerOptions } from "./csrf.js";
+
+// Secure private-key storage (#1060)
+export {
+  SecureKeyStore,
+  MemoryKeyStoreBackend,
+  KeyStorageError,
+  KeyNotFoundError,
+  KeyIntegrityError,
+  KeyRotationError,
+} from "./secureKeyStore.js";
+export type { KeyStoreBackend, SecureKeyStoreOptions } from "./secureKeyStore.js";
+
