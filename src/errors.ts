@@ -2357,185 +2357,222 @@ export function isBatchTooLargeError(err: unknown): err is BatchTooLargeError {
 }
 
 // ---------------------------------------------------------------------------
-// Invoice versioning errors (#1056)
+// Rounds, Milestones, and Referrals Errors (issues #878, #879, #880, #881)
 // ---------------------------------------------------------------------------
 
-/** Thrown when a requested invoice version does not exist. */
-export class InvoiceVersionNotFoundError extends StellarSplitError {
+/** Thrown when closeRound is called before the round timestamp has ended. */
+export class RoundNotEndedError extends StellarSplitError {
   readonly invoiceId: string;
-  readonly version: number;
+  readonly roundEnd: number;
 
-  constructor(invoiceId: string, version: number) {
+  constructor(invoiceId: string, roundEnd: number, raw?: string) {
     super(
-      `Version ${version} not found for invoice "${invoiceId}"`,
-      "INVOICE_VERSION_NOT_FOUND",
-      { invoiceId, version },
+      `Round has not ended yet for invoice ${invoiceId} (ends at ${roundEnd})`,
+      "ROUND_NOT_ENDED",
+      { invoiceId, roundEnd },
+      raw
     );
-    this.name = "InvoiceVersionNotFoundError";
+    this.name = "RoundNotEndedError";
     this.invoiceId = invoiceId;
-    this.version = version;
+    this.roundEnd = roundEnd;
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
 
-export function isInvoiceVersionNotFoundError(err: unknown): err is InvoiceVersionNotFoundError {
-  return err instanceof InvoiceVersionNotFoundError;
+export function isRoundNotEndedError(err: unknown): err is RoundNotEndedError {
+  return err instanceof RoundNotEndedError;
 }
 
-/** Thrown when an invoice rollback operation fails safety checks. */
-export class UnsafeRollbackError extends StellarSplitError {
+/** Thrown when completeMilestone is called for an index that is not active. */
+export class WrongMilestoneError extends StellarSplitError {
   readonly invoiceId: string;
-  readonly targetVersion: number;
-  readonly reason: string;
+  readonly requestedIndex: number;
+  readonly activeIndex: number;
 
-  constructor(invoiceId: string, targetVersion: number, reason: string) {
+  constructor(invoiceId: string, requestedIndex: number, activeIndex: number, raw?: string) {
     super(
-      `Cannot safely roll back invoice "${invoiceId}" to version ${targetVersion}: ${reason}`,
-      "UNSAFE_ROLLBACK",
-      { invoiceId, targetVersion, reason },
+      `Milestone ${requestedIndex} is not active for invoice ${invoiceId} (active: ${activeIndex})`,
+      "WRONG_MILESTONE",
+      { invoiceId, requestedIndex, activeIndex },
+      raw
     );
-    this.name = "UnsafeRollbackError";
+    this.name = "WrongMilestoneError";
     this.invoiceId = invoiceId;
-    this.targetVersion = targetVersion;
-    this.reason = reason;
+    this.requestedIndex = requestedIndex;
+    this.activeIndex = activeIndex;
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
 
-export function isUnsafeRollbackError(err: unknown): err is UnsafeRollbackError {
-  return err instanceof UnsafeRollbackError;
+export function isWrongMilestoneError(err: unknown): err is WrongMilestoneError {
+  return err instanceof WrongMilestoneError;
 }
 
-/** Thrown when an invalid version identifier or vector is encountered. */
-export class InvalidVersionError extends StellarSplitError {
-  readonly version: unknown;
+/** Thrown when claimReferralRewards is called with a zero balance. */
+export class NothingToClaimError extends StellarSplitError {
+  readonly address: string;
 
-  constructor(message: string, version?: unknown) {
-    super(message, "INVALID_VERSION", { version });
-    this.name = "InvalidVersionError";
-    this.version = version;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isInvalidVersionError(err: unknown): err is InvalidVersionError {
-  return err instanceof InvalidVersionError;
-}
-
-// ---------------------------------------------------------------------------
-// Smart contract ABI cache errors (#1054)
-// ---------------------------------------------------------------------------
-
-/** Thrown when fetching a contract ABI fails. */
-export class AbiFetchError extends StellarSplitError {
-  readonly contractId: string;
-
-  constructor(contractId: string, cause?: unknown) {
-    const causeMsg = cause instanceof Error ? cause.message : String(cause ?? "Unknown error");
+  constructor(address: string, raw?: string) {
     super(
-      `Failed to fetch ABI for contract "${contractId}": ${causeMsg}`,
-      "ABI_FETCH_FAILED",
-      { contractId, cause: causeMsg },
+      `No referral rewards to claim for address ${address}`,
+      "NOTHING_TO_CLAIM",
+      { address },
+      raw
     );
-    this.name = "AbiFetchError";
-    this.contractId = contractId;
+    this.name = "NothingToClaimError";
+    this.address = address;
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
 
-export function isAbiFetchError(err: unknown): err is AbiFetchError {
-  return err instanceof AbiFetchError;
+export function isNothingToClaimError(err: unknown): err is NothingToClaimError {
+  return err instanceof NothingToClaimError;
 }
 
-/** Thrown when an ABI cannot be found for a given contract. */
-export class AbiNotFoundError extends StellarSplitError {
-  readonly contractId: string;
+/** Thrown when an invoice is expired (round_end / deadline already passed). */
+export class InvoiceExpiredError extends StellarSplitError {
+  readonly invoiceId: string;
 
-  constructor(contractId: string) {
+  constructor(invoiceId: string, raw?: string) {
+    super(`Invoice ${invoiceId} has expired`, "INVOICE_EXPIRED", { invoiceId }, raw);
+    this.name = "InvoiceExpiredError";
+    this.invoiceId = invoiceId;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isInvoiceExpiredError(err: unknown): err is InvoiceExpiredError {
+  return err instanceof InvoiceExpiredError;
+}
+
+/** Thrown when payer is not on the whitelist for a restricted invoice. */
+export class PayerNotWhitelistedError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly payer: string;
+
+  constructor(invoiceId: string, payer: string, raw?: string) {
     super(
-      `No ABI found for contract "${contractId}"`,
-      "ABI_NOT_FOUND",
-      { contractId },
+      `Payer ${payer} is not whitelisted for invoice ${invoiceId}`,
+      "PAYER_NOT_WHITELISTED",
+      { invoiceId, payer },
+      raw
     );
-    this.name = "AbiNotFoundError";
-    this.contractId = contractId;
+    this.name = "PayerNotWhitelistedError";
+    this.invoiceId = invoiceId;
+    this.payer = payer;
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
 
-export function isAbiNotFoundError(err: unknown): err is AbiNotFoundError {
-  return err instanceof AbiNotFoundError;
+export function isPayerNotWhitelistedError(err: unknown): err is PayerNotWhitelistedError {
+  return err instanceof PayerNotWhitelistedError;
 }
 
-// ---------------------------------------------------------------------------
-// Invoice collaboration errors (#1053)
-// ---------------------------------------------------------------------------
+/** Thrown when a payer's contribution exceeds their per-payer cap. */
+export class ContributionCapExceededError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly payer: string;
+  readonly cap: bigint;
+  readonly attempted: bigint;
 
-/** Base error for invoice collaboration workflows. */
-export class CollaborationError extends StellarSplitError {
-  constructor(message: string, code: string = "COLLABORATION_ERROR", context?: Record<string, unknown>) {
-    super(message, code, context);
-    this.name = "CollaborationError";
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isCollaborationError(err: unknown): err is CollaborationError {
-  return err instanceof CollaborationError;
-}
-
-/** Thrown when an invoice comment is not found. */
-export class CommentNotFoundError extends CollaborationError {
-  readonly commentId: string;
-
-  constructor(commentId: string) {
-    super(`Comment not found: ${commentId}`, "COMMENT_NOT_FOUND", { commentId });
-    this.name = "CommentNotFoundError";
-    this.commentId = commentId;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isCommentNotFoundError(err: unknown): err is CommentNotFoundError {
-  return err instanceof CommentNotFoundError;
-}
-
-/** Thrown when an approval request is not found. */
-export class ApprovalRequestNotFoundError extends CollaborationError {
-  readonly requestId: string;
-
-  constructor(requestId: string) {
-    super(`Approval request not found: ${requestId}`, "APPROVAL_REQUEST_NOT_FOUND", { requestId });
-    this.name = "ApprovalRequestNotFoundError";
-    this.requestId = requestId;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isApprovalRequestNotFoundError(err: unknown): err is ApprovalRequestNotFoundError {
-  return err instanceof ApprovalRequestNotFoundError;
-}
-
-/** Thrown when an actor is unauthorized to perform a collaboration action. */
-export class UnauthorizedCollaborationError extends CollaborationError {
-  readonly actor: string;
-  readonly action: string;
-
-  constructor(actor: string, action: string, reason?: string) {
+  constructor(invoiceId: string, payer: string, cap: bigint, attempted: bigint, raw?: string) {
     super(
-      `Actor "${actor}" is not authorized to ${action}${reason ? `: ${reason}` : ""}`,
-      "UNAUTHORIZED_COLLABORATION",
-      { actor, action, reason },
+      `Contribution cap exceeded for payer ${payer} on invoice ${invoiceId}: cap ${cap}, attempted ${attempted}`,
+      "CONTRIBUTION_CAP_EXCEEDED",
+      { invoiceId, payer, cap: cap.toString(), attempted: attempted.toString() },
+      raw
     );
-    this.name = "UnauthorizedCollaborationError";
-    this.actor = actor;
-    this.action = action;
+    this.name = "ContributionCapExceededError";
+    this.invoiceId = invoiceId;
+    this.payer = payer;
+    this.cap = cap;
+    this.attempted = attempted;
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
 
-export function isUnauthorizedCollaborationError(err: unknown): err is UnauthorizedCollaborationError {
-  return err instanceof UnauthorizedCollaborationError;
+export function isContributionCapExceededError(err: unknown): err is ContributionCapExceededError {
+  return err instanceof ContributionCapExceededError;
 }
 
+/**
+ * Thrown when a payment is attempted during an active cooldown window.
+ * Includes retryAfter so callers know when they may try again.
+ */
+export class PaymentCooldownActiveError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly payer: string;
+  /** The earliest time after which the payer may retry. */
+  readonly retryAfter: Date;
+
+  constructor(invoiceId: string, payer: string, retryAfterTimestamp: number, raw?: string) {
+    const retryAfter = new Date(retryAfterTimestamp * 1000);
+    super(
+      `Payment cooldown active for payer ${payer} on invoice ${invoiceId}. Retry after ${retryAfter.toISOString()}`,
+      "PAYMENT_COOLDOWN_ACTIVE",
+      { invoiceId, payer, retryAfterTimestamp },
+      raw
+    );
+    this.name = "PaymentCooldownActiveError";
+    this.invoiceId = invoiceId;
+    this.payer = payer;
+    this.retryAfter = retryAfter;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isPaymentCooldownActiveError(err: unknown): err is PaymentCooldownActiveError {
+  return err instanceof PaymentCooldownActiveError;
+}
+
+/** Thrown when the contract is administratively frozen for all operations. */
+export class ContractFrozenError extends StellarSplitError {
+  constructor(raw?: string) {
+    super("Contract is frozen and not accepting operations", "CONTRACT_FROZEN", undefined, raw);
+    this.name = "ContractFrozenError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isContractFrozenError(err: unknown): err is ContractFrozenError {
+  return err instanceof ContractFrozenError;
+}
+
+/** Thrown when an invoice has been fully funded and cannot receive more payments. */
+export class InvoiceFullyFundedError extends StellarSplitError {
+  readonly invoiceId: string;
+
+  constructor(invoiceId: string, raw?: string) {
+    super(`Invoice ${invoiceId} is already fully funded`, "INVOICE_FULLY_FUNDED", { invoiceId }, raw);
+    this.name = "InvoiceFullyFundedError";
+    this.invoiceId = invoiceId;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isInvoiceFullyFundedError(err: unknown): err is InvoiceFullyFundedError {
+  return err instanceof InvoiceFullyFundedError;
+}
+
+/** Thrown when delegate limit is reached. */
+export class DelegateLimitReachedError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly limit: number;
+
+  constructor(invoiceId: string, limit: number = 3) {
+    super(
+      `Invoice ${invoiceId} has reached the delegate limit of ${limit}`,
+      "DELEGATE_LIMIT_REACHED",
+      { invoiceId, limit },
+    );
+    this.name = "DelegateLimitReachedError";
+    this.invoiceId = invoiceId;
+    this.limit = limit;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isDelegateLimitReachedError(err: unknown): err is DelegateLimitReachedError {
+  return err instanceof DelegateLimitReachedError;
+}
 

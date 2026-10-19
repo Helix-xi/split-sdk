@@ -425,7 +425,7 @@ export { watchContractUpgrade } from "./upgrade.js";
 
 export { calculateFee } from "./fee.js";
 
-export { formatAddress } from "./utils.js";
+export { formatAddress, parseAmount, formatAmount } from "./utils.js";
 
 export { resolveToken } from "./token.js";
 
@@ -1548,6 +1548,16 @@ export { LazyInitializer } from "./client/LazyInitializer.js";
 export { SplitClient } from "./client/SplitClient.js";
 export type { SplitClientConfig } from "./client/SplitClient.js";
 export {
+  BaseClientModule,
+  InvoiceModule,
+  PaymentModule,
+  DisputeModule,
+  AdminModule,
+  GroupModule,
+  TemplateModule,
+  MilestoneModule,
+} from "./client/modules/index.js";
+export {
   RpcConnectionError,
   isRpcConnectionError,
 } from "./errors.js";
@@ -1736,83 +1746,59 @@ export type {
   RetirementEventMap,
 } from "./invoiceRetirement.js";
 
-// ---------------------------------------------------------------------------
-// Invoice Versioning System (#1056)
-// ---------------------------------------------------------------------------
+// Multi-wallet support (#1027)
 export {
-  InvoiceVersionTracker,
-  InvoiceVersionManager,
-  InMemoryVersionStore,
-  computeChecksum,
-  detectVersionConflict,
-  ConflictError,
-} from "./invoiceVersioning.js";
+  MultiWalletManager,
+  MetaMaskConnector,
+  WalletConnectConnector,
+  LedgerConnector,
+  MetaMaskAdapter,
+  MetaMaskNotInstalledError,
+  MetaMaskConnectionError,
+  UserRejectedError,
+  WalletFallbackExhaustedError,
+  WalletNotAvailableError,
+} from "./multiWallet.js";
 export type {
-  InvoiceVersion,
-  InvoiceVersionDiff,
-  VersionStore,
-  InvoiceVersionTrackerOptions,
-  RollbackOptions,
-  InvoiceRollbackResult,
-  ChangeLogEntry,
-  VersionVector,
-} from "./invoiceVersioning.js";
+  WalletAttemptLog,
+  MultiWalletOptions,
+  MultiWalletEvent,
+  MultiWalletEventType,
+  MultiWalletEventListener,
+} from "./multiWallet.js";
 
-// ---------------------------------------------------------------------------
-// Payment Analytics & Performance Engine (#1055)
-// ---------------------------------------------------------------------------
-export { PaymentAnalyticsEngine } from "./paymentAnalytics.js";
-export type {
-  PaymentAnalyticsFilter,
-  StatusDistribution,
-  TokenDistribution,
-  PaymentDistributionStats,
-  PaymentTimingMetrics,
-  PaymentAnalyticsSummary,
-  PayerAnalyticsRecord,
-  PayerCohortSummary,
-  TimeSeriesDataPoint,
-  InvoicePerformanceRecord,
-  PaymentAnalyticsReport,
-  StructuredChartData,
-} from "./paymentAnalytics.js";
-
-// ---------------------------------------------------------------------------
-// Smart Contract ABI Caching Layer (#1054)
-// ---------------------------------------------------------------------------
+// Transaction simulation before execution (#1028)
 export {
-  ContractAbiCache,
-  MemoryAbiStorage,
-  AdapterAbiStorage,
-  StaticContractAbiFetcher,
-  RpcContractAbiFetcher,
-} from "./abiCache.js";
+  TransactionSimulator,
+  TransactionSimulationError,
+} from "./transactionSimulator.js";
 export type {
-  ContractAbi,
-  AbiFunctionSpec,
-  AbiParamSpec,
-  AbiTypeSpec,
-  CachedAbiEntry,
-  AbiCacheStats,
-  AbiStorage,
-  ContractAbiFetcher,
-  AbiCacheOptions,
-} from "./abiCache.js";
+  SimulationRequest,
+  SimulationReport,
+  SimulationStatus,
+  SimulationErrorCode,
+  SimulationErrorDetail,
+  SimulationResourceUsage,
+  SimulationEvent,
+  TransactionSimulatorOptions,
+} from "./transactionSimulator.js";
 
-// ---------------------------------------------------------------------------
-// Invoice Collaboration & Approvals (#1053)
-// ---------------------------------------------------------------------------
-export { InvoiceCollaborationManager } from "./invoiceCollaboration.js";
+// Automatic nonce management (#1029)
+export {
+  NonceManager,
+  NonceError,
+  InvalidNonceError,
+  DuplicateNonceError,
+  StaleNonceError,
+  NonceGapError,
+} from "./nonceManager.js";
 export type {
-  InvoiceComment,
-  ThreadedComment,
-  ApprovalDecision,
-  ApprovalRequestStatus,
-  ApprovalRequest,
-  InvoiceApprovalSummary,
-  CollaborationNotificationType,
-  CollaborationNotification,
-  CollaborationNotificationHandler,
-  CollaborationEventMap,
-} from "./invoiceCollaboration.js";
+  NonceState,
+  NonceManagerOptions,
+  NonceResetOptions,
+  NonceValidationResult,
+  NonceEvent,
+  NonceEventType,
+  NonceEventListener,
+} from "./nonceManager.js";
 

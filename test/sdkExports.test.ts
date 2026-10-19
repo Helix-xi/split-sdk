@@ -25,35 +25,16 @@ describe("public API surface (issues #586, #588, #589)", () => {
     expect(typeof sdk.isWalletConnectionTimeoutError).toBe("function");
   });
 
-  it("exports invoice versioning components (#1056)", () => {
-    expect(typeof sdk.InvoiceVersionTracker).toBe("function");
-    expect(typeof sdk.InvoiceVersionManager).toBe("function");
-    expect(typeof sdk.InMemoryVersionStore).toBe("function");
-    expect(typeof sdk.computeChecksum).toBe("function");
-    expect(typeof sdk.InvoiceVersionNotFoundError).toBe("function");
-    expect(typeof sdk.UnsafeRollbackError).toBe("function");
-    expect(typeof sdk.InvalidVersionError).toBe("function");
-  });
-
-  it("exports payment analytics components (#1055)", () => {
-    expect(typeof sdk.PaymentAnalyticsEngine).toBe("function");
-  });
-
-  it("exports smart contract ABI caching components (#1054)", () => {
-    expect(typeof sdk.ContractAbiCache).toBe("function");
-    expect(typeof sdk.MemoryAbiStorage).toBe("function");
-    expect(typeof sdk.AdapterAbiStorage).toBe("function");
-    expect(typeof sdk.StaticContractAbiFetcher).toBe("function");
-    expect(typeof sdk.RpcContractAbiFetcher).toBe("function");
-    expect(typeof sdk.AbiFetchError).toBe("function");
-    expect(typeof sdk.AbiNotFoundError).toBe("function");
-  });
-
-  it("exports invoice collaboration components (#1053)", () => {
-    expect(typeof sdk.InvoiceCollaborationManager).toBe("function");
-    expect(typeof sdk.CollaborationError).toBe("function");
-    expect(typeof sdk.CommentNotFoundError).toBe("function");
-    expect(typeof sdk.ApprovalRequestNotFoundError).toBe("function");
-    expect(typeof sdk.UnauthorizedCollaborationError).toBe("function");
+  it("exports parseAmount, InvoiceStateSubscriber, WebhookClient, and AnalyticsTracker (#1034, #1035, #1036, #1037)", () => {
+    expect(typeof sdk.parseAmount).toBe("function");
+    expect(typeof sdk.InvoiceStateSubscriber).toBe("function");
+    expect(typeof sdk.matchesFilter).toBe("function");
+    expect(typeof sdk.WebhookClient).toBe("function");
+    expect(typeof sdk.WebhookVerificationError).toBe("function");
+    expect(typeof sdk.AnalyticsTracker).toBe("function");
+    expect(typeof sdk.AnalyticsCollector).toBe("function");
+    expect(typeof sdk.PrivacyController).toBe("function");
+    expect(typeof sdk.wrapClientWithAnalytics).toBe("function");
   });
 });
+

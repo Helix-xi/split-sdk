@@ -3,6 +3,20 @@ import {
   ValidationError,
   WalletNotConnectedError,
   RpcError,
+  PaymentCooldownActiveError,
+  RoundNotEndedError,
+  WrongMilestoneError,
+  NothingToClaimError,
+  InvoiceExpiredError,
+  PayerNotWhitelistedError,
+  ContributionCapExceededError,
+  ContractFrozenError,
+  InvoiceFullyFundedError,
+  DelegateLimitReachedError,
+  InvoiceFrozenError,
+  UnauthorizedError,
+  CircuitOpenError,
+  TransactionNotConfirmedError,
 } from "./errors.js";
 
 export interface RetryOptions {
@@ -16,12 +30,26 @@ export interface RetryOptions {
 export type PerMethodRetryOptions = Partial<RetryOptions>;
 
 export function isRetryable(error: unknown): boolean {
+  if (error instanceof PaymentCooldownActiveError) return true;
+  if (error instanceof CircuitOpenError) return true;
+  if (error instanceof TransactionNotConfirmedError) return true;
   if (error instanceof InvoiceNotFoundError) return false;
   if (error instanceof ValidationError) return false;
   if (error instanceof WalletNotConnectedError) return false;
+  if (error instanceof InvoiceFrozenError) return false;
+  if (error instanceof UnauthorizedError) return false;
+  if (error instanceof RoundNotEndedError) return false;
+  if (error instanceof WrongMilestoneError) return false;
+  if (error instanceof NothingToClaimError) return false;
+  if (error instanceof InvoiceExpiredError) return false;
+  if (error instanceof PayerNotWhitelistedError) return false;
+  if (error instanceof ContributionCapExceededError) return false;
+  if (error instanceof ContractFrozenError) return false;
+  if (error instanceof InvoiceFullyFundedError) return false;
+  if (error instanceof DelegateLimitReachedError) return false;
 
   if (error instanceof RpcError) {
-    return error.statusCode === 429 || error.statusCode === 503;
+    return error.statusCode === 429 || error.statusCode === 502 || error.statusCode === 503 || error.statusCode === 504;
   }
 
   if (!(error instanceof Error)) return false;
@@ -29,7 +57,7 @@ export function isRetryable(error: unknown): boolean {
   const msg = error.message.toLowerCase();
   return (
     error.name === "AbortError" ||
-    /timeout|timed out|network|failed to fetch|connection|connect|econnreset|econnrefused|eai_again|enotfound|429|503/.test(
+    /timeout|timed out|network|failed to fetch|connection|connect|econnreset|econnrefused|eai_again|enotfound|429|502|503|504/.test(
       msg
     )
   );
