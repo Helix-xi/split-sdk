@@ -237,6 +237,27 @@ export {
   // Batch operations errors (issue #855)
   BatchTooLargeError,
   isBatchTooLargeError,
+  // Invoice versioning errors (#1056)
+  InvoiceVersionNotFoundError,
+  isInvoiceVersionNotFoundError,
+  UnsafeRollbackError,
+  isUnsafeRollbackError,
+  InvalidVersionError,
+  isInvalidVersionError,
+  // Smart contract ABI cache errors (#1054)
+  AbiFetchError,
+  isAbiFetchError,
+  AbiNotFoundError,
+  isAbiNotFoundError,
+  // Invoice collaboration errors (#1053)
+  CollaborationError,
+  isCollaborationError,
+  CommentNotFoundError,
+  isCommentNotFoundError,
+  ApprovalRequestNotFoundError,
+  isApprovalRequestNotFoundError,
+  UnauthorizedCollaborationError,
+  isUnauthorizedCollaborationError,
 } from "./errors.js";
 
 // Invoice metadata JSON Schema validator (issue #533)
