@@ -52,6 +52,9 @@ export type SplitClientEventMap = {
   dispute: import("./contractEvents.js").DisputeEvent;
   /** Emitted when a tier is unlocked on an invoice. */
   tier_unlocked: import("./contractEvents.js").TierUnlockedEvent;
+  "queue:drained": undefined;
+  "queue:operation:failed": { operation: import("./offlineQueue.js").QueuedOperation; error: unknown };
+  "queue:conflict:resolved": { operation: import("./offlineQueue.js").QueuedOperation; strategy: string; remoteState?: unknown };
 };
 import { signTransaction } from "./wallet.js";
 import { telemetry } from "./telemetry.js";
@@ -238,6 +241,15 @@ import {
   WrongMilestoneError,
   NothingToClaimError,
 } from "./errors.js";
+import {
+  InvoiceModule,
+  PaymentModule,
+  DisputeModule,
+  AdminModule,
+  GroupModule,
+  TemplateModule,
+  MilestoneModule,
+} from "./client/modules/index.js";
 import { hashInvoice, verifyInvoiceHash } from "./invoiceHashVerifier.js";
 import { buildFeeBump } from "./feeBumpBuilder.js";
 import type { FeeBumpConfig } from "./feeBumpBuilder.js";
@@ -670,6 +682,21 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   private _queue = new PriorityQueue();
   private contract: Contract;
   private config: StellarSplitClientConfig;
+
+  /** Modular sub-client for invoice operations (#1079). */
+  readonly invoices: InvoiceModule;
+  /** Modular sub-client for payment operations (#1079). */
+  readonly payments: PaymentModule;
+  /** Modular sub-client for dispute and arbitration operations (#1079). */
+  readonly disputes: DisputeModule;
+  /** Modular sub-client for admin operations (#1079). */
+  readonly admin: AdminModule;
+  /** Modular sub-client for invoice grouping operations (#1079). */
+  readonly groups: GroupModule;
+  /** Modular sub-client for template and recurring invoice operations (#1079). */
+  readonly templates: TemplateModule;
+  /** Modular sub-client for milestone and funding round operations (#1079). */
+  readonly milestones: MilestoneModule;
   private _plugins = new Set<string>();
   private _pluginInstances: StellarSplitPlugin[] = [];
   private _pluginRegistry = new PluginRegistry();
@@ -924,6 +951,9 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     this._rpcClient = config.container?.getRPCClient() ?? null;
     this._adapter =
       config.container?.getWalletAdapter() ?? config.adapter ?? null;
+    if (config.offlineQueue) {
+      this._offlineQueue = new OfflineQueue(this, config.offlineQueue);
+    }
 
     // Per-method timeout manager (Issue #1)
   /**
@@ -1264,6 +1294,15 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       on: (event, handler) => this.on(event as keyof SplitClientEventMap, handler as never),
       off: (event, handler) => this.off(event as keyof SplitClientEventMap, handler as never),
     });
+
+    // Initialize logical modules (#1079)
+    this.invoices = new InvoiceModule(this);
+    this.payments = new PaymentModule(this);
+    this.disputes = new DisputeModule(this);
+    this.admin = new AdminModule(this);
+    this.groups = new GroupModule(this);
+    this.templates = new TemplateModule(this);
+    this.milestones = new MilestoneModule(this);
   }
 
   /**
@@ -1305,6 +1344,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
   clearOfflineQueue(): void {
     if (this._offlineQueue) this._offlineQueue.clear();
+  }
+
+  async syncOfflineQueue(conflictStrategy?: import("./types.js").ConflictStrategy) {
+    if (!this._offlineQueue) return null;
+    return this._offlineQueue.sync(conflictStrategy);
   }
 
   async switchTo(network: "mainnet" | "testnet" | "futurenet"): Promise<void> {
@@ -3378,6 +3422,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         "pay",
         params as unknown as Record<string, unknown>,
       );
+    }
+    if (this._offlineQueue?.config?.enabled) {
+      try {
+        const health = await this.checkRPCHealth();
+        if (health.status === "down") {
+          this._offlineQueue.enqueue("pay", [params]);
+          return { txHash: "queued" };
+        }
+      } catch (e) {
+        this._offlineQueue.enqueue("pay", [params]);
+        return { txHash: "queued" };
+      }
     }
     const startTime = Date.now();
     params = this._pluginRegistry.runBeforeCall("pay", params);
@@ -10709,15 +10765,23 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @throws {Error} If the method fails.
    */
   async connectWallet(adapter: WalletAdapter): Promise<string> {
-    const address = await adapter.connect();
+    const address =
+      typeof (adapter as any).connect === "function"
+        ? await (adapter as any).connect()
+        : await adapter.getAddress();
     this._adapter = adapter;
 
     // Listen for account changes and update internal reference
-    adapter.onAccountChange((newAddress: string) => {
-      this.emit("wallet:accountChanged", newAddress);
-    });
+    if (typeof (adapter as any).onAccountChange === "function") {
+      (adapter as any).onAccountChange((newAddress: string) => {
+        this.emit("wallet:accountChanged", newAddress);
+      });
+    }
 
-    this.emit("wallet:connected", { walletName: adapter.name, address });
+    this.emit("wallet:connected", {
+      walletName: (adapter as any).name ?? "Wallet",
+      address,
+    });
     return address;
   }
 
@@ -11416,3 +11480,8 @@ function toBigInt(value: unknown): bigint {
   if (typeof value === "string" && value !== "") return BigInt(value);
   return 0n;
 }
+
+// ---------------------------------------------------------------------------
+// Client modules (issue #1079)
+// ---------------------------------------------------------------------------
+export * from "./client/modules/index.js";
