@@ -309,8 +309,12 @@ export class UnauthorizedError extends StellarSplitError {
 
 /** Thrown when validation fails for input data (e.g., template deserialization). */
 export class ValidationError extends StellarSplitError {
-  constructor(message: string, context?: Record<string, unknown>) {
-    super(message, "VALIDATION_ERROR", context, message);
+  constructor(
+    message: string,
+    context?: Record<string, unknown>,
+    code: string = "VALIDATION_ERROR"
+  ) {
+    super(message, code, context, message);
     this.name = "ValidationError";
     Object.setPrototypeOf(this, new.target.prototype);
   }
@@ -2251,16 +2255,112 @@ export class ChannelExhaustedError extends StellarSplitError {
 // so callers can switch on `err.code` instead of string-matching `.message`.
 // ---------------------------------------------------------------------------
 
-/** Machine-readable error codes carried by {@link SdkError}. */
+/**
+ * Machine-readable error codes carried by {@link SdkError}.
+ *
+ * Grouped by failure category and designed to be comprehensive: every
+ * distinct SDK failure mode maps to exactly one code. Use
+ * {@link describeSdkErrorCode} for a human-readable description of each code
+ * and {@link isRetryableErrorCode} to check whether the failure is transient
+ * and safe to retry.
+ *
+ * @see {@link SDK_ERROR_CODE_DESCRIPTIONS} for per-code descriptions.
+ * @see docs/ERROR_CODES.md for the full error-code and recovery reference.
+ */
 export enum SdkErrorCode {
+  // --- Invoice / resource lifecycle -----------------------------------
+  /** The requested invoice does not exist on-chain. */
   INVOICE_NOT_FOUND = "INVOICE_NOT_FOUND",
-  ACCOUNT_NOT_FOUND = "ACCOUNT_NOT_FOUND",
-  INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS",
+  /** The invoice exists but is not in the Pending state required by the operation. */
+  INVOICE_NOT_PENDING = "INVOICE_NOT_PENDING",
+  /** The invoice's payment deadline has passed. */
   DEADLINE_EXPIRED = "DEADLINE_EXPIRED",
+  /** The invoice is frozen (active dispute or lock) and cannot be modified. */
+  INVOICE_FROZEN = "INVOICE_FROZEN",
+
+  // --- Accounts & funds -----------------------------------------------
+  /** The referenced Stellar account does not exist on the network. */
+  ACCOUNT_NOT_FOUND = "ACCOUNT_NOT_FOUND",
+  /** The account balance is too low to cover the operation. */
+  INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS",
+
+  // --- Input validation ------------------------------------------------
+  /** A generic input failed validation (malformed JSON, out-of-range value, ...). */
+  INVALID_INPUT = "INVALID_INPUT",
+  /** A Stellar account address (`G...`/`M...`) is malformed. */
+  INVALID_ADDRESS = "INVALID_ADDRESS",
+  /** A Soroban contract address (`C...`) is malformed or fails its checksum. */
+  INVALID_CONTRACT_ADDRESS = "INVALID_CONTRACT_ADDRESS",
+  /** A payment amount is malformed or out of range. */
+  INVALID_AMOUNT = "INVALID_AMOUNT",
+  /** One or more recipient addresses are invalid. */
   INVALID_RECIPIENT = "INVALID_RECIPIENT",
-  CONTRACT_REJECTED = "CONTRACT_REJECTED",
+  /** The SDK configuration is invalid. */
+  INVALID_CONFIG = "INVALID_CONFIG",
+
+  // --- Network / transport --------------------------------------------
+  /** A generic network failure (DNS, TLS, connection reset, ...). */
+  NETWORK_ERROR = "NETWORK_ERROR",
+  /** A network request timed out. */
   NETWORK_TIMEOUT = "NETWORK_TIMEOUT",
+  /** The RPC node rejected or failed to process the request. */
+  RPC_FAILED = "RPC_FAILED",
+  /** Horizon returned an error response. */
+  HORIZON_ERROR = "HORIZON_ERROR",
+  /** The service is temporarily unavailable (overloaded or down). */
+  SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE",
+  /** The endpoint is rate limiting requests. */
   RATE_LIMITED = "RATE_LIMITED",
+
+  // --- Transaction lifecycle ------------------------------------------
+  /** The transaction was rejected or failed on-chain. */
+  TRANSACTION_FAILED = "TRANSACTION_FAILED",
+  /** The transaction's time bounds elapsed before it was included in a ledger. */
+  TRANSACTION_EXPIRED = "TRANSACTION_EXPIRED",
+  /** The transaction's sequence number does not match the account state. */
+  SEQUENCE_MISMATCH = "SEQUENCE_MISMATCH",
+  /** The provided fee is below the network minimum or the resource fee quote. */
+  INSUFFICIENT_FEE = "INSUFFICIENT_FEE",
+  /** Submitting the transaction to the network failed. */
+  SUBMISSION_FAILED = "SUBMISSION_FAILED",
+  /** The transaction was submitted but was not confirmed in time. */
+  CONFIRMATION_TIMEOUT = "CONFIRMATION_TIMEOUT",
+  /** Pre-submit transaction verification found one or more failed checks. */
+  VERIFICATION_FAILED = "VERIFICATION_FAILED",
+  /** A required signature is missing from the transaction. */
+  MISSING_SIGNATURE = "MISSING_SIGNATURE",
+  /** A signature present on the transaction failed cryptographic verification. */
+  INVALID_SIGNATURE = "INVALID_SIGNATURE",
+
+  // --- Soroban contract execution --------------------------------------
+  /** The referenced contract does not exist on the network. */
+  CONTRACT_NOT_FOUND = "CONTRACT_NOT_FOUND",
+  /** The contract rejected the transaction (panic or error result). */
+  CONTRACT_REJECTED = "CONTRACT_REJECTED",
+  /** Simulating the contract invocation failed. */
+  SIMULATION_FAILED = "SIMULATION_FAILED",
+  /** The invocation exceeded the Soroban CPU or memory budget. */
+  OUT_OF_RESOURCE = "OUT_OF_RESOURCE",
+
+  // --- Authorization ---------------------------------------------------
+  /** The caller is not authorized to perform the operation. */
+  UNAUTHORIZED = "UNAUTHORIZED",
+  /** No wallet is connected (or the wallet connection was lost). */
+  WALLET_NOT_CONNECTED = "WALLET_NOT_CONNECTED",
+  /** Wallet / signer authentication failed. */
+  AUTHENTICATION_FAILED = "AUTHENTICATION_FAILED",
+
+  // --- Operational / state ---------------------------------------------
+  /** Concurrent modification produced a state conflict (e.g. merge conflict). */
+  STATE_CONFLICT = "STATE_CONFLICT",
+  /** The circuit breaker is open and calls are being short-circuited. */
+  CIRCUIT_OPEN = "CIRCUIT_OPEN",
+  /** The operation was aborted before completion. */
+  OPERATION_ABORTED = "OPERATION_ABORTED",
+  /** A batch exceeds the maximum permitted size. */
+  BATCH_TOO_LARGE = "BATCH_TOO_LARGE",
+  /** An unexpected internal SDK error. */
+  INTERNAL_ERROR = "INTERNAL_ERROR",
 }
 
 /** Generic SDK error carrying a typed {@link SdkErrorCode} and optional details. */
@@ -2279,6 +2379,163 @@ export class SdkError extends Error {
 
 export function isSdkError(err: unknown): err is SdkError {
   return err instanceof SdkError;
+}
+
+/**
+ * Human-readable description for every {@link SdkErrorCode}.
+ *
+ * Exhaustive by construction: adding a new code to the enum without adding a
+ * description here is a compile error.
+ */
+export const SDK_ERROR_CODE_DESCRIPTIONS: Record<SdkErrorCode, string> = {
+  [SdkErrorCode.INVOICE_NOT_FOUND]: "The requested invoice does not exist on-chain.",
+  [SdkErrorCode.INVOICE_NOT_PENDING]:
+    "The invoice is not in the Pending state required by this operation.",
+  [SdkErrorCode.DEADLINE_EXPIRED]: "The invoice's payment deadline has passed.",
+  [SdkErrorCode.INVOICE_FROZEN]: "The invoice is frozen due to an active dispute or lock.",
+  [SdkErrorCode.ACCOUNT_NOT_FOUND]: "The referenced Stellar account does not exist on the network.",
+  [SdkErrorCode.INSUFFICIENT_FUNDS]: "The account balance is too low to cover the operation.",
+  [SdkErrorCode.INVALID_INPUT]: "A generic input failed validation.",
+  [SdkErrorCode.INVALID_ADDRESS]: "A Stellar account address is malformed.",
+  [SdkErrorCode.INVALID_CONTRACT_ADDRESS]:
+    "A Soroban contract address is malformed or fails its CRC16 checksum.",
+  [SdkErrorCode.INVALID_AMOUNT]: "A payment amount is malformed or out of range.",
+  [SdkErrorCode.INVALID_RECIPIENT]: "One or more recipient addresses are invalid.",
+  [SdkErrorCode.INVALID_CONFIG]: "The SDK configuration is invalid.",
+  [SdkErrorCode.NETWORK_ERROR]: "A network-level failure occurred (DNS, TLS, connection reset).",
+  [SdkErrorCode.NETWORK_TIMEOUT]: "A network request timed out.",
+  [SdkErrorCode.RPC_FAILED]: "The RPC node rejected or failed to process the request.",
+  [SdkErrorCode.HORIZON_ERROR]: "Horizon returned an error response.",
+  [SdkErrorCode.SERVICE_UNAVAILABLE]: "The network endpoint is temporarily unavailable.",
+  [SdkErrorCode.RATE_LIMITED]: "The endpoint is rate limiting requests.",
+  [SdkErrorCode.TRANSACTION_FAILED]: "The transaction was rejected or failed on-chain.",
+  [SdkErrorCode.TRANSACTION_EXPIRED]:
+    "The transaction's time bounds elapsed before it was included in a ledger.",
+  [SdkErrorCode.SEQUENCE_MISMATCH]:
+    "The transaction's sequence number does not match the account's current sequence.",
+  [SdkErrorCode.INSUFFICIENT_FEE]: "The provided fee is below the required minimum.",
+  [SdkErrorCode.SUBMISSION_FAILED]: "Submitting the transaction to the network failed.",
+  [SdkErrorCode.CONFIRMATION_TIMEOUT]:
+    "The transaction was submitted but was not confirmed in time.",
+  [SdkErrorCode.VERIFICATION_FAILED]:
+    "Pre-submit transaction verification found one or more failed checks.",
+  [SdkErrorCode.MISSING_SIGNATURE]: "A required signature is missing from the transaction.",
+  [SdkErrorCode.INVALID_SIGNATURE]:
+    "A signature on the transaction failed cryptographic verification.",
+  [SdkErrorCode.CONTRACT_NOT_FOUND]: "The referenced contract does not exist on the network.",
+  [SdkErrorCode.CONTRACT_REJECTED]:
+    "The contract rejected the transaction (panic or error result).",
+  [SdkErrorCode.SIMULATION_FAILED]: "Simulating the contract invocation failed.",
+  [SdkErrorCode.OUT_OF_RESOURCE]: "The invocation exceeded the Soroban CPU or memory budget.",
+  [SdkErrorCode.UNAUTHORIZED]: "The caller is not authorized to perform the operation.",
+  [SdkErrorCode.WALLET_NOT_CONNECTED]: "No wallet is connected, or the connection was lost.",
+  [SdkErrorCode.AUTHENTICATION_FAILED]: "Wallet or signer authentication failed.",
+  [SdkErrorCode.STATE_CONFLICT]: "Concurrent modification produced a state conflict.",
+  [SdkErrorCode.CIRCUIT_OPEN]: "The circuit breaker is open and calls are short-circuited.",
+  [SdkErrorCode.OPERATION_ABORTED]: "The operation was aborted before completion.",
+  [SdkErrorCode.BATCH_TOO_LARGE]: "A batch exceeds the maximum permitted size.",
+  [SdkErrorCode.INTERNAL_ERROR]: "An unexpected internal SDK error occurred.",
+};
+
+/**
+ * Codes that describe transient failures where retrying the same logical
+ * request (unchanged) is safe and may succeed.
+ *
+ * Deliberately conservative: transaction-state errors such as
+ * `SEQUENCE_MISMATCH` or `TRANSACTION_FAILED` are excluded because a blind
+ * retry can double-submit; they require rebuilding the transaction instead.
+ */
+export const RETRYABLE_ERROR_CODES: ReadonlySet<SdkErrorCode> = new Set<SdkErrorCode>([
+  SdkErrorCode.NETWORK_TIMEOUT,
+  SdkErrorCode.NETWORK_ERROR,
+  SdkErrorCode.RPC_FAILED,
+  SdkErrorCode.HORIZON_ERROR,
+  SdkErrorCode.SERVICE_UNAVAILABLE,
+  SdkErrorCode.RATE_LIMITED,
+  SdkErrorCode.CONFIRMATION_TIMEOUT,
+]);
+
+/**
+ * Return a human-readable description for an {@link SdkErrorCode}.
+ *
+ * Unknown strings fall back to a generic description so callers can safely
+ * pass through arbitrary code strings (e.g. from parsed error payloads).
+ *
+ * @param code - An SdkErrorCode member or any code string (matched
+ *   case-insensitively).
+ */
+export function describeSdkErrorCode(code: SdkErrorCode | string): string {
+  return (
+    SDK_ERROR_CODE_DESCRIPTIONS[code.toUpperCase() as SdkErrorCode] ??
+    "Unknown SDK error code."
+  );
+}
+
+/**
+ * Report whether a code describes a transient failure that is safe to retry
+ * unchanged. Unknown codes are treated as not retryable.
+ *
+ * @param code - An SdkErrorCode member or any code string (matched
+ *   case-insensitively).
+ */
+export function isRetryableErrorCode(code: SdkErrorCode | string): boolean {
+  return RETRYABLE_ERROR_CODES.has(code.toUpperCase() as SdkErrorCode);
+}
+
+// ---------------------------------------------------------------------------
+// Contract address validation error (issue #1065)
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown when a string is not a well-formed Soroban contract address
+ * (`C...`, 56 base32 characters, valid CRC16 checksum).
+ */
+export class InvalidContractAddressError extends StellarSplitError {
+  /** The rejected address value. */
+  readonly address: string;
+  /** Human-readable reason(s) the address was rejected. */
+  readonly reasons: string[];
+
+  constructor(address: string, reasons: string[]) {
+    super(
+      `Invalid contract address: ${reasons.join("; ")}`,
+      "INVALID_CONTRACT_ADDRESS",
+      { address, reasons },
+    );
+    this.name = "InvalidContractAddressError";
+    this.address = address;
+    this.reasons = reasons;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isInvalidContractAddressError(err: unknown): err is InvalidContractAddressError {
+  return err instanceof InvalidContractAddressError;
+}
+
+// ---------------------------------------------------------------------------
+// Transaction verification error (issue #1066)
+// ---------------------------------------------------------------------------
+
+/** Thrown by transaction verification when one or more checks fail. */
+export class TransactionVerificationError extends StellarSplitError {
+  /** Names of the verification checks that failed. */
+  readonly failedChecks: string[];
+
+  constructor(failedChecks: string[], context?: Record<string, unknown>) {
+    super(
+      `Transaction verification failed: ${failedChecks.join(", ")}`,
+      "VERIFICATION_FAILED",
+      { failedChecks, ...context },
+    );
+    this.name = "TransactionVerificationError";
+    this.failedChecks = failedChecks;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isTransactionVerificationError(err: unknown): err is TransactionVerificationError {
+  return err instanceof TransactionVerificationError;
 }
 
 // ---------------------------------------------------------------------------
@@ -2394,14 +2651,18 @@ export function isBatchTooLargeError(err: unknown): err is BatchTooLargeError {
   return err instanceof BatchTooLargeError;
 }
 
-/** Thrown when closeRound is called before round_end has passed. */
+// ---------------------------------------------------------------------------
+// Rounds, Milestones, and Referrals Errors (issues #878, #879, #880, #881)
+// ---------------------------------------------------------------------------
+
+/** Thrown when closeRound is called before the round timestamp has ended. */
 export class RoundNotEndedError extends StellarSplitError {
   readonly invoiceId: string;
   readonly roundEnd: number;
 
   constructor(invoiceId: string, roundEnd: number, raw?: string) {
     super(
-      `Fundraising round has not yet ended for invoice ${invoiceId} (round end: ${roundEnd})`,
+      `Round has not ended yet for invoice ${invoiceId} (ends at ${roundEnd})`,
       "ROUND_NOT_ENDED",
       { invoiceId, roundEnd },
       raw
@@ -2588,109 +2849,6 @@ export function isInvoiceFullyFundedError(err: unknown): err is InvoiceFullyFund
   return err instanceof InvoiceFullyFundedError;
 }
 
-/** Thrown when attempting to rate an invoice that is not yet released. */
-export class InvoiceNotReleasedForRatingError extends StellarSplitError {
-  readonly invoiceId: string;
-  readonly status: string;
-
-  constructor(invoiceId: string, status: string, raw?: string) {
-    super(
-      `Invoice ${invoiceId} is not released and cannot be rated (current: ${status})`,
-      "INVOICE_NOT_RELEASED_FOR_RATING",
-      { invoiceId, status },
-      raw
-    );
-    this.name = "InvoiceNotReleasedForRatingError";
-    this.invoiceId = invoiceId;
-    this.status = status;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isInvoiceNotReleasedForRatingError(err: unknown): err is InvoiceNotReleasedForRatingError {
-  return err instanceof InvoiceNotReleasedForRatingError;
-}
-
-/** Thrown when a payer has already rated an invoice. */
-export class AlreadyRatedError extends StellarSplitError {
-  readonly invoiceId: string;
-  readonly payer: string;
-
-  constructor(invoiceId: string, payer: string, raw?: string) {
-    super(
-      `Payer ${payer} has already rated invoice ${invoiceId}`,
-      "ALREADY_RATED",
-      { invoiceId, payer },
-      raw
-    );
-    this.name = "AlreadyRatedError";
-    this.invoiceId = invoiceId;
-    this.payer = payer;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isAlreadyRatedError(err: unknown): err is AlreadyRatedError {
-  return err instanceof AlreadyRatedError;
-}
-
-/** Thrown when a non-contributor attempts to vote on a deadline extension. */
-export class NotEligibleToVoteError extends StellarSplitError {
-  readonly invoiceId: string;
-  readonly caller: string;
-
-  constructor(invoiceId: string, caller: string, raw?: string) {
-    super(
-      `Caller ${caller} is not eligible to vote on invoice ${invoiceId} (must be a contributor)`,
-      "NOT_ELIGIBLE_TO_VOTE",
-      { invoiceId, caller },
-      raw
-    );
-    this.name = "NotEligibleToVoteError";
-    this.invoiceId = invoiceId;
-    this.caller = caller;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isNotEligibleToVoteError(err: unknown): err is NotEligibleToVoteError {
-  return err instanceof NotEligibleToVoteError;
-}
-
-// ---------------------------------------------------------------------------
-// Price oracle adapter errors
-// ---------------------------------------------------------------------------
-
-/** Thrown when a price oracle request is rate-limited by the upstream provider. */
-export class RateLimitError extends StellarSplitError {
-  /** Seconds the caller should wait before retrying, if known. */
-  readonly retryAfterSeconds?: number;
-
-  constructor(message: string, retryAfterSeconds?: number) {
-    super(message, "RATE_LIMITED", { retryAfterSeconds });
-    this.name = "RateLimitError";
-    this.retryAfterSeconds = retryAfterSeconds;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isRateLimitError(err: unknown): err is RateLimitError {
-  return err instanceof RateLimitError;
-}
-
-/** Thrown when a price oracle request fails for a reason other than rate limiting. */
-export class PriceOracleFetchError extends StellarSplitError {
-  constructor(message: string) {
-    super(message, "PRICE_ORACLE_FETCH_FAILED", undefined, message);
-    this.name = "PriceOracleFetchError";
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export function isPriceOracleFetchError(err: unknown): err is PriceOracleFetchError {
-  return err instanceof PriceOracleFetchError;
-}
-
 /** Thrown when delegate limit is reached. */
 export class DelegateLimitReachedError extends StellarSplitError {
   readonly invoiceId: string;
@@ -2712,23 +2870,4 @@ export class DelegateLimitReachedError extends StellarSplitError {
 export function isDelegateLimitReachedError(err: unknown): err is DelegateLimitReachedError {
   return err instanceof DelegateLimitReachedError;
 }
-
-/** Structured classification of a Horizon transaction/operation result code. */
-export interface HorizonErrorClassification {
-  /** The primary result code string. */
-  code: string;
-  /** Whether the error is safe to retry. */
-  isRetryable: boolean;
-  /** Severity level of the error. */
-  severity: "low" | "medium" | "high" | "critical" | "unknown";
-  /** Human-readable description of what went wrong. */
-  description: string;
-  /** Recommended action for the caller to take. */
-  suggestedAction: string;
-  /** The specific operation result code, if available. */
-  operationCode?: string;
-}
-
-
-
 

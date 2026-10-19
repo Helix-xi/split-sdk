@@ -1,0 +1,300 @@
+/**
+ * Stellar address validator for accounts, contracts, and muxed addresses.
+ *
+ * Stellar addresses use StrKey encoding, which is RFC 4648 Base32 without padding
+ * composed of:
+ * 1. A 1-byte version prefix ('G' for public keys, 'C' for contract IDs, 'M' for muxed accounts).
+ * 2. An encoded payload (32 bytes for account/contract, 40 bytes for muxed accounts).
+ * 3. A 2-byte CRC16-XModem checksum of the prefix and payload.
+ *
+ * This module enforces strict validation rules:
+ * 1. Format validation: Enforces exact lengths (56 chars for G/C, 69 for M),
+ *    valid Base32 characters (`[A-Z2-7]`), uppercase standard, and correct prefix.
+ * 2. Checksum validation: Decodes and verifies the CRC16-XModem checksum against the payload.
+ * 3. Secret key protection: Explicitly rejects secret seeds ('S...') to prevent
+ *    accidental disclosure or misuse of private keys as public addresses.
+ * 4. Address type constraints: Allows integrators to restrict accepted addresses
+ *    to specific types (e.g., only account addresses, or account + contract).
+ *
+ * @example
+ * ```ts
+ * import { validateAddress, validateAddressOrThrow } from "@stellar-split/sdk";
+ *
+ * // Validate standard ed25519 public key
+ * const result = validateAddress("GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ");
+ * console.log(result.valid); // true
+ * console.log(result.type);  // "account"
+ *
+ * // Throws AddressValidationError for corrupted checksum
+ * validateAddressOrThrow("GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGA");
+ * ```
+ */
+
+import { StrKey } from "@stellar/stellar-sdk";
+import { AddressValidationError } from "../errors.js";
+
+/** Valid Stellar address types supported by the validator. */
+export type StellarAddressType = "account" | "contract" | "muxed";
+
+/** RFC 4648 Base32 alphabet characters used by Stellar StrKeys. */
+const BASE32_ALPHABET = /^[A-Z2-7]+$/;
+
+/** Expected lengths for each address type. */
+export const STELLAR_ADDRESS_LENGTHS = {
+  account: 56,
+  contract: 56,
+  muxed: 69,
+  secretKey: 56,
+} as const;
+
+/** Result object returned by {@link validateAddress}. */
+export interface AddressValidationResult {
+  /** True when the address passes all format, checksum, and type constraints. */
+  valid: boolean;
+  /** Detected address type ("account", "contract", or "muxed") if valid or recognizable. */
+  type?: StellarAddressType;
+  /** List of human-readable validation error messages. */
+  errors: string[];
+  /** Normalized address (trimmed and uppercase) if valid. */
+  normalizedAddress?: string;
+}
+
+/** Options for configuring address validation behavior. */
+export interface AddressValidationOptions {
+  /**
+   * Allowed address types.
+   * Defaults to `["account", "contract"]`.
+   */
+  allowedTypes?: StellarAddressType[];
+  /**
+   * Shortcut to enable or disable muxed addresses ('M...').
+   * If true, adds "muxed" to allowedTypes; if false, excludes "muxed".
+   */
+  allowMuxed?: boolean;
+  /**
+   * Whether to explicitly reject secret keys ('S...') with a security warning.
+   * Defaults to true.
+   */
+  rejectSecretKeys?: boolean;
+}
+
+/**
+ * Detect the address type from prefix and length.
+ *
+ * @param address - Address string to inspect.
+ * @returns The detected {@link StellarAddressType}, or `null` if unrecognized.
+ */
+export function detectAddressType(address: string): StellarAddressType | null {
+  if (typeof address !== "string") return null;
+  const trimmed = address.trim();
+
+  if (trimmed.startsWith("G") && trimmed.length === STELLAR_ADDRESS_LENGTHS.account) {
+    return "account";
+  }
+  if (trimmed.startsWith("C") && trimmed.length === STELLAR_ADDRESS_LENGTHS.contract) {
+    return "contract";
+  }
+  if (trimmed.startsWith("M") && trimmed.length === STELLAR_ADDRESS_LENGTHS.muxed) {
+    return "muxed";
+  }
+  return null;
+}
+
+/**
+ * Verify whether an address string passes Stellar CRC16 checksum verification.
+ *
+ * @param address - The address string to verify.
+ * @returns `true` if the checksum is valid for its detected type.
+ */
+export function verifyAddressChecksum(address: string): boolean {
+  if (typeof address !== "string") return false;
+  const trimmed = address.trim();
+
+  if (trimmed.startsWith("G")) {
+    return StrKey.isValidEd25519PublicKey(trimmed);
+  }
+  if (trimmed.startsWith("C")) {
+    return StrKey.isValidContract(trimmed);
+  }
+  if (trimmed.startsWith("M")) {
+    return StrKey.isValidMed25519PublicKey(trimmed);
+  }
+  return false;
+}
+
+/**
+ * Validate a Stellar address for correct format, character set, prefix, and CRC16 checksum.
+ *
+ * Validation checks:
+ * 1. Type & Non-empty: Must be a non-empty string.
+ * 2. Secret Key Check: Explicitly rejects private keys ('S...') for security.
+ * 3. Base32 Characters: Must contain only RFC 4648 Base32 uppercase characters (`[A-Z2-7]`).
+ * 4. Prefix & Length:
+ *    - 'G' addresses must be exactly 56 characters.
+ *    - 'C' addresses must be exactly 56 characters.
+ *    - 'M' addresses must be exactly 69 characters.
+ * 5. Type Restrictions: Verifies detected type is in `allowedTypes`.
+ * 6. CRC16 Checksum: Decodes the StrKey and verifies integrity against corruption or typos.
+ *
+ * @param address - The candidate address to validate.
+ * @param options - Optional validation configuration.
+ * @returns A {@link AddressValidationResult} object.
+ */
+export function validateAddress(
+  address: unknown,
+  options?: AddressValidationOptions
+): AddressValidationResult {
+  const errors: string[] = [];
+
+  // 1. Type check
+  if (address === null || address === undefined) {
+    return {
+      valid: false,
+      errors: ["Address is required (received null or undefined)."],
+    };
+  }
+
+  if (typeof address !== "string") {
+    return {
+      valid: false,
+      errors: [`Address must be a string (received ${typeof address}).`],
+    };
+  }
+
+  const trimmed = address.trim();
+  if (trimmed.length === 0) {
+    return {
+      valid: false,
+      errors: ["Address string cannot be empty."],
+    };
+  }
+
+  // 2. Secret key security check
+  const rejectSecretKeys = options?.rejectSecretKeys ?? true;
+  if (rejectSecretKeys && (trimmed.startsWith("S") || StrKey.isValidEd25519SecretSeed(trimmed))) {
+    return {
+      valid: false,
+      errors: [
+        "Security error: Secret key ('S...') detected. Private keys must never be used as public addresses.",
+      ],
+    };
+  }
+
+  // 3. Allowed types configuration
+  let allowedTypes: StellarAddressType[] = options?.allowedTypes ?? ["account", "contract"];
+  if (options?.allowMuxed === true && !allowedTypes.includes("muxed")) {
+    allowedTypes = [...allowedTypes, "muxed"];
+  } else if (options?.allowMuxed === false && allowedTypes.includes("muxed")) {
+    allowedTypes = allowedTypes.filter((t) => t !== "muxed");
+  }
+
+  // 4. Prefix check
+  const firstChar = trimmed[0];
+  if (firstChar !== "G" && firstChar !== "C" && firstChar !== "M") {
+    errors.push(
+      `Invalid address prefix: "${firstChar}". Expected "G" (account), "C" (contract), or "M" (muxed).`
+    );
+    return { valid: false, errors };
+  }
+
+  const detectedType = detectAddressType(trimmed);
+
+  // 5. Length check
+  if (!detectedType) {
+    const expectedLen =
+      firstChar === "M"
+        ? STELLAR_ADDRESS_LENGTHS.muxed
+        : STELLAR_ADDRESS_LENGTHS.account;
+    errors.push(
+      `Invalid address length for "${firstChar}" address: got ${trimmed.length} characters, expected ${expectedLen}.`
+    );
+    return { valid: false, errors };
+  }
+
+  // 6. Character set check (RFC 4648 Base32)
+  if (!BASE32_ALPHABET.test(trimmed)) {
+    const invalidChars = Array.from(new Set(trimmed.replace(/[A-Z2-7]/g, ""))).join(", ");
+    errors.push(
+      `Address contains invalid Base32 characters: ${invalidChars}. Stellar addresses may only contain uppercase letters A-Z and digits 2-7.`
+    );
+    return { valid: false, errors, type: detectedType };
+  }
+
+  // 7. Allowed types restriction check
+  if (!allowedTypes.includes(detectedType)) {
+    errors.push(
+      `Address type "${detectedType}" is not allowed. Allowed types: ${allowedTypes.join(", ")}.`
+    );
+    return { valid: false, errors, type: detectedType };
+  }
+
+  // 8. CRC16 Checksum validation
+  const checksumValid = verifyAddressChecksum(trimmed);
+  if (!checksumValid) {
+    errors.push(
+      `Address checksum validation failed. The address format is syntactically valid but the CRC16 checksum does not match (potential typo or corruption).`
+    );
+    return { valid: false, errors, type: detectedType };
+  }
+
+  return {
+    valid: true,
+    type: detectedType,
+    errors: [],
+    normalizedAddress: trimmed,
+  };
+}
+
+/**
+ * Validate a Stellar address and throw {@link AddressValidationError} if invalid.
+ *
+ * @param address - The candidate address to validate.
+ * @param options - Optional validation configuration.
+ * @returns The normalized address string.
+ * @throws {AddressValidationError} If validation fails.
+ */
+export function validateAddressOrThrow(
+  address: unknown,
+  options?: AddressValidationOptions
+): string {
+  const result = validateAddress(address, options);
+  if (!result.valid || !result.normalizedAddress) {
+    throw new AddressValidationError(result.errors.join("; "), {
+      errors: result.errors,
+      address,
+    });
+  }
+  return result.normalizedAddress;
+}
+
+/**
+ * Convenience helper returning `true` if an address is valid.
+ *
+ * @param address - Candidate address.
+ * @param options - Optional validation configuration.
+ * @returns `true` if valid, `false` otherwise.
+ */
+export function isStellarAddress(address: unknown, options?: AddressValidationOptions): boolean {
+  return validateAddress(address, options).valid;
+}
+
+/**
+ * Reusable validator instance for validating addresses with pre-configured rules.
+ */
+export class AddressValidator {
+  constructor(private readonly defaultOptions?: AddressValidationOptions) {}
+
+  /**
+   * Validate an address using configured defaults combined with per-call overrides.
+   */
+  validate(address: unknown, options?: AddressValidationOptions): AddressValidationResult {
+    return validateAddress(address, { ...this.defaultOptions, ...options });
+  }
+
+  /**
+   * Validate an address or throw {@link AddressValidationError}.
+   */
+  validateOrThrow(address: unknown, options?: AddressValidationOptions): string {
+    return validateAddressOrThrow(address, { ...this.defaultOptions, ...options });
+  }
+}

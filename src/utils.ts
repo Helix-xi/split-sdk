@@ -48,9 +48,24 @@ export function formatAmount(stroops: bigint): string {
  * parseAmount("0.00000015"); // 1n  (8th decimal is truncated)
  */
 export function parseAmount(value: string): bigint {
-  const [whole = "0", frac = ""] = value.split(".");
+  const isNegative = value.startsWith("-");
+  const clean = isNegative ? value.slice(1) : value;
+  const parts = clean.split(".");
+  if (parts.length > 2) {
+    throw new SyntaxError(`Invalid amount "${value}": multiple decimal points`);
+  }
+  const [whole = "0", frac = ""] = parts;
+  if (!/^[+]?\d*$/.test(whole)) {
+    throw new SyntaxError(`Invalid whole part "${whole}"`);
+  }
+  if (!/^\d*$/.test(frac)) {
+    throw new SyntaxError(`Invalid fractional part "${frac}"`);
+  }
   const fracPadded = frac.padEnd(7, "0").slice(0, 7);
-  return BigInt(whole) * STROOPS_PER_UNIT + BigInt(fracPadded);
+  const wholePart = whole === "" || whole === "+" ? 0n : BigInt(whole);
+  const fracPart = fracPadded === "" ? 0n : BigInt(fracPadded);
+  const total = wholePart * STROOPS_PER_UNIT + fracPart;
+  return isNegative ? -total : total;
 }
 
 export function groupBy<T extends Record<string, any>>(
