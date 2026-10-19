@@ -2,7 +2,7 @@
  * Recurring subscription types for invoice subscriptions.
  */
 
-import type { CreateInvoiceParams } from "./index.js";
+import type { CreateInvoiceParams } from "../types.js";
 
 export type SubscriptionStatus = "active" | "paused" | "cancelled";
 

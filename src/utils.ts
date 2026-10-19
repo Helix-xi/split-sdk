@@ -68,7 +68,7 @@ export function parseAmount(value: string): bigint {
   return isNegative ? -total : total;
 }
 
-export function groupBy<T extends Record<string, unknown>>(
+export function groupBy<T extends Record<string, any>>(
   array: T[],
   key: keyof T,
 ): Record<string, T[]> {

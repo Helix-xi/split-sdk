@@ -439,6 +439,8 @@ export interface InvoiceStats {
   totalPayers: number;
   /** Mean payment size in stroops (0 when there are no payments). */
   avgPayment: bigint;
+  /** Median payment size in stroops (0 when there are no payments). */
+  medianAmount?: bigint;
   /**
    * Stroops funded per day across the payment window, i.e. the sum of payment
    * amounts divided by the span between the first and last payment.
@@ -1595,6 +1597,15 @@ export interface AccountFlagSet {
   authClawbackEnabled: boolean;
   /** Returns `false` when this account's flags make `operation` impossible without prior authorization. */
   isCompatibleWith(operation: string): boolean;
+}
+
+/** Result of checking an account's freeze / lock state for an asset. */
+export interface AccountLockState {
+  isFrozen: boolean;
+  isLocked: boolean;
+  trustlineAuthorized: boolean;
+  revocableByIssuer: boolean;
+  reason?: "no_trustline" | "frozen" | "immutable" | string;
 }
 
 /** Declarative description of a claimable-balance claim predicate, buildable via `PredicateBuilder.build()`. */

@@ -449,7 +449,13 @@ export class ContractStorageExporter {
     const entries: StorageEntry[] = [];
 
     for (const item of raw.entries) {
-      const ledgerEntryData = item.val.data().contractData();
+      const valAny = item.val as any;
+      const ledgerEntryData =
+        typeof valAny.data === "function" && typeof valAny.data().contractData === "function"
+          ? valAny.data().contractData()
+          : typeof valAny.contractData === "function"
+            ? valAny.contractData()
+            : valAny;
       const key = scValToJson(ledgerEntryData.key());
       const value = scValToJson(ledgerEntryData.val());
 

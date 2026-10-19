@@ -151,20 +151,23 @@ export function calculatePoolShare(
     );
   }
 
+  const reserve0 = pool.reserves[0]!;
+  const reserve1 = pool.reserves[1]!;
+
   if (owned <= 0n) {
     return {
       shareOfAssetA: "0",
       shareOfAssetB: "0",
-      assetA: pool.reserves[0].asset,
-      assetB: pool.reserves[1].asset,
+      assetA: reserve0.asset,
+      assetB: reserve1.asset,
       totalShares: totalShares.toString(),
       sharesOwned: "0",
       ownershipPercent: "0.00",
     };
   }
 
-  const reserveA = BigInt(pool.reserves[0].amount);
-  const reserveB = BigInt(pool.reserves[1].amount);
+  const reserveA = BigInt(reserve0.amount);
+  const reserveB = BigInt(reserve1.amount);
 
   // Proportional share: (owned / totalShares) * reserve
   const shareOfAssetA = (reserveA * owned) / totalShares;
@@ -175,8 +178,8 @@ export function calculatePoolShare(
   return {
     shareOfAssetA: shareOfAssetA.toString(),
     shareOfAssetB: shareOfAssetB.toString(),
-    assetA: pool.reserves[0].asset,
-    assetB: pool.reserves[1].asset,
+    assetA: reserve0.asset,
+    assetB: reserve1.asset,
     totalShares: totalShares.toString(),
     sharesOwned: owned.toString(),
     ownershipPercent,

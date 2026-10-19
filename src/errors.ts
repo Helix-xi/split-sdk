@@ -1930,6 +1930,44 @@ export class InsufficientSponsorReserveError extends StellarSplitError {
   }
 }
 
+/** Thrown when an account's trustline has been frozen by the asset issuer. */
+export class AccountFrozenError extends StellarSplitError {
+  readonly accountId: string;
+  readonly assetCode: string;
+
+  constructor(accountId: string, assetCode: string, raw?: string) {
+    super(
+      `Account ${accountId} is frozen for asset ${assetCode}`,
+      "ACCOUNT_FROZEN",
+      { accountId, assetCode },
+      raw
+    );
+    this.name = "AccountFrozenError";
+    this.accountId = accountId;
+    this.assetCode = assetCode;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/** Thrown when an account is permanently locked out of authorization (auth_immutable without auth). */
+export class AccountLockedError extends StellarSplitError {
+  readonly accountId: string;
+  readonly assetCode: string;
+
+  constructor(accountId: string, assetCode: string, raw?: string) {
+    super(
+      `Account ${accountId} is locked for asset ${assetCode}`,
+      "ACCOUNT_LOCKED",
+      { accountId, assetCode },
+      raw
+    );
+    this.name = "AccountLockedError";
+    this.accountId = accountId;
+    this.assetCode = assetCode;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 /** Thrown when a fee-bump inner transaction is not a v1 transaction. */
 export class InvalidTransactionTypeError extends StellarSplitError {
   readonly typeName: string;

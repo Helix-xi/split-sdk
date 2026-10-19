@@ -4,13 +4,16 @@
  * Wraps @stellar/freighter-api with typed helpers.
  */
 
-import {
+import freighterPkg from "@stellar/freighter-api";
+import { WalletNotConnectedError } from "./errors.js";
+
+const freighter: any = (freighterPkg as any)?.default ?? freighterPkg;
+const {
   isConnected,
   getAddress,
-  signTransaction as freighterSignTransaction,
+  signTransaction: freighterSignTransaction,
   requestAccess,
-} from "@stellar/freighter-api";
-import { WalletNotConnectedError } from "./errors.js";
+} = freighter;
 
 /** Connect to the Freighter wallet extension and request access. */
 export async function connectWallet(): Promise<string> {
