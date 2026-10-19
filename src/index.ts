@@ -265,6 +265,81 @@ export { InvoiceMetadataValidator } from "./validators/invoiceMetadataValidator.
 export type { MetadataValidationResult } from "./validators/invoiceMetadataValidator.js";
 export { validateMetadataKeys, MAX_METADATA_KEY_LENGTH } from "./validators/invoiceMetadataValidator.js";
 
+// Deadline validator (issue #1064)
+export {
+  validateDeadline,
+  validateDeadlineOrThrow,
+  isFutureDeadline,
+  parseDeadline,
+  DeadlineValidator,
+  MAX_U64 as MAX_DEADLINE_U64,
+  MS_TIMESTAMP_THRESHOLD as DEADLINE_MS_TIMESTAMP_THRESHOLD,
+} from "./validators/deadlineValidator.js";
+export type {
+  DeadlineValidationResult,
+  DeadlineValidationOptions,
+} from "./validators/deadlineValidator.js";
+
+// Amount validator (issue #1063)
+export {
+  validateAmount,
+  validateAmountOrThrow,
+  isValidAmount,
+  parseToStroops,
+  AmountValidator,
+  STELLAR_MAX_INT64,
+  STELLAR_MIN_AMOUNT,
+  STELLAR_MAX_DECIMALS,
+  STROOPS_PER_UNIT as AMOUNT_STROOPS_PER_UNIT,
+} from "./validators/amountValidator.js";
+export type {
+  AmountValidationResult,
+  AmountValidationOptions,
+  AmountUnit,
+} from "./validators/amountValidator.js";
+
+// Address validator (issue #1062)
+export {
+  validateAddress,
+  validateAddressOrThrow,
+  isStellarAddress,
+  detectAddressType,
+  verifyAddressChecksum,
+  AddressValidator,
+  STELLAR_ADDRESS_LENGTHS,
+} from "./validators/addressValidator.js";
+export type {
+  StellarAddressType,
+  AddressValidationResult,
+  AddressValidationOptions,
+} from "./validators/addressValidator.js";
+
+// Signature validator (issue #1061)
+export {
+  validateEd25519Signature,
+  validateEd25519SignatureOrThrow,
+  validateMultiSig,
+  validateMultiSigOrThrow,
+  validateWebhookSignature as validateWebhookSignaturePayload,
+  isValidSignatureFormat,
+  normalizeSignature,
+  normalizePublicKey,
+  normalizeMessage,
+  SignatureValidator,
+  ED25519_SIGNATURE_BYTE_LENGTH,
+  ED25519_PUBLIC_KEY_BYTE_LENGTH,
+} from "./validators/signatureValidator.js";
+export type {
+  SignatureValidationResult,
+  Ed25519ValidationParams,
+  MultiSigEntry,
+  SignerWeightConfig,
+  MultiSigValidationParams,
+  MultiSigValidationResult,
+  WebhookValidationParams,
+} from "./validators/signatureValidator.js";
+
+
 // ---------------------------------------------------------------------------
 // Lifecycle management (graceful shutdown)
 // ---------------------------------------------------------------------------

@@ -309,8 +309,12 @@ export class UnauthorizedError extends StellarSplitError {
 
 /** Thrown when validation fails for input data (e.g., template deserialization). */
 export class ValidationError extends StellarSplitError {
-  constructor(message: string, context?: Record<string, unknown>) {
-    super(message, "VALIDATION_ERROR", context, message);
+  constructor(
+    message: string,
+    context?: Record<string, unknown>,
+    code: string = "VALIDATION_ERROR"
+  ) {
+    super(message, code, context, message);
     this.name = "ValidationError";
     Object.setPrototypeOf(this, new.target.prototype);
   }
