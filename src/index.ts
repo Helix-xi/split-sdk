@@ -237,15 +237,27 @@ export {
   // Batch operations errors (issue #855)
   BatchTooLargeError,
   isBatchTooLargeError,
-  // Validation errors (issues #1061, #1062, #1063, #1064)
-  DeadlineValidationError,
-  isDeadlineValidationError,
-  AmountValidationError,
-  isAmountValidationError,
-  AddressValidationError,
-  isAddressValidationError,
-  SignatureValidationError,
-  isSignatureValidationError,
+  // Invoice versioning errors (#1056)
+  InvoiceVersionNotFoundError,
+  isInvoiceVersionNotFoundError,
+  UnsafeRollbackError,
+  isUnsafeRollbackError,
+  InvalidVersionError,
+  isInvalidVersionError,
+  // Smart contract ABI cache errors (#1054)
+  AbiFetchError,
+  isAbiFetchError,
+  AbiNotFoundError,
+  isAbiNotFoundError,
+  // Invoice collaboration errors (#1053)
+  CollaborationError,
+  isCollaborationError,
+  CommentNotFoundError,
+  isCommentNotFoundError,
+  ApprovalRequestNotFoundError,
+  isApprovalRequestNotFoundError,
+  UnauthorizedCollaborationError,
+  isUnauthorizedCollaborationError,
 } from "./errors.js";
 
 // Invoice metadata JSON Schema validator (issue #533)
@@ -488,7 +500,7 @@ export { watchContractUpgrade } from "./upgrade.js";
 
 export { calculateFee } from "./fee.js";
 
-export { formatAddress } from "./utils.js";
+export { formatAddress, parseAmount, formatAmount } from "./utils.js";
 
 export { resolveToken } from "./token.js";
 
@@ -1611,6 +1623,16 @@ export { LazyInitializer } from "./client/LazyInitializer.js";
 export { SplitClient } from "./client/SplitClient.js";
 export type { SplitClientConfig } from "./client/SplitClient.js";
 export {
+  BaseClientModule,
+  InvoiceModule,
+  PaymentModule,
+  DisputeModule,
+  AdminModule,
+  GroupModule,
+  TemplateModule,
+  MilestoneModule,
+} from "./client/modules/index.js";
+export {
   RpcConnectionError,
   isRpcConnectionError,
 } from "./errors.js";
@@ -1798,3 +1820,60 @@ export type {
   RetirementManagerOptions,
   RetirementEventMap,
 } from "./invoiceRetirement.js";
+
+// Multi-wallet support (#1027)
+export {
+  MultiWalletManager,
+  MetaMaskConnector,
+  WalletConnectConnector,
+  LedgerConnector,
+  MetaMaskAdapter,
+  MetaMaskNotInstalledError,
+  MetaMaskConnectionError,
+  UserRejectedError,
+  WalletFallbackExhaustedError,
+  WalletNotAvailableError,
+} from "./multiWallet.js";
+export type {
+  WalletAttemptLog,
+  MultiWalletOptions,
+  MultiWalletEvent,
+  MultiWalletEventType,
+  MultiWalletEventListener,
+} from "./multiWallet.js";
+
+// Transaction simulation before execution (#1028)
+export {
+  TransactionSimulator,
+  TransactionSimulationError,
+} from "./transactionSimulator.js";
+export type {
+  SimulationRequest,
+  SimulationReport,
+  SimulationStatus,
+  SimulationErrorCode,
+  SimulationErrorDetail,
+  SimulationResourceUsage,
+  SimulationEvent,
+  TransactionSimulatorOptions,
+} from "./transactionSimulator.js";
+
+// Automatic nonce management (#1029)
+export {
+  NonceManager,
+  NonceError,
+  InvalidNonceError,
+  DuplicateNonceError,
+  StaleNonceError,
+  NonceGapError,
+} from "./nonceManager.js";
+export type {
+  NonceState,
+  NonceManagerOptions,
+  NonceResetOptions,
+  NonceValidationResult,
+  NonceEvent,
+  NonceEventType,
+  NonceEventListener,
+} from "./nonceManager.js";
+
