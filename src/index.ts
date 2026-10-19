@@ -1527,6 +1527,16 @@ export { LazyInitializer } from "./client/LazyInitializer.js";
 export { SplitClient } from "./client/SplitClient.js";
 export type { SplitClientConfig } from "./client/SplitClient.js";
 export {
+  BaseClientModule,
+  InvoiceModule,
+  PaymentModule,
+  DisputeModule,
+  AdminModule,
+  GroupModule,
+  TemplateModule,
+  MilestoneModule,
+} from "./client/modules/index.js";
+export {
   RpcConnectionError,
   isRpcConnectionError,
 } from "./errors.js";
