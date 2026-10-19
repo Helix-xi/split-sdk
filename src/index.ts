@@ -404,7 +404,7 @@ export { watchContractUpgrade } from "./upgrade.js";
 
 export { calculateFee } from "./fee.js";
 
-export { formatAddress } from "./utils.js";
+export { formatAddress, parseAmount, formatAmount } from "./utils.js";
 
 export { resolveToken } from "./token.js";
 
