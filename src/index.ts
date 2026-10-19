@@ -404,7 +404,7 @@ export { watchContractUpgrade } from "./upgrade.js";
 
 export { calculateFee } from "./fee.js";
 
-export { formatAddress } from "./utils.js";
+export { formatAddress, parseAmount, formatAmount } from "./utils.js";
 
 export { resolveToken } from "./token.js";
 
@@ -1715,87 +1715,59 @@ export type {
   RetirementEventMap,
 } from "./invoiceRetirement.js";
 
-// Error Logging (#1069)
+// Multi-wallet support (#1027)
 export {
-  ErrorLogger,
-  MemoryLogStorage,
-  ConsoleLogStorage,
-  MultiLogStorage,
-  TextLogFormatter,
-  JsonLogFormatter,
-  LogLevelPriority,
-  isLogLevelEnabled,
-  parseLogLevel,
-  getDefaultErrorLogger,
-  setDefaultErrorLogger,
-  resetDefaultErrorLogger,
-  logError,
-} from "./errorLogger.js";
+  MultiWalletManager,
+  MetaMaskConnector,
+  WalletConnectConnector,
+  LedgerConnector,
+  MetaMaskAdapter,
+  MetaMaskNotInstalledError,
+  MetaMaskConnectionError,
+  UserRejectedError,
+  WalletFallbackExhaustedError,
+  WalletNotAvailableError,
+} from "./multiWallet.js";
 export type {
-  LogLevel,
-  LogEntry,
-  LogFilter,
-  LogFormatter,
-  LogStorage,
-  ErrorLoggerOptions,
-} from "./errorLogger.js";
+  WalletAttemptLog,
+  MultiWalletOptions,
+  MultiWalletEvent,
+  MultiWalletEventType,
+  MultiWalletEventListener,
+} from "./multiWallet.js";
 
-// Breadcrumb Tracking (#1070)
+// Transaction simulation before execution (#1028)
 export {
-  BreadcrumbTracker,
-  RingBufferBreadcrumbStorage,
-  getDefaultBreadcrumbTracker,
-  setDefaultBreadcrumbTracker,
-  resetDefaultBreadcrumbTracker,
-  addBreadcrumb,
-  getBreadcrumbs,
-  clearBreadcrumbs,
-} from "./breadcrumbTracker.js";
+  TransactionSimulator,
+  TransactionSimulationError,
+} from "./transactionSimulator.js";
 export type {
-  Breadcrumb,
-  BreadcrumbCategory,
-  BreadcrumbLevel,
-  BreadcrumbStorage,
-  BreadcrumbFilter,
-  BreadcrumbTrackerOptions,
-} from "./breadcrumbTracker.js";
+  SimulationRequest,
+  SimulationReport,
+  SimulationStatus,
+  SimulationErrorCode,
+  SimulationErrorDetail,
+  SimulationResourceUsage,
+  SimulationEvent,
+  TransactionSimulatorOptions,
+} from "./transactionSimulator.js";
 
-// Error Context (#1071)
+// Automatic nonce management (#1029)
 export {
-  ERROR_CONTEXT_SYMBOL,
-  sanitizeContext,
-  mergeContext,
-  attachErrorContext,
-  getErrorContext,
-  hasErrorContext,
-  serializeError,
-  serializeErrorContext,
-  ErrorContextBuilder,
-  createErrorContext,
-  withErrorContext,
-  wrapError,
-} from "./errorContext.js";
+  NonceManager,
+  NonceError,
+  InvalidNonceError,
+  DuplicateNonceError,
+  StaleNonceError,
+  NonceGapError,
+} from "./nonceManager.js";
 export type {
-  ErrorContext,
-  SerializedError,
-} from "./errorContext.js";
+  NonceState,
+  NonceManagerOptions,
+  NonceResetOptions,
+  NonceValidationResult,
+  NonceEvent,
+  NonceEventType,
+  NonceEventListener,
+} from "./nonceManager.js";
 
-// Error Aggregation (#1072)
-export {
-  ErrorAggregator,
-  normalizeErrorMessage,
-  getDefaultErrorAggregator,
-  setDefaultErrorAggregator,
-  resetDefaultErrorAggregator,
-  aggregateError,
-} from "./errorAggregator.js";
-export type {
-  GroupingStrategyType,
-  CustomGroupingResolver,
-  ErrorGroupingStrategy,
-  AggregatedErrorGroup,
-  ErrorPattern,
-  ReportOptions,
-  ErrorAggregationReport,
-  ErrorAggregatorOptions,
-} from "./errorAggregator.js";
