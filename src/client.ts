@@ -52,6 +52,9 @@ export type SplitClientEventMap = {
   dispute: import("./contractEvents.js").DisputeEvent;
   /** Emitted when a tier is unlocked on an invoice. */
   tier_unlocked: import("./contractEvents.js").TierUnlockedEvent;
+  "queue:drained": undefined;
+  "queue:operation:failed": { operation: import("./offlineQueue.js").QueuedOperation; error: unknown };
+  "queue:conflict:resolved": { operation: import("./offlineQueue.js").QueuedOperation; strategy: string; remoteState?: unknown };
 };
 import { signTransaction } from "./wallet.js";
 import { telemetry } from "./telemetry.js";
@@ -924,6 +927,9 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     this._rpcClient = config.container?.getRPCClient() ?? null;
     this._adapter =
       config.container?.getWalletAdapter() ?? config.adapter ?? null;
+    if (config.offlineQueue) {
+      this._offlineQueue = new OfflineQueue(this, config.offlineQueue);
+    }
 
     // Per-method timeout manager (Issue #1)
   /**
@@ -1305,6 +1311,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
   clearOfflineQueue(): void {
     if (this._offlineQueue) this._offlineQueue.clear();
+  }
+
+  async syncOfflineQueue(conflictStrategy?: import("./types.js").ConflictStrategy) {
+    if (!this._offlineQueue) return null;
+    return this._offlineQueue.sync(conflictStrategy);
   }
 
   async switchTo(network: "mainnet" | "testnet" | "futurenet"): Promise<void> {
@@ -3378,6 +3389,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         "pay",
         params as unknown as Record<string, unknown>,
       );
+    }
+    if (this._offlineQueue?.config?.enabled) {
+      try {
+        const health = await this.checkRPCHealth();
+        if (health.status === "down") {
+          this._offlineQueue.enqueue("pay", [params]);
+          return { txHash: "queued" };
+        }
+      } catch (e) {
+        this._offlineQueue.enqueue("pay", [params]);
+        return { txHash: "queued" };
+      }
     }
     const startTime = Date.now();
     params = this._pluginRegistry.runBeforeCall("pay", params);
@@ -10709,15 +10732,23 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @throws {Error} If the method fails.
    */
   async connectWallet(adapter: WalletAdapter): Promise<string> {
-    const address = await adapter.connect();
+    const address =
+      typeof (adapter as any).connect === "function"
+        ? await (adapter as any).connect()
+        : await adapter.getAddress();
     this._adapter = adapter;
 
     // Listen for account changes and update internal reference
-    adapter.onAccountChange((newAddress: string) => {
-      this.emit("wallet:accountChanged", newAddress);
-    });
+    if (typeof (adapter as any).onAccountChange === "function") {
+      (adapter as any).onAccountChange((newAddress: string) => {
+        this.emit("wallet:accountChanged", newAddress);
+      });
+    }
 
-    this.emit("wallet:connected", { walletName: adapter.name, address });
+    this.emit("wallet:connected", {
+      walletName: (adapter as any).name ?? "Wallet",
+      address,
+    });
     return address;
   }
 

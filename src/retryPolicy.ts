@@ -21,7 +21,7 @@ export function isRetryable(error: unknown): boolean {
   if (error instanceof WalletNotConnectedError) return false;
 
   if (error instanceof RpcError) {
-    return error.statusCode === 429 || error.statusCode === 503;
+    return error.statusCode === 429 || error.statusCode === 502 || error.statusCode === 503 || error.statusCode === 504;
   }
 
   if (!(error instanceof Error)) return false;
@@ -29,7 +29,7 @@ export function isRetryable(error: unknown): boolean {
   const msg = error.message.toLowerCase();
   return (
     error.name === "AbortError" ||
-    /timeout|timed out|network|failed to fetch|connection|connect|econnreset|econnrefused|eai_again|enotfound|429|503/.test(
+    /timeout|timed out|network|failed to fetch|connection|connect|econnreset|econnrefused|eai_again|enotfound|429|502|503|504/.test(
       msg
     )
   );
