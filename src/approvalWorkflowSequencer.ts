@@ -13,6 +13,16 @@ export interface ApprovalWorkflowOptions {
   applySignatures?: SignatureApplier;
 }
 
+export type WithdrawalApprovalState = "pending" | "approved" | "rejected" | "executed" | "expired";
+
+export interface WithdrawalApprovalResult {
+  state: WithdrawalApprovalState;
+  weight: number;
+  threshold: number;
+  approvals: number;
+  rejections: number;
+}
+
 export interface PaymentForwardingRule {
   id: string;
   /** Optional source account filter; matches any source when omitted. */

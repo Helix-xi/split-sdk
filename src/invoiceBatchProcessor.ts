@@ -53,9 +53,14 @@ function isRateLimitError(error: unknown): boolean {
   return error instanceof Error && /429|rate.?limit|too many requests/i.test(error.message);
 }
 
+function isValidPauseMs(value: number): boolean {
+  return Number.isInteger(value) && value >= 0;
+}
+
 function retryAfterMs(error: unknown, fallbackMs: number): number {
   const withRetryAfter = error as { retryAfterMs?: number } | undefined;
-  return typeof withRetryAfter?.retryAfterMs === "number" ? withRetryAfter.retryAfterMs : fallbackMs;
+  const candidate = withRetryAfter?.retryAfterMs;
+  return typeof candidate === "number" && isValidPauseMs(candidate) ? candidate : fallbackMs;
 }
 
 export class InvoiceBatchProcessor {
@@ -76,14 +81,29 @@ export class InvoiceBatchProcessor {
     const maxConcurrent = config.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
     const rateLimitPauseMs = config.rateLimitPauseMs ?? DEFAULT_RATE_LIMIT_PAUSE_MS;
 
+    if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1) {
+      throw new RangeError("maxConcurrent must be a positive integer");
+    }
+
+    if (!isValidPauseMs(rateLimitPauseMs)) {
+      throw new RangeError("rateLimitPauseMs must be a non-negative integer");
+    }
+
     let cursor = 0;
     let pausedUntil = 0;
     let slotSeq = 0;
     const inFlight = new Map<number, Promise<{ slot: number; result: BatchInvoiceResult }>>();
 
+    const waitForGlobalPause = async (): Promise<void> => {
+      while (true) {
+        const wait = pausedUntil - Date.now();
+        if (wait <= 0) return;
+        await sleep(wait);
+      }
+    };
+
     const runOne = async (invoiceId: string): Promise<BatchInvoiceResult> => {
-      const wait = pausedUntil - Date.now();
-      if (wait > 0) await sleep(wait);
+      await waitForGlobalPause();
 
       const amount = config.amounts[invoiceId];
       if (amount === undefined) {
@@ -103,7 +123,8 @@ export class InvoiceBatchProcessor {
         return result;
       } catch (error) {
         if (isRateLimitError(error)) {
-          pausedUntil = Date.now() + retryAfterMs(error, rateLimitPauseMs);
+          const nextPausedUntil = Date.now() + retryAfterMs(error, rateLimitPauseMs);
+          pausedUntil = Math.max(pausedUntil, nextPausedUntil);
         }
         const result: BatchInvoiceResult = {
           invoiceId,
@@ -125,7 +146,8 @@ export class InvoiceBatchProcessor {
       );
     };
 
-    for (let i = 0; i < maxConcurrent; i++) launch();
+    const initialLaunches = Math.min(maxConcurrent, invoiceIds.length);
+    for (let i = 0; i < initialLaunches; i++) launch();
 
     while (inFlight.size > 0) {
       const { slot, result } = await Promise.race(inFlight.values());

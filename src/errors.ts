@@ -309,8 +309,12 @@ export class UnauthorizedError extends StellarSplitError {
 
 /** Thrown when validation fails for input data (e.g., template deserialization). */
 export class ValidationError extends StellarSplitError {
-  constructor(message: string, context?: Record<string, unknown>) {
-    super(message, "VALIDATION_ERROR", context, message);
+  constructor(
+    message: string,
+    context?: Record<string, unknown>,
+    code: string = "VALIDATION_ERROR"
+  ) {
+    super(message, code, context, message);
     this.name = "ValidationError";
     Object.setPrototypeOf(this, new.target.prototype);
   }
@@ -1926,6 +1930,44 @@ export class InsufficientSponsorReserveError extends StellarSplitError {
   }
 }
 
+/** Thrown when an account's trustline has been frozen by the asset issuer. */
+export class AccountFrozenError extends StellarSplitError {
+  readonly accountId: string;
+  readonly assetCode: string;
+
+  constructor(accountId: string, assetCode: string, raw?: string) {
+    super(
+      `Account ${accountId} is frozen for asset ${assetCode}`,
+      "ACCOUNT_FROZEN",
+      { accountId, assetCode },
+      raw
+    );
+    this.name = "AccountFrozenError";
+    this.accountId = accountId;
+    this.assetCode = assetCode;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/** Thrown when an account is permanently locked out of authorization (auth_immutable without auth). */
+export class AccountLockedError extends StellarSplitError {
+  readonly accountId: string;
+  readonly assetCode: string;
+
+  constructor(accountId: string, assetCode: string, raw?: string) {
+    super(
+      `Account ${accountId} is locked for asset ${assetCode}`,
+      "ACCOUNT_LOCKED",
+      { accountId, assetCode },
+      raw
+    );
+    this.name = "AccountLockedError";
+    this.accountId = accountId;
+    this.assetCode = assetCode;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 /** Thrown when a fee-bump inner transaction is not a v1 transaction. */
 export class InvalidTransactionTypeError extends StellarSplitError {
   readonly typeName: string;
@@ -2213,16 +2255,112 @@ export class ChannelExhaustedError extends StellarSplitError {
 // so callers can switch on `err.code` instead of string-matching `.message`.
 // ---------------------------------------------------------------------------
 
-/** Machine-readable error codes carried by {@link SdkError}. */
+/**
+ * Machine-readable error codes carried by {@link SdkError}.
+ *
+ * Grouped by failure category and designed to be comprehensive: every
+ * distinct SDK failure mode maps to exactly one code. Use
+ * {@link describeSdkErrorCode} for a human-readable description of each code
+ * and {@link isRetryableErrorCode} to check whether the failure is transient
+ * and safe to retry.
+ *
+ * @see {@link SDK_ERROR_CODE_DESCRIPTIONS} for per-code descriptions.
+ * @see docs/ERROR_CODES.md for the full error-code and recovery reference.
+ */
 export enum SdkErrorCode {
+  // --- Invoice / resource lifecycle -----------------------------------
+  /** The requested invoice does not exist on-chain. */
   INVOICE_NOT_FOUND = "INVOICE_NOT_FOUND",
-  ACCOUNT_NOT_FOUND = "ACCOUNT_NOT_FOUND",
-  INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS",
+  /** The invoice exists but is not in the Pending state required by the operation. */
+  INVOICE_NOT_PENDING = "INVOICE_NOT_PENDING",
+  /** The invoice's payment deadline has passed. */
   DEADLINE_EXPIRED = "DEADLINE_EXPIRED",
+  /** The invoice is frozen (active dispute or lock) and cannot be modified. */
+  INVOICE_FROZEN = "INVOICE_FROZEN",
+
+  // --- Accounts & funds -----------------------------------------------
+  /** The referenced Stellar account does not exist on the network. */
+  ACCOUNT_NOT_FOUND = "ACCOUNT_NOT_FOUND",
+  /** The account balance is too low to cover the operation. */
+  INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS",
+
+  // --- Input validation ------------------------------------------------
+  /** A generic input failed validation (malformed JSON, out-of-range value, ...). */
+  INVALID_INPUT = "INVALID_INPUT",
+  /** A Stellar account address (`G...`/`M...`) is malformed. */
+  INVALID_ADDRESS = "INVALID_ADDRESS",
+  /** A Soroban contract address (`C...`) is malformed or fails its checksum. */
+  INVALID_CONTRACT_ADDRESS = "INVALID_CONTRACT_ADDRESS",
+  /** A payment amount is malformed or out of range. */
+  INVALID_AMOUNT = "INVALID_AMOUNT",
+  /** One or more recipient addresses are invalid. */
   INVALID_RECIPIENT = "INVALID_RECIPIENT",
-  CONTRACT_REJECTED = "CONTRACT_REJECTED",
+  /** The SDK configuration is invalid. */
+  INVALID_CONFIG = "INVALID_CONFIG",
+
+  // --- Network / transport --------------------------------------------
+  /** A generic network failure (DNS, TLS, connection reset, ...). */
+  NETWORK_ERROR = "NETWORK_ERROR",
+  /** A network request timed out. */
   NETWORK_TIMEOUT = "NETWORK_TIMEOUT",
+  /** The RPC node rejected or failed to process the request. */
+  RPC_FAILED = "RPC_FAILED",
+  /** Horizon returned an error response. */
+  HORIZON_ERROR = "HORIZON_ERROR",
+  /** The service is temporarily unavailable (overloaded or down). */
+  SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE",
+  /** The endpoint is rate limiting requests. */
   RATE_LIMITED = "RATE_LIMITED",
+
+  // --- Transaction lifecycle ------------------------------------------
+  /** The transaction was rejected or failed on-chain. */
+  TRANSACTION_FAILED = "TRANSACTION_FAILED",
+  /** The transaction's time bounds elapsed before it was included in a ledger. */
+  TRANSACTION_EXPIRED = "TRANSACTION_EXPIRED",
+  /** The transaction's sequence number does not match the account state. */
+  SEQUENCE_MISMATCH = "SEQUENCE_MISMATCH",
+  /** The provided fee is below the network minimum or the resource fee quote. */
+  INSUFFICIENT_FEE = "INSUFFICIENT_FEE",
+  /** Submitting the transaction to the network failed. */
+  SUBMISSION_FAILED = "SUBMISSION_FAILED",
+  /** The transaction was submitted but was not confirmed in time. */
+  CONFIRMATION_TIMEOUT = "CONFIRMATION_TIMEOUT",
+  /** Pre-submit transaction verification found one or more failed checks. */
+  VERIFICATION_FAILED = "VERIFICATION_FAILED",
+  /** A required signature is missing from the transaction. */
+  MISSING_SIGNATURE = "MISSING_SIGNATURE",
+  /** A signature present on the transaction failed cryptographic verification. */
+  INVALID_SIGNATURE = "INVALID_SIGNATURE",
+
+  // --- Soroban contract execution --------------------------------------
+  /** The referenced contract does not exist on the network. */
+  CONTRACT_NOT_FOUND = "CONTRACT_NOT_FOUND",
+  /** The contract rejected the transaction (panic or error result). */
+  CONTRACT_REJECTED = "CONTRACT_REJECTED",
+  /** Simulating the contract invocation failed. */
+  SIMULATION_FAILED = "SIMULATION_FAILED",
+  /** The invocation exceeded the Soroban CPU or memory budget. */
+  OUT_OF_RESOURCE = "OUT_OF_RESOURCE",
+
+  // --- Authorization ---------------------------------------------------
+  /** The caller is not authorized to perform the operation. */
+  UNAUTHORIZED = "UNAUTHORIZED",
+  /** No wallet is connected (or the wallet connection was lost). */
+  WALLET_NOT_CONNECTED = "WALLET_NOT_CONNECTED",
+  /** Wallet / signer authentication failed. */
+  AUTHENTICATION_FAILED = "AUTHENTICATION_FAILED",
+
+  // --- Operational / state ---------------------------------------------
+  /** Concurrent modification produced a state conflict (e.g. merge conflict). */
+  STATE_CONFLICT = "STATE_CONFLICT",
+  /** The circuit breaker is open and calls are being short-circuited. */
+  CIRCUIT_OPEN = "CIRCUIT_OPEN",
+  /** The operation was aborted before completion. */
+  OPERATION_ABORTED = "OPERATION_ABORTED",
+  /** A batch exceeds the maximum permitted size. */
+  BATCH_TOO_LARGE = "BATCH_TOO_LARGE",
+  /** An unexpected internal SDK error. */
+  INTERNAL_ERROR = "INTERNAL_ERROR",
 }
 
 /** Generic SDK error carrying a typed {@link SdkErrorCode} and optional details. */
@@ -2241,6 +2379,163 @@ export class SdkError extends Error {
 
 export function isSdkError(err: unknown): err is SdkError {
   return err instanceof SdkError;
+}
+
+/**
+ * Human-readable description for every {@link SdkErrorCode}.
+ *
+ * Exhaustive by construction: adding a new code to the enum without adding a
+ * description here is a compile error.
+ */
+export const SDK_ERROR_CODE_DESCRIPTIONS: Record<SdkErrorCode, string> = {
+  [SdkErrorCode.INVOICE_NOT_FOUND]: "The requested invoice does not exist on-chain.",
+  [SdkErrorCode.INVOICE_NOT_PENDING]:
+    "The invoice is not in the Pending state required by this operation.",
+  [SdkErrorCode.DEADLINE_EXPIRED]: "The invoice's payment deadline has passed.",
+  [SdkErrorCode.INVOICE_FROZEN]: "The invoice is frozen due to an active dispute or lock.",
+  [SdkErrorCode.ACCOUNT_NOT_FOUND]: "The referenced Stellar account does not exist on the network.",
+  [SdkErrorCode.INSUFFICIENT_FUNDS]: "The account balance is too low to cover the operation.",
+  [SdkErrorCode.INVALID_INPUT]: "A generic input failed validation.",
+  [SdkErrorCode.INVALID_ADDRESS]: "A Stellar account address is malformed.",
+  [SdkErrorCode.INVALID_CONTRACT_ADDRESS]:
+    "A Soroban contract address is malformed or fails its CRC16 checksum.",
+  [SdkErrorCode.INVALID_AMOUNT]: "A payment amount is malformed or out of range.",
+  [SdkErrorCode.INVALID_RECIPIENT]: "One or more recipient addresses are invalid.",
+  [SdkErrorCode.INVALID_CONFIG]: "The SDK configuration is invalid.",
+  [SdkErrorCode.NETWORK_ERROR]: "A network-level failure occurred (DNS, TLS, connection reset).",
+  [SdkErrorCode.NETWORK_TIMEOUT]: "A network request timed out.",
+  [SdkErrorCode.RPC_FAILED]: "The RPC node rejected or failed to process the request.",
+  [SdkErrorCode.HORIZON_ERROR]: "Horizon returned an error response.",
+  [SdkErrorCode.SERVICE_UNAVAILABLE]: "The network endpoint is temporarily unavailable.",
+  [SdkErrorCode.RATE_LIMITED]: "The endpoint is rate limiting requests.",
+  [SdkErrorCode.TRANSACTION_FAILED]: "The transaction was rejected or failed on-chain.",
+  [SdkErrorCode.TRANSACTION_EXPIRED]:
+    "The transaction's time bounds elapsed before it was included in a ledger.",
+  [SdkErrorCode.SEQUENCE_MISMATCH]:
+    "The transaction's sequence number does not match the account's current sequence.",
+  [SdkErrorCode.INSUFFICIENT_FEE]: "The provided fee is below the required minimum.",
+  [SdkErrorCode.SUBMISSION_FAILED]: "Submitting the transaction to the network failed.",
+  [SdkErrorCode.CONFIRMATION_TIMEOUT]:
+    "The transaction was submitted but was not confirmed in time.",
+  [SdkErrorCode.VERIFICATION_FAILED]:
+    "Pre-submit transaction verification found one or more failed checks.",
+  [SdkErrorCode.MISSING_SIGNATURE]: "A required signature is missing from the transaction.",
+  [SdkErrorCode.INVALID_SIGNATURE]:
+    "A signature on the transaction failed cryptographic verification.",
+  [SdkErrorCode.CONTRACT_NOT_FOUND]: "The referenced contract does not exist on the network.",
+  [SdkErrorCode.CONTRACT_REJECTED]:
+    "The contract rejected the transaction (panic or error result).",
+  [SdkErrorCode.SIMULATION_FAILED]: "Simulating the contract invocation failed.",
+  [SdkErrorCode.OUT_OF_RESOURCE]: "The invocation exceeded the Soroban CPU or memory budget.",
+  [SdkErrorCode.UNAUTHORIZED]: "The caller is not authorized to perform the operation.",
+  [SdkErrorCode.WALLET_NOT_CONNECTED]: "No wallet is connected, or the connection was lost.",
+  [SdkErrorCode.AUTHENTICATION_FAILED]: "Wallet or signer authentication failed.",
+  [SdkErrorCode.STATE_CONFLICT]: "Concurrent modification produced a state conflict.",
+  [SdkErrorCode.CIRCUIT_OPEN]: "The circuit breaker is open and calls are short-circuited.",
+  [SdkErrorCode.OPERATION_ABORTED]: "The operation was aborted before completion.",
+  [SdkErrorCode.BATCH_TOO_LARGE]: "A batch exceeds the maximum permitted size.",
+  [SdkErrorCode.INTERNAL_ERROR]: "An unexpected internal SDK error occurred.",
+};
+
+/**
+ * Codes that describe transient failures where retrying the same logical
+ * request (unchanged) is safe and may succeed.
+ *
+ * Deliberately conservative: transaction-state errors such as
+ * `SEQUENCE_MISMATCH` or `TRANSACTION_FAILED` are excluded because a blind
+ * retry can double-submit; they require rebuilding the transaction instead.
+ */
+export const RETRYABLE_ERROR_CODES: ReadonlySet<SdkErrorCode> = new Set<SdkErrorCode>([
+  SdkErrorCode.NETWORK_TIMEOUT,
+  SdkErrorCode.NETWORK_ERROR,
+  SdkErrorCode.RPC_FAILED,
+  SdkErrorCode.HORIZON_ERROR,
+  SdkErrorCode.SERVICE_UNAVAILABLE,
+  SdkErrorCode.RATE_LIMITED,
+  SdkErrorCode.CONFIRMATION_TIMEOUT,
+]);
+
+/**
+ * Return a human-readable description for an {@link SdkErrorCode}.
+ *
+ * Unknown strings fall back to a generic description so callers can safely
+ * pass through arbitrary code strings (e.g. from parsed error payloads).
+ *
+ * @param code - An SdkErrorCode member or any code string (matched
+ *   case-insensitively).
+ */
+export function describeSdkErrorCode(code: SdkErrorCode | string): string {
+  return (
+    SDK_ERROR_CODE_DESCRIPTIONS[code.toUpperCase() as SdkErrorCode] ??
+    "Unknown SDK error code."
+  );
+}
+
+/**
+ * Report whether a code describes a transient failure that is safe to retry
+ * unchanged. Unknown codes are treated as not retryable.
+ *
+ * @param code - An SdkErrorCode member or any code string (matched
+ *   case-insensitively).
+ */
+export function isRetryableErrorCode(code: SdkErrorCode | string): boolean {
+  return RETRYABLE_ERROR_CODES.has(code.toUpperCase() as SdkErrorCode);
+}
+
+// ---------------------------------------------------------------------------
+// Contract address validation error (issue #1065)
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown when a string is not a well-formed Soroban contract address
+ * (`C...`, 56 base32 characters, valid CRC16 checksum).
+ */
+export class InvalidContractAddressError extends StellarSplitError {
+  /** The rejected address value. */
+  readonly address: string;
+  /** Human-readable reason(s) the address was rejected. */
+  readonly reasons: string[];
+
+  constructor(address: string, reasons: string[]) {
+    super(
+      `Invalid contract address: ${reasons.join("; ")}`,
+      "INVALID_CONTRACT_ADDRESS",
+      { address, reasons },
+    );
+    this.name = "InvalidContractAddressError";
+    this.address = address;
+    this.reasons = reasons;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isInvalidContractAddressError(err: unknown): err is InvalidContractAddressError {
+  return err instanceof InvalidContractAddressError;
+}
+
+// ---------------------------------------------------------------------------
+// Transaction verification error (issue #1066)
+// ---------------------------------------------------------------------------
+
+/** Thrown by transaction verification when one or more checks fail. */
+export class TransactionVerificationError extends StellarSplitError {
+  /** Names of the verification checks that failed. */
+  readonly failedChecks: string[];
+
+  constructor(failedChecks: string[], context?: Record<string, unknown>) {
+    super(
+      `Transaction verification failed: ${failedChecks.join(", ")}`,
+      "VERIFICATION_FAILED",
+      { failedChecks, ...context },
+    );
+    this.name = "TransactionVerificationError";
+    this.failedChecks = failedChecks;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isTransactionVerificationError(err: unknown): err is TransactionVerificationError {
+  return err instanceof TransactionVerificationError;
 }
 
 // ---------------------------------------------------------------------------
@@ -2354,5 +2649,225 @@ export class BatchTooLargeError extends StellarSplitError {
 
 export function isBatchTooLargeError(err: unknown): err is BatchTooLargeError {
   return err instanceof BatchTooLargeError;
+}
+
+// ---------------------------------------------------------------------------
+// Rounds, Milestones, and Referrals Errors (issues #878, #879, #880, #881)
+// ---------------------------------------------------------------------------
+
+/** Thrown when closeRound is called before the round timestamp has ended. */
+export class RoundNotEndedError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly roundEnd: number;
+
+  constructor(invoiceId: string, roundEnd: number, raw?: string) {
+    super(
+      `Round has not ended yet for invoice ${invoiceId} (ends at ${roundEnd})`,
+      "ROUND_NOT_ENDED",
+      { invoiceId, roundEnd },
+      raw
+    );
+    this.name = "RoundNotEndedError";
+    this.invoiceId = invoiceId;
+    this.roundEnd = roundEnd;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isRoundNotEndedError(err: unknown): err is RoundNotEndedError {
+  return err instanceof RoundNotEndedError;
+}
+
+/** Thrown when completeMilestone is called for an index that is not active. */
+export class WrongMilestoneError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly requestedIndex: number;
+  readonly activeIndex: number;
+
+  constructor(invoiceId: string, requestedIndex: number, activeIndex: number, raw?: string) {
+    super(
+      `Milestone ${requestedIndex} is not active for invoice ${invoiceId} (active: ${activeIndex})`,
+      "WRONG_MILESTONE",
+      { invoiceId, requestedIndex, activeIndex },
+      raw
+    );
+    this.name = "WrongMilestoneError";
+    this.invoiceId = invoiceId;
+    this.requestedIndex = requestedIndex;
+    this.activeIndex = activeIndex;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isWrongMilestoneError(err: unknown): err is WrongMilestoneError {
+  return err instanceof WrongMilestoneError;
+}
+
+/** Thrown when claimReferralRewards is called with a zero balance. */
+export class NothingToClaimError extends StellarSplitError {
+  readonly address: string;
+
+  constructor(address: string, raw?: string) {
+    super(
+      `No referral rewards to claim for address ${address}`,
+      "NOTHING_TO_CLAIM",
+      { address },
+      raw
+    );
+    this.name = "NothingToClaimError";
+    this.address = address;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isNothingToClaimError(err: unknown): err is NothingToClaimError {
+  return err instanceof NothingToClaimError;
+}
+
+/** Thrown when an invoice is expired (round_end / deadline already passed). */
+export class InvoiceExpiredError extends StellarSplitError {
+  readonly invoiceId: string;
+
+  constructor(invoiceId: string, raw?: string) {
+    super(`Invoice ${invoiceId} has expired`, "INVOICE_EXPIRED", { invoiceId }, raw);
+    this.name = "InvoiceExpiredError";
+    this.invoiceId = invoiceId;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isInvoiceExpiredError(err: unknown): err is InvoiceExpiredError {
+  return err instanceof InvoiceExpiredError;
+}
+
+/** Thrown when payer is not on the whitelist for a restricted invoice. */
+export class PayerNotWhitelistedError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly payer: string;
+
+  constructor(invoiceId: string, payer: string, raw?: string) {
+    super(
+      `Payer ${payer} is not whitelisted for invoice ${invoiceId}`,
+      "PAYER_NOT_WHITELISTED",
+      { invoiceId, payer },
+      raw
+    );
+    this.name = "PayerNotWhitelistedError";
+    this.invoiceId = invoiceId;
+    this.payer = payer;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isPayerNotWhitelistedError(err: unknown): err is PayerNotWhitelistedError {
+  return err instanceof PayerNotWhitelistedError;
+}
+
+/** Thrown when a payer's contribution exceeds their per-payer cap. */
+export class ContributionCapExceededError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly payer: string;
+  readonly cap: bigint;
+  readonly attempted: bigint;
+
+  constructor(invoiceId: string, payer: string, cap: bigint, attempted: bigint, raw?: string) {
+    super(
+      `Contribution cap exceeded for payer ${payer} on invoice ${invoiceId}: cap ${cap}, attempted ${attempted}`,
+      "CONTRIBUTION_CAP_EXCEEDED",
+      { invoiceId, payer, cap: cap.toString(), attempted: attempted.toString() },
+      raw
+    );
+    this.name = "ContributionCapExceededError";
+    this.invoiceId = invoiceId;
+    this.payer = payer;
+    this.cap = cap;
+    this.attempted = attempted;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isContributionCapExceededError(err: unknown): err is ContributionCapExceededError {
+  return err instanceof ContributionCapExceededError;
+}
+
+/**
+ * Thrown when a payment is attempted during an active cooldown window.
+ * Includes retryAfter so callers know when they may try again.
+ */
+export class PaymentCooldownActiveError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly payer: string;
+  /** The earliest time after which the payer may retry. */
+  readonly retryAfter: Date;
+
+  constructor(invoiceId: string, payer: string, retryAfterTimestamp: number, raw?: string) {
+    const retryAfter = new Date(retryAfterTimestamp * 1000);
+    super(
+      `Payment cooldown active for payer ${payer} on invoice ${invoiceId}. Retry after ${retryAfter.toISOString()}`,
+      "PAYMENT_COOLDOWN_ACTIVE",
+      { invoiceId, payer, retryAfterTimestamp },
+      raw
+    );
+    this.name = "PaymentCooldownActiveError";
+    this.invoiceId = invoiceId;
+    this.payer = payer;
+    this.retryAfter = retryAfter;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isPaymentCooldownActiveError(err: unknown): err is PaymentCooldownActiveError {
+  return err instanceof PaymentCooldownActiveError;
+}
+
+/** Thrown when the contract is administratively frozen for all operations. */
+export class ContractFrozenError extends StellarSplitError {
+  constructor(raw?: string) {
+    super("Contract is frozen and not accepting operations", "CONTRACT_FROZEN", undefined, raw);
+    this.name = "ContractFrozenError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isContractFrozenError(err: unknown): err is ContractFrozenError {
+  return err instanceof ContractFrozenError;
+}
+
+/** Thrown when an invoice has been fully funded and cannot receive more payments. */
+export class InvoiceFullyFundedError extends StellarSplitError {
+  readonly invoiceId: string;
+
+  constructor(invoiceId: string, raw?: string) {
+    super(`Invoice ${invoiceId} is already fully funded`, "INVOICE_FULLY_FUNDED", { invoiceId }, raw);
+    this.name = "InvoiceFullyFundedError";
+    this.invoiceId = invoiceId;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isInvoiceFullyFundedError(err: unknown): err is InvoiceFullyFundedError {
+  return err instanceof InvoiceFullyFundedError;
+}
+
+/** Thrown when delegate limit is reached. */
+export class DelegateLimitReachedError extends StellarSplitError {
+  readonly invoiceId: string;
+  readonly limit: number;
+
+  constructor(invoiceId: string, limit: number = 3) {
+    super(
+      `Invoice ${invoiceId} has reached the delegate limit of ${limit}`,
+      "DELEGATE_LIMIT_REACHED",
+      { invoiceId, limit },
+    );
+    this.name = "DelegateLimitReachedError";
+    this.invoiceId = invoiceId;
+    this.limit = limit;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isDelegateLimitReachedError(err: unknown): err is DelegateLimitReachedError {
+  return err instanceof DelegateLimitReachedError;
 }
 

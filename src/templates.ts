@@ -7,7 +7,7 @@ import type {
   CreateFromTemplateParams,
   SaveTemplateParams,
 } from "./types/templates.js";
-import type { CreateInvoiceParams } from "./types/index.js";
+import type { CreateInvoiceParams } from "./types.js";
 import { StellarSplitError } from "./errors.js";
 
 export class TemplateNotFoundError extends StellarSplitError {

@@ -24,4 +24,17 @@ describe("public API surface (issues #586, #588, #589)", () => {
     expect(typeof sdk.WalletConnectionTimeoutError).toBe("function");
     expect(typeof sdk.isWalletConnectionTimeoutError).toBe("function");
   });
+
+  it("exports parseAmount, InvoiceStateSubscriber, WebhookClient, and AnalyticsTracker (#1034, #1035, #1036, #1037)", () => {
+    expect(typeof sdk.parseAmount).toBe("function");
+    expect(typeof sdk.InvoiceStateSubscriber).toBe("function");
+    expect(typeof sdk.matchesFilter).toBe("function");
+    expect(typeof sdk.WebhookClient).toBe("function");
+    expect(typeof sdk.WebhookVerificationError).toBe("function");
+    expect(typeof sdk.AnalyticsTracker).toBe("function");
+    expect(typeof sdk.AnalyticsCollector).toBe("function");
+    expect(typeof sdk.PrivacyController).toBe("function");
+    expect(typeof sdk.wrapClientWithAnalytics).toBe("function");
+  });
 });
+

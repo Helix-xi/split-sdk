@@ -151,20 +151,23 @@ export function calculatePoolShare(
     );
   }
 
+  const reserve0 = pool.reserves[0]!;
+  const reserve1 = pool.reserves[1]!;
+
   if (owned <= 0n) {
     return {
       shareOfAssetA: "0",
       shareOfAssetB: "0",
-      assetA: pool.reserves[0].asset,
-      assetB: pool.reserves[1].asset,
+      assetA: reserve0.asset,
+      assetB: reserve1.asset,
       totalShares: totalShares.toString(),
       sharesOwned: "0",
       ownershipPercent: "0.00",
     };
   }
 
-  const reserveA = BigInt(pool.reserves[0].amount);
-  const reserveB = BigInt(pool.reserves[1].amount);
+  const reserveA = BigInt(reserve0.amount);
+  const reserveB = BigInt(reserve1.amount);
 
   // Proportional share: (owned / totalShares) * reserve
   const shareOfAssetA = (reserveA * owned) / totalShares;
@@ -175,8 +178,8 @@ export function calculatePoolShare(
   return {
     shareOfAssetA: shareOfAssetA.toString(),
     shareOfAssetB: shareOfAssetB.toString(),
-    assetA: pool.reserves[0].asset,
-    assetB: pool.reserves[1].asset,
+    assetA: reserve0.asset,
+    assetB: reserve1.asset,
     totalShares: totalShares.toString(),
     sharesOwned: owned.toString(),
     ownershipPercent,
@@ -438,13 +441,16 @@ function computePriceImpact(spotPrice: string, effectivePrice: string): string {
   
   const spotScaled = spot.int * spot.scale + spot.frac;
   const effectiveScaled = effective.int * effective.scale + effective.frac;
+  const commonScale = spot.scale > effective.scale ? spot.scale : effective.scale;
+  const spotCommon = spotScaled * (commonScale / spot.scale);
+  const effectiveCommon = effectiveScaled * (commonScale / effective.scale);
 
-  if (spotScaled === 0n) return "0.00";
+  if (spotCommon === 0n) return "0.00";
 
   // (spot - effective) / spot * 100 with 4 decimal places of precision
   const SCALE = 10000n;
-  const numerator = (spotScaled - effectiveScaled) * SCALE * 100n;
-  const denominator = spotScaled;
+  const numerator = (spotCommon - effectiveCommon) * SCALE * 100n;
+  const denominator = spotCommon;
 
   if (numerator <= 0n) return "0.00";
 

@@ -18,6 +18,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { OraclePriceError, NoReturnValueError, ValidationError } from "./errors.js";
 import { RateCache } from "./rateCache.js";
+import type { PriceOracleAdapter } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Types & Interfaces

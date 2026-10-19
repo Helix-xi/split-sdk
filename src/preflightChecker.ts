@@ -1,8 +1,9 @@
-import { rpc as SorobanRpc, Horizon } from "@stellar/stellar-sdk";
+import { rpc as SorobanRpc, Horizon, Asset } from "@stellar/stellar-sdk";
 import { inspectFlags } from "./accountFlagsInspector.js";
-import type { AccountFlagSet } from "./types.js";
+import type { AccountFlagSet, AccountLockState } from "./types.js";
 import { withTimeout } from "./timeout.js";
-import { PreflightError } from "./errors.js";
+import { PreflightError, PaymentExpiredError, AccountFrozenError, AccountLockedError } from "./errors.js";
+import { detectLockState } from "./accountStateDetector.js";
 
 export type PayerReadinessReason =
   | "account_not_found"
@@ -32,8 +33,6 @@ export interface InvoiceExpiryResult {
   /** Remaining seconds until expiry (0 or negative if expired). */
   secondsRemaining: number;
 }
-
-import { PaymentExpiredError } from "./errors.js";
 
 /**
  * Check whether an invoice has expired and should reject a payment submission.
@@ -127,7 +126,7 @@ export async function checkSponsorReserve(
   const horizonServer = new Horizon.Server(horizonUrl);
   const sponsorRecord = await horizonServer.loadAccount(sponsorAddress);
 
-  const numSponsored = sponsorRecord.num_sponsored;
+  const numSponsored = (sponsorRecord as any).num_sponsored ?? 0;
   const nativeLine = sponsorRecord.balances.find(
     (b) => b.asset_type === "native",
   );

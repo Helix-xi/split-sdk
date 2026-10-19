@@ -33,22 +33,14 @@ import React, {
   useState,
 } from "react";
 import type { ReactNode } from "react";
-import type { Invoice, InvoiceEvent } from "../types.js";
+import type { Invoice, InvoiceEvent, ProtocolStats } from "../types.js";
 import type { StellarSplitClient } from "../client.js";
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-/** ProtocolStats returned by {@link useProtocolStats}. */
-export interface ProtocolStats {
-  /** Total number of invoices created on-chain. */
-  totalInvoices: number;
-  /** Total amount released in stroops. */
-  totalReleased: bigint;
-  /** Number of currently pending invoices. */
-  pendingInvoices: number;
-}
+export type { ProtocolStats };
 
 /** Filter options accepted by {@link useCreatorInvoices}. */
 export interface InvoiceFilter {
