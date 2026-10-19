@@ -10,6 +10,7 @@ import type { WalletAdapter } from "../types.js";
 import { FreighterAdapter } from "./adapters/FreighterAdapter.js";
 import { LobstrAdapter } from "./adapters/LobstrAdapter.js";
 import { XBullAdapter } from "./adapters/XBullAdapter.js";
+import { MetaMaskAdapter } from "./adapters/MetaMaskAdapter.js";
 
 export interface SessionState {
   walletName: string;
@@ -55,6 +56,11 @@ export class WalletSessionManager extends EventEmitter {
     // Check for xBull
     if (typeof window !== "undefined" && (window as any).xbull) {
       adapters.push(new XBullAdapter());
+    }
+
+    // Check for MetaMask
+    if (typeof window !== "undefined" && (window as any).ethereum) {
+      adapters.push(new MetaMaskAdapter());
     }
 
     return adapters;

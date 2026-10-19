@@ -284,7 +284,10 @@ export interface TokenGatePolicy {
 }
 
 /** An on-chain StellarSplit invoice. */
-export interface Invoice {
+export interface Invoice<
+  TMetadata = Record<string, unknown>,
+  TStatus extends InvoiceStatus = InvoiceStatus
+> {
   /** Invoice ID (u64 from the contract). */
   id: string;
   /** Address that created the invoice. */
@@ -311,7 +314,7 @@ export interface Invoice {
   /** Total amount funded so far in stroops. */
   funded: bigint;
   /** Current lifecycle status. */
-  status: InvoiceStatus;
+  status: TStatus;
   /** All payments recorded on-chain. */
   payments: Payment[];
   /** Whether this is a recurring invoice. */
@@ -364,6 +367,10 @@ export interface Invoice {
    * asset balance to read or interact with this invoice.
    */
   accessPolicy?: TokenGatePolicy;
+  /**
+   * Optional custom metadata attached to the invoice for higher-level application typing.
+   */
+  metadata?: TMetadata;
 }
 
 /**
@@ -432,6 +439,8 @@ export interface InvoiceStats {
   totalPayers: number;
   /** Mean payment size in stroops (0 when there are no payments). */
   avgPayment: bigint;
+  /** Median payment size in stroops (0 when there are no payments). */
+  medianAmount?: bigint;
   /**
    * Stroops funded per day across the payment window, i.e. the sum of payment
    * amounts divided by the span between the first and last payment.
@@ -484,7 +493,7 @@ export interface InvoiceReceipt {
 }
 
 /** Parameters for creating an invoice. */
-export interface CreateInvoiceParams {
+export interface CreateInvoiceParams<TMetadata = Record<string, unknown>> {
   /** Stellar address of the creator (must sign). */
   creator: string;
   /** Recipients and their owed amounts. */
@@ -495,6 +504,8 @@ export interface CreateInvoiceParams {
   deadline: number;
   /** Optional memo / description. */
   memo?: string;
+  /** Optional custom metadata. */
+  metadata?: TMetadata;
   /**
    * When `true`, simulate the transaction against Soroban RPC instead of
    * submitting it, and resolve with a {@link SimulationResult} (issue #844).
@@ -1588,6 +1599,15 @@ export interface AccountFlagSet {
   isCompatibleWith(operation: string): boolean;
 }
 
+/** Result of checking an account's freeze / lock state for an asset. */
+export interface AccountLockState {
+  isFrozen: boolean;
+  isLocked: boolean;
+  trustlineAuthorized: boolean;
+  revocableByIssuer: boolean;
+  reason?: "no_trustline" | "frozen" | "immutable" | string;
+}
+
 /** Declarative description of a claimable-balance claim predicate, buildable via `PredicateBuilder.build()`. */
 export type PredicateConfig =
   | { type: "unconditional" }
@@ -2276,3 +2296,9 @@ export interface Attestation {
   /** Whether the attestation has been revoked. */
   revoked: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// Type definitions improvements & utilities (issue #1080)
+// ---------------------------------------------------------------------------
+
+export * from "./types/utilities.js";

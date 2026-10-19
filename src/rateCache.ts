@@ -42,16 +42,26 @@ function cacheKey(from: string, to: string): string {
  */
 export class RateCache<TRate = number> {
   private readonly store = new Map<string, RateCacheEntry<TRate>>();
-  private readonly oracle: RateOracleFn<TRate>;
+  private readonly oracle?: RateOracleFn<TRate>;
   private readonly ttlMs: number;
   private readonly maxSize: number;
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private _running = false;
 
-  constructor(oracle: RateOracleFn<TRate>, config: RateCacheConfig = {}) {
-    this.oracle = oracle;
-    this.ttlMs = config.ttlMs ?? DEFAULT_TTL_MS;
-    this.maxSize = config.maxSize ?? DEFAULT_MAX_SIZE;
+  constructor(
+    oracleOrConfig?: RateOracleFn<TRate> | RateCacheConfig,
+    config?: RateCacheConfig,
+  ) {
+    if (typeof oracleOrConfig === "function") {
+      this.oracle = oracleOrConfig;
+      this.ttlMs = config?.ttlMs ?? DEFAULT_TTL_MS;
+      this.maxSize = config?.maxSize ?? DEFAULT_MAX_SIZE;
+    } else {
+      this.oracle = undefined;
+      const cfg = oracleOrConfig ?? config ?? {};
+      this.ttlMs = cfg.ttlMs ?? DEFAULT_TTL_MS;
+      this.maxSize = cfg.maxSize ?? DEFAULT_MAX_SIZE;
+    }
   }
 
   /** Whether background refresh is currently running. */
@@ -64,21 +74,42 @@ export class RateCache<TRate = number> {
     return this.store.size;
   }
 
+  /** The cached rate for `from`/`to`, or undefined if absent or expired. */
+  get(from: string, to: string): TRate | undefined {
+    const key = cacheKey(from, to);
+    const entry = this.store.get(key);
+    if (!entry) return undefined;
+    if (Date.now() - entry.fetchedAt > this.ttlMs) {
+      this.store.delete(key);
+      return undefined;
+    }
+    return entry.rate;
+  }
+
+  /** Cache `rate` for `from`/`to`, expiring after this cache's TTL. */
+  set(from: string, to: string, rate: TRate): void {
+    const key = cacheKey(from, to);
+    this.store.set(key, { rate, fetchedAt: Date.now() });
+    this.evictOverflow();
+  }
+
   /**
    * Get the exchange rate for `from -> to`, serving from cache when the
    * entry is younger than `ttlMs`. On a cache miss (or expired entry), calls
    * the configured oracle function and stores the result with a timestamp.
    */
   async getRate(from: string, to: string): Promise<TRate> {
-    const key = cacheKey(from, to);
-    const entry = this.store.get(key);
-    if (entry && Date.now() - entry.fetchedAt < this.ttlMs) {
-      return entry.rate;
+    const cached = this.get(from, to);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    if (!this.oracle) {
+      throw new Error(`No oracle function configured in RateCache for ${from}:${to}`);
     }
 
     const rate = await this.oracle(from, to);
-    this.store.set(key, { rate, fetchedAt: Date.now() });
-    this.evictOverflow();
+    this.set(from, to, rate);
     return rate;
   }
 
@@ -90,6 +121,11 @@ export class RateCache<TRate = number> {
   /** Clear the entire cache. */
   invalidateAll(): void {
     this.store.clear();
+  }
+
+  /** Remove all cached rates. Alias for invalidateAll. */
+  clear(): void {
+    this.invalidateAll();
   }
 
   /**
@@ -115,6 +151,7 @@ export class RateCache<TRate = number> {
   }
 
   private async refreshAll(): Promise<void> {
+    if (!this.oracle) return;
     for (const key of Array.from(this.store.keys())) {
       const [from, to] = key.split(":");
       if (from === undefined || to === undefined) continue;

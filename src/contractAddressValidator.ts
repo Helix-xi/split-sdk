@@ -1,0 +1,159 @@
+/**
+ * Soroban contract address validation for StellarSplit (issue #1065).
+ *
+ * Validates contract identifiers (`C...` addresses) against the Stellar
+ * StrKey standard before they are used to build or submit transactions, so
+ * mistyped or corrupt contract IDs fail fast locally instead of producing
+ * on-chain failures.
+ *
+ * ## Validation rules
+ *
+ * A valid Soroban contract address must satisfy all of the following:
+ *
+ * 1. **Type** — a non-empty string (`typeof address === "string"`).
+ * 2. **Length** — exactly 56 characters.
+ * 3. **Prefix** — starts with `C` (the contract StrKey version byte).
+ * 4. **Alphabet** — every character is in the RFC 4648 base32 alphabet
+ *    (`A`–`Z`, `2`–`7`); base32 is case-sensitive, so lowercase is rejected.
+ * 5. **Checksum** — the trailing two characters encode a CRC16-XModem
+ *    checksum over the version byte plus the 32-byte payload, as defined by
+ *    the StrKey specification (CAP-0005 / SEP-0023).
+ *
+ * Rules 2–4 are reported as the `format` check; rule 5 is reported as the
+ * `checksum` check. Both must pass for the address to be valid.
+ *
+ * @example
+ * ```ts
+ * import { validateContractAddress, isValidContractAddress } from "@stellar-split/sdk";
+ *
+ * isValidContractAddress("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"); // true
+ *
+ * const result = validateContractAddress("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC5");
+ * result.format;    // true  — well-formed, only the checksum is broken
+ * result.checksum;  // false
+ * result.errors;    // ["Contract address failed CRC16 checksum validation"]
+ * ```
+ */
+
+import { StrKey } from "@stellar/stellar-sdk";
+import { InvalidContractAddressError } from "./errors.js";
+
+/** Total length of a StrKey-encoded contract address, in characters. */
+export const CONTRACT_ADDRESS_LENGTH = 56;
+
+/** Required leading character of a contract (`C...`) address. */
+export const CONTRACT_ADDRESS_PREFIX = "C";
+
+/** RFC 4648 base32 alphabet used by StrKey (uppercase, case-sensitive). */
+const BASE32_PATTERN = /^[A-Z2-7]+$/;
+
+/** Detailed outcome of validating a contract address. */
+export interface ContractAddressValidationResult {
+  /** `true` when both the format and checksum checks pass. */
+  valid: boolean;
+  /** The value that was validated (stringified for non-string input). */
+  address: string;
+  /** `true` when length, prefix, and base32 alphabet checks pass. */
+  format: boolean;
+  /** `true` when the StrKey CRC16 checksum verifies (only checked when `format` is `true`). */
+  checksum: boolean;
+  /** Human-readable descriptions of every failed rule. */
+  errors: string[];
+}
+
+/**
+ * Validate a Soroban contract address against the StrKey standard.
+ *
+ * Performs format validation (type, length, prefix, base32 alphabet) followed
+ * by CRC16 checksum validation via the stellar-sdk `StrKey` codec. Never
+ * throws — all failures are reported in the returned result.
+ *
+ * @param address - Candidate contract address (any value; non-strings fail).
+ * @returns A {@link ContractAddressValidationResult} describing which rules
+ *   passed and why any failed.
+ */
+export function validateContractAddress(address: unknown): ContractAddressValidationResult {
+  if (typeof address !== "string" || address.length === 0) {
+    return {
+      valid: false,
+      address: String(address),
+      format: false,
+      checksum: false,
+      errors: ["Contract address must be a non-empty string"],
+    };
+  }
+
+  const errors: string[] = [];
+  let format = true;
+
+  if (address.length !== CONTRACT_ADDRESS_LENGTH) {
+    format = false;
+    errors.push(
+      `Contract address must be exactly ${CONTRACT_ADDRESS_LENGTH} characters (got ${address.length})`,
+    );
+  }
+  if (!address.startsWith(CONTRACT_ADDRESS_PREFIX)) {
+    format = false;
+    errors.push(
+      `Contract address must start with '${CONTRACT_ADDRESS_PREFIX}' (got '${address.slice(0, 1)}')`,
+    );
+  }
+  if (!BASE32_PATTERN.test(address)) {
+    format = false;
+    errors.push(
+      "Contract address must contain only uppercase base32 characters (A-Z, 2-7)",
+    );
+  }
+
+  // Only attempt checksum validation once the address is well-formed;
+  // StrKey.decodeContract throws on any structural or checksum mismatch.
+  let checksum = false;
+  if (format) {
+    try {
+      StrKey.decodeContract(address);
+      checksum = true;
+    } catch {
+      errors.push("Contract address failed CRC16 checksum validation");
+    }
+  }
+
+  return {
+    valid: format && checksum,
+    address,
+    format,
+    checksum,
+    errors,
+  };
+}
+
+/**
+ * Report whether `address` is a valid Soroban contract address.
+ *
+ * Shorthand for `validateContractAddress(address).valid`.
+ *
+ * @param address - Candidate contract address string.
+ *
+ * @example
+ * ```ts
+ * isValidContractAddress("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"); // true
+ * isValidContractAddress("GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ"); // false — G-address
+ * isValidContractAddress(""); // false
+ * ```
+ */
+export function isValidContractAddress(address: string): boolean {
+  return validateContractAddress(address).valid;
+}
+
+/**
+ * Assert that `address` is a valid Soroban contract address, throwing
+ * {@link InvalidContractAddressError} with every violated rule when it is not.
+ *
+ * @param address - Candidate contract address string.
+ * @throws {InvalidContractAddressError} If the address fails any rule.
+ */
+export function assertValidContractAddress(address: string): void {
+  const result = validateContractAddress(address);
+  if (!result.valid) {
+    throw new InvalidContractAddressError(address, result.errors);
+  }
+}

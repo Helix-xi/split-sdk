@@ -1,9 +1,10 @@
 import { createHash } from "crypto";
 import { Horizon } from "@stellar/stellar-sdk";
-import type { DecodedTransactionResult, Invoice, Payment } from "./types.js";
+import type { DecodedTransactionResult, Invoice, Payment, FinalityStatus } from "./types.js";
 import type { PaymentReceipt as ChainPaymentReceipt } from "./types/receipts.js";
 import { PayerAddressRequiredError } from "./errors.js";
 import { decodeTransactionResult } from "./txResultDecoder.js";
+import type { FinalityChecker } from "./finalityChecker.js";
 
 /** A verified payment receipt compiled from on-chain invoice data. */
 export interface PaymentReceipt {
@@ -28,7 +29,9 @@ export interface PaymentReceipt {
   /** Payment status (optional). */
   status?: "pending" | "finalized";
   /** Per-account balance deltas aggregated from transaction effects (optional). */
-  effectSummary?: Array<{ accountId: string; assetDeltas: Array<{ asset: string; delta: bigint }> }>;
+  effectSummary?: Array<{ accountId: string; assetDeltas: Array<{ asset: string; delta: bigint }> }> | Record<string, bigint>;
+  /** Finality check results if finalized. */
+  finality?: FinalityStatus;
 }
 
 /** Options controlling optional receipt enrichment. */
@@ -57,6 +60,9 @@ export interface PaymentReceiptJSON {
   generatedAt: number;
   ledgerTimestamp: number;
   decodedResult?: DecodedTransactionResult;
+  status?: "pending" | "finalized";
+  effectSummary?: unknown;
+  finality?: FinalityStatus;
 }
 
 /** Interface for any client capable of fetching an invoice by ID. */
@@ -158,7 +164,7 @@ export async function generatePaymentReceipt(
 
   if (options?.includeEffects && options.server && options.txHash) {
     const effectSummary = await _fetchEffectSummary(options.server as Horizon.Server, options.txHash);
-    (receipt as Record<string, unknown>).effectSummary = effectSummary;
+    receipt.effectSummary = effectSummary;
   }
 
   return receipt;
@@ -272,6 +278,9 @@ function _buildReceiptObject(data: {
   generatedAt: number;
   ledgerTimestamp: number;
   decodedResult?: DecodedTransactionResult;
+  finality?: FinalityStatus;
+  status?: "pending" | "finalized";
+  effectSummary?: Array<{ accountId: string; assetDeltas: Array<{ asset: string; delta: bigint }> }> | Record<string, bigint>;
 }): PaymentReceipt {
   return {
     invoiceId: data.invoiceId,
@@ -282,6 +291,9 @@ function _buildReceiptObject(data: {
     generatedAt: data.generatedAt,
     ledgerTimestamp: data.ledgerTimestamp,
     decodedResult: data.decodedResult,
+    finality: data.finality,
+    status: data.status,
+    effectSummary: data.effectSummary,
     toJSON(): PaymentReceiptJSON {
       const json: PaymentReceiptJSON = {
         invoiceId: this.invoiceId,
@@ -300,9 +312,22 @@ function _buildReceiptObject(data: {
         json.status = this.status;
       }
       if (this.effectSummary) {
-        json.effectSummary = Object.fromEntries(
-          Object.entries(this.effectSummary).map(([k, v]) => [k, v.toString()])
-        );
+        if (Array.isArray(this.effectSummary)) {
+          json.effectSummary = this.effectSummary.map((e) => ({
+            accountId: e.accountId,
+            assetDeltas: e.assetDeltas.map((d) => ({
+              asset: d.asset,
+              delta: d.delta.toString(),
+            })),
+          }));
+        } else {
+          json.effectSummary = Object.fromEntries(
+            Object.entries(this.effectSummary).map(([k, v]) => [k, v?.toString() ?? ""])
+          );
+        }
+      }
+      if (this.finality) {
+        json.finality = this.finality;
       }
       return json;
     },

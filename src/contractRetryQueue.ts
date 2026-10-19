@@ -35,10 +35,10 @@ export interface ContractRetryQueueConfig {
   maxAttempts?: number;
 }
 
-interface ContractRetryEvents {
+type ContractRetryEvents = {
   contractRetryAttempted: { invocation: ContractInvocation; attempt: number; delay: number; error: unknown };
   contractRetryExhausted: { invocation: ContractInvocation; attempts: number; error: unknown };
-}
+};
 
 const DEFAULT_CONFIG: Required<ContractRetryQueueConfig> = {
   baseDelayMs: 500,

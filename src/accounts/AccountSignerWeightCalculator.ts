@@ -379,6 +379,28 @@ export class AccountSignerWeightCalculator {
   }
 }
 
+export interface MultiSigSigner {
+  key: string;
+  weight: number;
+}
+
+export interface MultiSigTransaction {
+  accountId: string;
+  threshold: ThresholdLevel;
+  signers: MultiSigSigner[];
+  totalWeight: number;
+  requiredThreshold: number;
+  sufficient: boolean;
+}
+
+export type MultiSigBuilderEvent =
+  | { type: "signerAdded"; signer: MultiSigSigner }
+  | { type: "signerRemoved"; key: string }
+  | { type: "thresholdSet"; threshold: ThresholdLevel }
+  | { type: "built"; transaction: MultiSigTransaction };
+
+export type MultiSigBuilderListener = (event: MultiSigBuilderEvent) => void;
+
 // ---------------------------------------------------------------------------
 // MultiSigTransactionBuilder
 // ---------------------------------------------------------------------------

@@ -35,7 +35,8 @@ export const SPLIT_RATIO_TOLERANCE = 1e-9;
 const SPLIT_RATIO_EXPECTED_SUM = 1;
 
 /**
- * Thrown when the sum of all recipient ratios does not equal 1.0 within
+ * Thrown when any recipient ratio is non-finite or outside `[0, 1]`, or the
+ * sum of all recipient ratios does not equal 1.0 within
  * {@link SPLIT_RATIO_TOLERANCE}. The offending sum is exposed on
  * {@link SplitRatioSumError.actualSum} so callers can report the exact drift.
  */
@@ -82,7 +83,8 @@ export function sumRecipientRatios(recipients: SplitRecipient[]): number {
 }
 
 /**
- * Assert that the declared recipient ratios sum to 1.0 within `tolerance`.
+ * Assert that the declared recipient ratios are finite fractions in `[0, 1]`
+ * and sum to 1.0 within `tolerance`.
  *
  * @param recipients - Recipient legs of the split; each should declare `ratio`.
  * @param tolerance  - Absolute tolerance for the comparison.
@@ -90,14 +92,24 @@ export function sumRecipientRatios(recipients: SplitRecipient[]): number {
  *
  * @returns The actual sum of the declared ratios (useful for logging/metrics).
  *
- * @throws {SplitRatioSumError} When `|sum - 1| > tolerance`.
+ * @throws {SplitRatioSumError} When a ratio is invalid or the sum is outside
+ *   the allowed tolerance.
  */
 export function validateSplitRatioSum(
   recipients: SplitRecipient[],
   tolerance: number = SPLIT_RATIO_TOLERANCE,
 ): number {
   const actualSum = sumRecipientRatios(recipients);
-  if (Math.abs(actualSum - SPLIT_RATIO_EXPECTED_SUM) > tolerance) {
+  const hasInvalidRatio = recipients.some((recipient) => {
+    const ratio = recipient.ratio ?? 0;
+    return !Number.isFinite(ratio) || ratio < 0 || ratio > 1;
+  });
+  // Invalid legs can cancel to a valid total (for example, -1 + 2 === 1).
+  // Negating <= also rejects NaN instead of allowing it through the sum check.
+  if (
+    hasInvalidRatio ||
+    !(Math.abs(actualSum - SPLIT_RATIO_EXPECTED_SUM) <= tolerance)
+  ) {
     throw new SplitRatioSumError(actualSum, SPLIT_RATIO_EXPECTED_SUM, tolerance);
   }
   return actualSum;
@@ -120,8 +132,8 @@ export interface SplitRecipient {
    */
   requiredSlots?: number;
   /**
-   * The recipient's share of the split as a decimal ratio (a fraction of the
-   * total, e.g. `0.25` for 25 %).
+   * The recipient's share of the split as a finite fraction in `[0, 1]`
+   * (e.g. `0.25` for 25 %).
    *
    * When at least one recipient declares a `ratio`, every recipient must do so
    * and the ratios must sum to 1.0 within {@link SPLIT_RATIO_TOLERANCE};

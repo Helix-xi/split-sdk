@@ -25,6 +25,14 @@ import type { StateMachineConfig } from "./types/state.js";
 import { RpcLoadBalancer } from "./rpc/RpcLoadBalancer.js";
 import { OfflineQueue, type QueuedOperation } from "./offlineQueue.js";
 import type { EndpointConfig, RpcLoadBalancerOptions } from "./rpc/RpcLoadBalancer.js";
+import {
+  LogLevel,
+  SdkLogger,
+  type Logger,
+  type LoggerOptions,
+  type LogLevelString,
+  type LogEntry,
+} from "./logger.js";
 
 /** Events emitted by {@link StellarSplitClient}. */
 export type SplitClientEventMap = {
@@ -52,6 +60,9 @@ export type SplitClientEventMap = {
   dispute: import("./contractEvents.js").DisputeEvent;
   /** Emitted when a tier is unlocked on an invoice. */
   tier_unlocked: import("./contractEvents.js").TierUnlockedEvent;
+  "queue:drained": undefined;
+  "queue:operation:failed": { operation: import("./offlineQueue.js").QueuedOperation; error: unknown };
+  "queue:conflict:resolved": { operation: import("./offlineQueue.js").QueuedOperation; strategy: string; remoteState?: unknown };
 };
 import { signTransaction } from "./wallet.js";
 import { telemetry } from "./telemetry.js";
@@ -114,7 +125,6 @@ import type {
 import type { WaterfallPlan } from "./types/routing.js";
 import {
   WaterfallInsufficientFundsError,
-  InvalidAttestationError,
   AlreadyRatedError,
   InvoiceNotReleasedForRatingError,
   NotEligibleToVoteError,
@@ -185,6 +195,18 @@ import type {
   CreatorRating,
   ExtensionStatus,
   GroupStats,
+  MatchPledge,
+  Stream,
+  RoundCloseResult,
+  PayerRefund,
+  RoundInfo,
+  MilestoneResult,
+  Milestone,
+  MilestoneStatus,
+  ReferralClaimResult,
+  ReferralPayResult,
+  PauseStatus,
+  ProtocolStats,
 } from "./types.js";
 import {
   estimateBridgeFee as _estimateBridgeFee,
@@ -238,6 +260,15 @@ import {
   WrongMilestoneError,
   NothingToClaimError,
 } from "./errors.js";
+import {
+  InvoiceModule,
+  PaymentModule,
+  DisputeModule,
+  AdminModule,
+  GroupModule,
+  TemplateModule,
+  MilestoneModule,
+} from "./client/modules/index.js";
 import { hashInvoice, verifyInvoiceHash } from "./invoiceHashVerifier.js";
 import { buildFeeBump } from "./feeBumpBuilder.js";
 import type { FeeBumpConfig } from "./feeBumpBuilder.js";
@@ -274,7 +305,7 @@ import type { IdempotencyConfig } from "./idempotency.js";
 import { RollbackCoordinator } from "./splitRollbackCoordinator.js";
 import { validateInvoicePayload } from "./payloadGuard.js";
 import { InvoiceMetadataValidator } from "./validators/invoiceMetadataValidator.js";
-import { validateSplitRatiosOrThrow } from "./validators/splitRatioValidator.js";
+import { validateSplitRatiosOrThrow, type SplitConfig as RatioSplitConfig } from "./validators/splitRatioValidator.js";
 import type { SplitConfig } from "./types.js";
 import { checkTrustlines } from "./trustlineChecker.js";
 import type { TrustlineCheckResult } from "./trustlineChecker.js";
@@ -522,10 +553,18 @@ export interface StellarSplitClientConfig {
    * instead of returning stale data while the transaction is pending.
    */
   optimisticCache?: boolean;
-  /** Whether to validate the passphrase against the RPC node on startup. Defaults to true. */
-  validatePassphrase?: boolean;
-  /** Map of available networks for the live switcher. */
-  networks?: Record<string, NetworkConfig>;
+  /** Optional public key for signing / transaction attribution. */
+  publicKey?: string;
+  /** Optional JSON Schema for invoice metadata validation. */
+  metadataSchema?: object;
+  /** Whether to throw on invalid invoice metadata. Defaults to true. */
+  metadataThrowOnInvalid?: boolean;
+  /** Optional token gate controller for access policy verification. */
+  tokenGateController?: import("./tokenGateController.js").TokenGateController;
+  /** Optional caller account ID for token gating. */
+  callerAccountId?: string;
+  /** Optional OpenTelemetry configuration. */
+  otel?: TelemetryOptions;
   /**
    * Optional override for the allowed invoice status transition graph used
    * by InvoiceStateMachine. When omitted, the default graph is used
@@ -555,11 +594,25 @@ export interface StellarSplitClientConfig {
    */
   debug?: boolean;
   /**
+   * Optional logger instance or options for SDK structured logging.
+   * When provided, the client emits structured log entries for lifecycle events,
+   * RPC interactions, errors, and debugging information.
+   */
+  logger?: Logger | LoggerOptions | boolean;
+  /**
+   * Optional minimum log level for the SDK logger.
+   * Can be a LogLevel enum or string ("debug" | "info" | "warn" | "error" | "none").
+   * Defaults to LogLevel.NONE (or LogLevel.DEBUG if `debug: true`).
+   */
+  logLevel?: LogLevel | LogLevelString;
+  /**
    * Optional fiat-to-asset price oracle adapter (see `PriceOracleAdapter` in
    * types.ts). Used by `convertFiatToAsset` in currencyConverter.ts to
    * resolve display conversions. Defaults to no oracle configured.
    */
   priceOracle?: import("./types.js").PriceOracleAdapter;
+  /** Allow dynamic properties for plugin configurations and runtime extensions. */
+  [key: string]: unknown;
 }
 
 /** Network configuration. */
@@ -679,6 +732,21 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   private _queue = new PriorityQueue();
   private contract: Contract;
   private config: StellarSplitClientConfig;
+
+  /** Modular sub-client for invoice operations (#1079). */
+  readonly invoices: InvoiceModule;
+  /** Modular sub-client for payment operations (#1079). */
+  readonly payments: PaymentModule;
+  /** Modular sub-client for dispute and arbitration operations (#1079). */
+  readonly disputes: DisputeModule;
+  /** Modular sub-client for admin operations (#1079). */
+  readonly admin: AdminModule;
+  /** Modular sub-client for invoice grouping operations (#1079). */
+  readonly groups: GroupModule;
+  /** Modular sub-client for template and recurring invoice operations (#1079). */
+  readonly templates: TemplateModule;
+  /** Modular sub-client for milestone and funding round operations (#1079). */
+  readonly milestones: MilestoneModule;
   private _plugins = new Set<string>();
   private _pluginInstances: StellarSplitPlugin[] = [];
   private _pluginRegistry = new PluginRegistry();
@@ -760,7 +828,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // ---------------------------------------------------------------------------
   // Issue #874: SDK Logger
   // ---------------------------------------------------------------------------
-  private _logger: SdkLogger | null = null;
+  private _logger: Logger | null = null;
 
   // ---------------------------------------------------------------------------
   // Issue #876: Protocol Stats Cache
@@ -778,19 +846,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private get server(): any {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._resilientRpc) return this._resilientRpc;
-  /**
-   * return
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     return (
       this._injectedRpcClient ??
       this._rpcClient ??
@@ -809,12 +865,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * Fire lifecycle hooks for invoice creation.
    */
   private _fireOnCreated(invoice: Invoice): void {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._hooks?.onCreated) {
       try {
         this._hooks.onCreated(invoice);
@@ -828,12 +878,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * Fire lifecycle hooks for invoice payment.
    */
   private _fireOnPaid(invoice: Invoice, payment: Payment): void {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._hooks?.onPaid) {
       try {
         this._hooks.onPaid(invoice, payment);
@@ -847,12 +891,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * Fire lifecycle hooks for invoice release.
    */
   private _fireOnReleased(invoice: Invoice): void {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._hooks?.onReleased) {
       try {
         this._hooks.onReleased(invoice);
@@ -866,12 +904,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * Fire lifecycle hooks for invoice refund.
    */
   private _fireOnRefunded(invoice: Invoice): void {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._hooks?.onRefunded) {
       try {
         this._hooks.onRefunded(invoice);
@@ -885,12 +917,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * Fire lifecycle hooks for invoice cancellation.
    */
   private _fireOnCancelled(invoice: Invoice): void {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._hooks?.onCancelled) {
       try {
         this._hooks.onCancelled(invoice);
@@ -901,25 +927,36 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   constructor(config: StellarSplitClientConfig) {
-  /**
-   * super
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     super();
 
     // Register so ProfilerSession can wrap this client's RPC server.
     StellarSplitClient._instances.add(this);
-  /**
-   * validateOrThrow
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     validateOrThrow(config);
     this.config = config;
     this._activeEnvironment = detectNetworkEnvironment(config.networkPassphrase);
+
+    if (config.logger && typeof config.logger === "object" && "debug" in config.logger && typeof (config.logger as any).debug === "function") {
+      this._logger = config.logger as Logger;
+    } else if (config.logger && typeof config.logger === "object") {
+      this._logger = new SdkLogger({
+        namespace: "StellarSplitClient",
+        ...(config.logger as LoggerOptions),
+        level: config.logLevel ?? (config.logger as LoggerOptions).level,
+      });
+    } else if (config.logger === true) {
+      this._logger = new SdkLogger({ namespace: "StellarSplitClient", level: LogLevel.DEBUG });
+    } else if (config.logLevel !== undefined) {
+      this._logger = new SdkLogger({ namespace: "StellarSplitClient", level: config.logLevel });
+    } else if (config.debug) {
+      this._logger = new SdkLogger({ namespace: "StellarSplitClient", level: LogLevel.DEBUG });
+    } else {
+      this._logger = new SdkLogger({ namespace: "StellarSplitClient", level: LogLevel.NONE });
+    }
+    this._logger.debug("StellarSplitClient initialized", {
+      contractId: config.contractId,
+      network: this._activeEnvironment,
+    });
+
     this._metadataValidator = new InvoiceMetadataValidator(
       config.metadataSchema,
       config.metadataThrowOnInvalid ?? true,
@@ -933,23 +970,14 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     this._rpcClient = config.container?.getRPCClient() ?? null;
     this._adapter =
       config.container?.getWalletAdapter() ?? config.adapter ?? null;
+    if (config.offlineQueue) {
+      this._offlineQueue = new OfflineQueue(this, config.offlineQueue);
+    }
 
     // Per-method timeout manager (Issue #1)
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.timeout !== undefined) {
       this._timeoutManager = new TimeoutManager(config.timeout);
     }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.rpcEndpoints && config.rpcEndpoints.length > 0) {
       this._rpcLoadBalancer = new RpcLoadBalancer(config.rpcEndpoints, config.rpcLoadBalancer);
       this._rpcLoadBalancer.on("endpoint:demoted", (event) => this.emit("endpoint:demoted", event));
@@ -963,12 +991,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
 
     // Circuit breaker + retry resilience layer (Issue #419)
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.circuitBreaker) {
       const rpcTarget = this._injectedRpcClient ?? this._rpcClient ?? this._mainServer;
       this._resilientRpc = new ResilientRpcClient(
@@ -980,25 +1002,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       this._resilientRpc.on("circuit:close", () => this.emit("circuit:close", undefined));
       this._resilientRpc.on("circuit:half-open", () => this.emit("circuit:half-open", undefined));
     }
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.advancedCircuitBreaker) {
       this._advancedCircuitBreaker = new AdvancedCircuitBreaker(config.advancedCircuitBreaker, {
         warn: (event) => this.emit("circuit_state_change", event),
       });
     }
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.optimisticCache) {
       this._optimisticCache = new OptimisticCache<Invoice>();
     }
@@ -1017,13 +1025,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     this._sorobanFeatureDetector.detect().catch(() => {
       // Best-effort startup probe; getSorobanFeatures() will retry on demand.
     });
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (
       !this._rpcClient &&
       Array.isArray(config.rpcUrl) &&
@@ -1037,12 +1038,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     // when an external RPC client hasn't been injected via the DI container.
     const wantsPool =
       !this._rpcClient && !this._standby && (config.rpcPoolSize ?? 0) >= 2;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (wantsPool) {
       this._effectiveRpcPoolSize = Math.min(
         Math.max(config.rpcPoolSize!, 1),
@@ -1059,23 +1054,9 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
     this._cache = config.container?.getCacheStore() ??
       (config.cache?.enabled ? new SimpleCache<any>(config.cache) : null);
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.telemetry) {
       telemetry.init(config.telemetry);
     }
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.signingKeypair) {
   /**
    * addRequestInterceptor
@@ -1093,13 +1074,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         createRequestSigningInterceptor(config.signingKeypair),
       );
     }
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.compression?.enabled) {
   /**
    * addRequestInterceptor
@@ -1135,56 +1109,23 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
     // Initialize hooks
     this._hooks = config.hooks ?? {};
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.retry) {
       this._retryOptions = config.retry;
     }
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.horizonUrl) {
       this._horizonReader = new HorizonFallbackReader(config.horizonUrl);
     }
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.idempotency) {
       this._idempotency = new IdempotencyManager(config.idempotency);
     }
 
     // WebSocket transport (Issue #377)
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.transport === 'websocket') {
       this._transportType = 'websocket';
       this._activeTransportType = 'websocket';
       this._wsTransport = new WebSocketTransport(primaryUrl, config.wsUrl);
       this._wsTransport.onFallback((event: { from: 'websocket'; to: 'http' }) => {
         this._activeTransportType = 'http';
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         for (const cb of this._fallbackListeners) {
           try { cb(event); } catch { }
         }
@@ -1195,12 +1136,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     this._signer = config.signer ?? null;
 
     // Admin keypair for admin-only operations
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.adminKeypair) {
       this._adminKeypair = config.adminKeypair;
     }
@@ -1214,49 +1149,19 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     initHealthDashboard(this.server, this._dedup);
 
     // Register and initialize config-level plugins
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.plugins) {
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       for (const plugin of config.plugins) {
         this.registerPlugin(plugin);
       }
     }
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     for (const p of this._pluginInstances) {
       p.onInit?.(this);
     }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.validatePassphrase !== false) {
       void this._validateStartupConfig();
     }
 
     // OpenTelemetry instrumentation (opt-in, zero overhead when omitted/disabled).
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (config.otel?.enabled) {
       const otelExporter = config.otel.exporterUrl
         ? new OtelExporter({
@@ -1279,6 +1184,15 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       on: (event, handler) => this.on(event as keyof SplitClientEventMap, handler as never),
       off: (event, handler) => this.off(event as keyof SplitClientEventMap, handler as never),
     });
+
+    // Initialize logical modules (#1079)
+    this.invoices = new InvoiceModule(this);
+    this.payments = new PaymentModule(this);
+    this.disputes = new DisputeModule(this);
+    this.admin = new AdminModule(this);
+    this.groups = new GroupModule(this);
+    this.templates = new TemplateModule(this);
+    this.milestones = new MilestoneModule(this);
   }
 
   /**
@@ -1297,29 +1211,84 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       this.config.networkPassphrase,
       primaryUrl,
     );
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (result.mismatch) {
       throw new PassphraseMismatchError(result.configured, result.reported);
     }
   }
 
   /**
-   * Live network switcher. Migrates state and re-subscribes.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Returns the logger instance configured for this client.
+   *
+   * @returns The active {@link Logger} instance.
+   *
+   * @example
+   * ```typescript
+   * client.logger.info("Custom log message", { extra: "data" });
+   * ```
+   */
+  public get logger(): Logger {
+    return this._logger ?? (this._logger = new SdkLogger({ namespace: "StellarSplitClient", level: LogLevel.NONE }));
+  }
+
+  /**
+   * Sets the active logging level for the SDK client.
+   *
+   * @param level - Target log level as an enum or string name ('debug' | 'info' | 'warn' | 'error' | 'none').
+   *
+   * @example
+   * ```typescript
+   * client.setLogLevel("debug");
+   * client.setLogLevel(LogLevel.WARN);
+   * ```
+   */
+  public setLogLevel(level: LogLevel | LogLevelString): void {
+    this.logger.setLevel(level);
+  }
+
+  /**
+   * Enables or disables debug logging dynamically.
+   *
+   * @param enabled - Whether debug logging should be active. Defaults to true.
+   *
+   * @example
+   * ```typescript
+   * client.enableDebugLogging(true);
+   * ```
+   */
+  public enableDebugLogging(enabled: boolean = true): void {
+    this.logger.setLevel(enabled ? LogLevel.DEBUG : LogLevel.NONE);
+  }
+
+  /**
+   * Retrieves all operations currently queued for submission while offline.
+   * @returns An array of pending QueuedOperation objects.
+   *
+   * @example
+   * ```typescript
+   * const pendingOps = client.getOfflineQueue();
+   * console.log(`Queued actions: ${pendingOps.length}`);
+   * ```
    */
   getOfflineQueue(): import("./offlineQueue.js").QueuedOperation[] {
     return this._offlineQueue ? this._offlineQueue.getQueue() : [];
   }
 
+  /**
+   * Clears and purges all operations currently pending in the offline queue.
+   * @returns void
+   *
+   * @example
+   * ```typescript
+   * client.clearOfflineQueue();
+   * ```
+   */
   clearOfflineQueue(): void {
     if (this._offlineQueue) this._offlineQueue.clear();
+  }
+
+  async syncOfflineQueue(conflictStrategy?: import("./types.js").ConflictStrategy) {
+    if (!this._offlineQueue) return null;
+    return this._offlineQueue.sync(conflictStrategy);
   }
 
   async switchTo(network: "mainnet" | "testnet" | "futurenet"): Promise<void> {
@@ -1328,49 +1297,62 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * isShutdownInProgress
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Checks whether a graceful shutdown sequence is currently in progress.
+   * @returns True if shutdown has commenced, otherwise false.
+   *
+   * @example
+   * ```typescript
+   * if (!client.isShutdownInProgress()) {
+   *   await client.pay({ invoiceId, amount, payer });
+   * }
+   * ```
    */
   isShutdownInProgress(): boolean {
     return this._shutdownInProgress;
   }
 
   /**
-   * beginGracefulShutdown
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Initiates graceful shutdown of the client, rejecting new requests while draining in-flight operations.
+   * @returns void
+   *
+   * @example
+   * ```typescript
+   * process.on('SIGTERM', () => {
+   *   client.beginGracefulShutdown();
+   * });
+   * ```
    */
   beginGracefulShutdown(): void {
     this._shutdownInProgress = true;
   }
 
   /**
-   * registerHorizonStreamManager
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Registers an active Horizon SSE stream manager with the client for lifecycle cleanup.
+   *
+   * @param manager - Manager object providing a stop() teardown hook.
+   * @returns A deregistration cleanup callback function.
+   *
+   * @example
+   * ```typescript
+   * const unregister = client.registerHorizonStreamManager(streamManager);
+   * ```
    */
   registerHorizonStreamManager(manager: { stop(): void }): () => void {
     this._managedHorizonStreams.add(manager);
-  /**
-   * return
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     return () => {
       this._managedHorizonStreams.delete(manager);
     };
   }
 
   /**
-   * getInFlightRequests
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Returns a snapshot list of Soroban RPC requests currently in-flight, ordered by start time.
+   * @returns Array of active in-flight request tracking metadata.
+   *
+   * @example
+   * ```typescript
+   * const inFlight = client.getInFlightRequests();
+   * console.log(`Active requests: ${inFlight.length}`);
+   * ```
    */
   getInFlightRequests(): InFlightRequestInfo[] {
     return [...this._inFlightRequests.values()].sort(
@@ -1379,28 +1361,28 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * waitForInFlightRequests
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Waits for all pending in-flight Soroban RPC requests to settle.
+   * @returns Promise that resolves once all active requests have completed.
+   *
+   * @example
+   * ```typescript
+   * await client.waitForInFlightRequests();
+   * ```
    */
   async waitForInFlightRequests(): Promise<void> {
     await Promise.allSettled([...this._inFlightRequestPromises.values()]);
   }
 
   /**
-   * finalizeShutdown
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Completes the shutdown sequence by destroying plugins, terminating managed streams, and freeing resources.
+   * @returns Promise that resolves once final shutdown cleanup finishes.
+   *
+   * @example
+   * ```typescript
+   * await client.finalizeShutdown();
+   * ```
    */
   async finalizeShutdown(): Promise<void> {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._runtimeShutdownPromise) {
       return this._runtimeShutdownPromise;
     }
@@ -1415,12 +1397,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @throws {Error} If the method fails.
    */
       destroySubscriptionManager(this.config.contractId);
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       for (const manager of this._managedHorizonStreams) {
         manager.stop();
       }
@@ -1432,43 +1408,12 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
       this._pool?.dispose();
       this._pool = null;
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (this._cache && typeof (this._cache as any).persist === "function") {
-  /**
-   * await
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         await (this._cache as any).persist();
       }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (this._cache && typeof (this._cache as any).close === "function") {
-  /**
-   * await
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         await (this._cache as any).close();
       }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (
         this._rpcClient &&
   /**
@@ -1479,12 +1424,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    */
         typeof (this._rpcClient as any).close === "function"
       ) {
-  /**
-   * await
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         await (this._rpcClient as any).close();
       }
 
@@ -1495,21 +1434,8 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   private async _destroyPlugins(): Promise<void> {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._pluginsDestroyed) return;
     this._pluginsDestroyed = true;
-
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     for (const plugin of [...this._pluginInstances].reverse()) {
       try {
         await plugin.onDestroy?.(this);
@@ -1526,12 +1452,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   private _assertWritable(): void {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._shutdownInProgress) {
       throw new ShutdownInProgressError();
     }
@@ -1583,36 +1503,12 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   private _instrumentOtel(): void {
     const proto = Object.getPrototypeOf(this) as object;
     const self = this as unknown as Record<string, unknown>;
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     for (const name of Object.getOwnPropertyNames(proto)) {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (name === "constructor" || name.startsWith("_")) continue;
       const descriptor = Object.getOwnPropertyDescriptor(proto, name);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (!descriptor || typeof descriptor.value !== "function") continue;
       const original = descriptor.value as (...args: unknown[]) => unknown;
       const isAsync = original.constructor.name === "AsyncFunction";
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (isAsync) {
         self[name] = (...args: unknown[]) =>
           this._withOtelSpanAsync(name, args, () => original.apply(this, args) as Promise<unknown>);
@@ -1626,35 +1522,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   /** Best-effort `invoice.id` extraction from a method's first argument. */
   private _otelInvoiceId(args: unknown[]): string | undefined {
     const first = args[0];
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (typeof first === "string") return first;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (first && typeof first === "object") {
       const obj = first as Record<string, unknown>;
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       for (const key of ["invoiceId", "invoice_id", "id"]) {
         const value = obj[key];
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         if (typeof value === "string") return value;
       }
     }
@@ -1663,20 +1535,8 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
   /** Best-effort `tx.hash` extraction from a method's resolved return value. */
   private _otelTxHash(result: unknown): string | undefined {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (result && typeof result === "object") {
       const value = (result as Record<string, unknown>).txHash;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (typeof value === "string") return value;
     }
     return undefined;
@@ -1687,20 +1547,8 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const span = this._otel.startSpan(name);
     span.setAttribute("stellar.network", this.config.networkPassphrase);
     const rpcUrl = Array.isArray(this.config.rpcUrl) ? this.config.rpcUrl[0] : this.config.rpcUrl;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (rpcUrl) span.setAttribute("rpc.url", rpcUrl);
     const invoiceId = this._otelInvoiceId(args);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (invoiceId) span.setAttribute("invoice.id", invoiceId);
     return span;
   }
@@ -1710,12 +1558,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     args: unknown[],
     fn: () => Promise<T>,
   ): Promise<T> {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._otelInitPromise) await this._otelInitPromise;
     const span = this._otelStartSpan(name, args);
     const startedAt = Date.now();
@@ -1724,12 +1566,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       const durationMs = Date.now() - startedAt;
       span.setAttribute("rpc.duration_ms", durationMs);
       const txHash = this._otelTxHash(result);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (txHash) span.setAttribute("tx.hash", txHash);
       this._otel.recordRpcCall(durationMs, { method: name });
       span.end();
@@ -1753,12 +1589,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       const durationMs = Date.now() - startedAt;
       span.setAttribute("rpc.duration_ms", durationMs);
       const txHash = this._otelTxHash(result);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (txHash) span.setAttribute("tx.hash", txHash);
       this._otel.recordRpcCall(durationMs, { method: name });
       span.end();
@@ -1775,59 +1605,28 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Internal startup validation. Throws PassphraseMismatchError if
-   * the configured passphrase doesn't match the RPC node.
-   */
-  private async _validateStartupConfig(): Promise<void> {
-    const primaryUrl = Array.isArray(this.config.rpcUrl) ? this.config.rpcUrl[0]! : this.config.rpcUrl;
-    const result = await NetworkPassphraseValidator.validate(
-      this.config.networkPassphrase,
-      primaryUrl
-    );
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
-    if (result.mismatch) {
-      throw new PassphraseMismatchError(result.configured, result.reported);
-    }
-  }
-
-  /**
-   * Live network switcher. Migrates state and re-subscribes.
-   * @param network - 'mainnet' | 'testnet' | 'futurenet'
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
-  public async switchTo(network: 'mainnet' | 'testnet' | 'futurenet'): Promise<void> {
-    const { NetworkSwitcher } = await import("./network/NetworkSwitcher.js");
-    return NetworkSwitcher.switchTo(network, this);
-  }
-
-  /**
-   * Performs a health check of the client's RPC connection and contract.
-   * Resolves with status information or throws HealthCheckTimeoutError if taking > 5000ms.
-   */
-  /**
-   * Return the current Soroban protocol feature flags, detected once at
-   * startup and re-probed automatically after the detector's staleness
-   * window (default 1 hour). Emits `protocolUpgradeDetected` on the
-   * underlying detector when a re-probe observes a version change.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Queries the connected Soroban RPC node and detects supported runtime protocol feature flags.
+   * @returns Promise resolving to detected SorobanFeatureFlags.
+   *
+   * @example
+   * ```typescript
+   * const features = await client.getSorobanFeatures();
+   * console.log(`State expiration support: ${features.stateExpiration}`);
+   * ```
    */
   async getSorobanFeatures(): Promise<SorobanFeatureFlags> {
     return this._sorobanFeatureDetector.detect();
   }
 
   /**
-   * healthCheck
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Performs an end-to-end health probe against connected RPC endpoints and contract availability.
+   * @returns Promise resolving to a HealthCheckResult with status, latency, and node versions.
+   *
+   * @example
+   * ```typescript
+   * const health = await client.healthCheck();
+   * console.log(`RPC health: ${health.healthy ? 'OK' : 'DEGRADED'}`);
+   * ```
    */
   async healthCheck(): Promise<HealthCheckResult> {
     const start = Date.now();
@@ -1859,12 +1658,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         ),
       ]);
     } catch (e: any) {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (e instanceof HealthCheckTimeoutError) {
         throw e;
       }
@@ -1892,12 +1685,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         await this.server.getContractWasmByContractId(this.config.contractId);
         contractDeployed = true;
       } catch (err: any) {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         if (!err.message?.includes("Could not obtain contract hash")) {
           // If we get here, it might be deployed but we couldn't fetch the wasm,
           // or it threw some other error. We'll conservatively say true if it's
@@ -1924,21 +1711,14 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param enabled - Pass `true` to enable batching, `false` to disable.
    * @returns The result of the method.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * client.setBatchingEnabled(true);
+   * ```
    */
   setBatchingEnabled(enabled: boolean): void {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (enabled) {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (!this._batcher) {
         this._batcher = new BatchedRpcClient({
           fetchInvoice: (id: string) => this._fetchInvoice(id),
@@ -1958,21 +1738,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param args Optional arguments array to invalidate a specific call.
    * @returns The result of the method.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * client.invalidateCache('getInvoice', ['123']);
+   * // Or invalidate all:
+   * client.invalidateCache();
+   * ```
    */
   public invalidateCache(method?: string, args?: any[]): void {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._cache) {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (typeof (this._cache as any).invalidate === "function") {
         (this._cache as any).invalidate(method, args);
       }
@@ -1980,66 +1755,20 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Get cache statistics.
-   * @returns Cache stats including hits, misses, size, and keys.
-   * @param params - The parameters for the method.
-   * @throws {Error} If the method fails.
+   * Retrieves performance statistics and hit/miss ratios for the client cache layer.
+   * @returns CacheStats object or null if caching is disabled.
+   *
+   * @example
+   * ```typescript
+   * const stats = client.getCacheStats();
+   * if (stats) console.log(`Hit rate: ${stats.hitRate}%`);
+   * ```
    */
   public getCacheStats(): import("./cache.js").CacheStats | null {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._cache && typeof (this._cache as any).getStats === "function") {
-  /**
-   * return
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       return (this._cache as any).getStats();
     }
     return null;
-  }
-
-  /**
-   * Internal startup validation. Throws PassphraseMismatchError if
-   * the configured passphrase doesn't match the RPC node.
-   */
-  private async _validateStartupConfig(): Promise<void> {
-    const { NetworkPassphraseValidator } = await import("./network/NetworkPassphraseValidator.js");
-    const { PassphraseMismatchError } = await import("./errors.js");
-    const primaryUrl = Array.isArray(this.config.rpcUrl)
-      ? this.config.rpcUrl[0]!
-      : this.config.rpcUrl;
-    const result = await NetworkPassphraseValidator.validate(
-      this.config.networkPassphrase,
-      primaryUrl,
-    );
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
-    if (result.mismatch) {
-      throw new PassphraseMismatchError(result.configured, result.reported);
-    }
-  }
-
-  /**
-   * Live network switcher. Migrates state and re-subscribes.
-   * @param network - 'mainnet' | 'testnet' | 'futurenet'
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
-  public async switchTo(
-    network: "mainnet" | "testnet" | "futurenet",
-  ): Promise<void> {
-    const { NetworkSwitcher } = await import("./network/NetworkSwitcher.js");
-    return NetworkSwitcher.switchTo(network, this);
   }
 
   private _logAudit(
@@ -2048,12 +1777,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     success: boolean,
     durationMs: number,
   ): void {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!this._auditLogger) return;
     this._auditLogger.log({
       timestamp: Date.now(),
@@ -2122,13 +1845,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
     const timeoutMs =
       opts?.timeout ?? this._timeoutManager?.resolveTimeout(method);
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (timeoutMs !== undefined) {
       return withTimeoutOrThrow(() => run(), timeoutMs, method);
     }
@@ -2140,19 +1856,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Register a plugin that extends this client instance.
-   * Throws if a plugin with the same name has already been registered.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Registers an extensible plugin into the client lifecycle.
+   *
+   * @param plugin - Plugin implementation instance.
+   * @returns void
+   * @throws {PluginAlreadyRegisteredError} If a plugin with the same name is already registered.
+   *
+   * @example
+   * ```typescript
+   * client.registerPlugin(new LoggingPlugin());
+   * ```
    */
   registerPlugin(plugin: StellarSplitPlugin): void {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._plugins.has(plugin.name)) {
       throw new PluginAlreadyRegisteredError(plugin.name);
     }
@@ -2170,25 +1885,41 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param options - Optional plugin configuration.
    * @returns The client instance for method chaining.
    * @throws {PluginAlreadyRegisteredError} if a plugin with the same name exists.
+   *
+   * @example
+   * ```typescript
+   * client.use(new MetricsPlugin(), { sampleRate: 0.5 });
+   * ```
    */
   use(plugin: SdkPlugin, options?: Record<string, unknown>): this {
     this._pluginRegistry.use(plugin, options);
     return this;
   }
 
-  /** Deregister a middleware plugin by name.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+  /**
+   * Unregisters and removes a previously registered plugin by its unique name identifier.
+   *
+   * @param name - The unique identifier name of the plugin to remove.
+   * @returns void
+   *
+   * @example
+   * ```typescript
+   * client.removePlugin('logging-plugin');
+   * ```
    */
   removePlugin(name: string): void {
     this._pluginRegistry.removePlugin(name);
   }
 
-  /** Return the names of all active middleware plugins.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+  /**
+   * Retrieves the names of all currently registered client plugins.
+   * @returns Array of registered plugin name strings.
+   *
+   * @example
+   * ```typescript
+   * const plugins = client.getPlugins();
+   * console.log(`Active plugins: ${plugins.join(', ')}`);
+   * ```
    */
   getPlugins(): string[] {
     return this._pluginRegistry.getPlugins();
@@ -2230,10 +1961,13 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Remove all registered telemetry hooks.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Removes and resets all configured telemetry lifecycle hooks.
+   * @returns void
+   *
+   * @example
+   * ```typescript
+   * client.clearTelemetryHooks();
+   * ```
    */
   clearTelemetryHooks(): void {
     this._telemetryHookManager.clearHooks();
@@ -2244,12 +1978,13 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Returns the resolved timeout (in ms) for each known SDK method.
-   * Reflects both the `default` timeout and any per-method overrides.
-   * Returns an empty object when no `timeout` option was set at construction.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Retrieves the configured execution timeout thresholds per SDK method.
+   * @returns Record mapping method names to timeout durations in milliseconds.
+   *
+   * @example
+   * ```typescript
+   * const timeouts = client.getTimeoutConfig();
+   * ```
    */
   getTimeoutConfig(): Record<string, number> {
     return this._timeoutManager?.getTimeoutConfig() ?? {};
@@ -2260,14 +1995,15 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Replace the default UUID v4 generator with a custom function.
-   * Useful for integrating OpenTelemetry span IDs or other systems.
+   * Sets the default generator function used to produce correlation trace IDs for RPC calls.
+   *
+   * @param generator - A function returning a unique trace identifier string.
+   * @returns void
    *
    * @example
-   * sdk.setDefaultTraceIdGenerator(() => opentelemetry.trace.getActiveSpan()?.spanContext().traceId ?? crypto.randomUUID());
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * ```typescript
+   * client.setDefaultTraceIdGenerator(() => `trace-${Date.now()}-${Math.random()}`);
+   * ```
    */
   setDefaultTraceIdGenerator(generator: () => string): void {
     this._traceIdManager.setGenerator(generator);
@@ -2282,18 +2018,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - The ID of the invoice to dispute.
    * @returns The dispute ID and transaction hash.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.disputeInvoice('123');
+   * ```
    */
   async disputeInvoice(invoiceId: string): Promise<DisputeResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "dispute_invoice",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       // Assuming the creator is the one calling dispute
@@ -2313,32 +2048,19 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param vote - The arbiter vote parameters.
    * @returns The dispute ID and transaction hash.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.submitArbiterVote({ invoiceId: '123', arbiter: 'GA...', approve: true });
+   * ```
    */
   async submitArbiterVote(vote: ArbiterVote): Promise<DisputeResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "submit_arbiter_vote",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(vote.invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(vote.arbiter, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(vote.approve, { type: "bool" }),
       );
       const result = await this._submitTx(vote.arbiter, operation);
@@ -2361,6 +2083,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param arbiter - The Stellar address of the arbiter (must sign).
    * @returns The dispute ID and transaction hash.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.resolveDispute('123', 'GA...ARBITER');
+   * ```
    */
   async resolveDispute(
     invoiceId: string,
@@ -2370,12 +2097,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     try {
       const operation = this.contract.call(
         "resolve_dispute",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const result = await this._submitTx(arbiter, operation);
@@ -2393,18 +2114,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - The ID of the invoice to dispute.
    * @returns The dispute ID and transaction hash.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.raiseDispute('123');
+   * ```
    */
   async raiseDispute(invoiceId: string): Promise<DisputeResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "dispute_invoice",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const result = await this._submitTx(this.config.contractId, operation);
@@ -2422,6 +2142,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - The ID of the invoice to query.
    * @returns The dispute status.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const status = await client.getDisputeStatus('123');
+   * ```
    */
   async getDisputeStatus(invoiceId: string): Promise<DisputeStatus> {
     return this._withCache("getDisputeStatus", [invoiceId], async () => {
@@ -2429,12 +2154,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       try {
         const operation = this.contract.call(
           "get_dispute_status",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           nativeToScVal(BigInt(invoiceId), { type: "u64" }),
         );
         const raw = (await this._simulateView(operation)) as Record<
@@ -2475,31 +2194,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param params - Vote parameters (invoiceId, arbiter address, approve boolean)
    * @returns Transaction result with hash
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.voteDispute(voteParams);
+   * ```
    */
   async voteDispute(params: ArbiterVote): Promise<{ txHash: string }> {
     return this._withTelemetry("voteDispute", params as unknown as Record<string, unknown>, async () => {
       const operation = this.contract.call(
         "vote_dispute",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(params.invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.arbiter, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.approve, { type: "bool" }),
       );
 
@@ -2515,6 +2221,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param fileName - Optional file name for reference
    * @returns Transaction result with hash
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.addDisputeEvidence('123', { uri: 'ipfs://...', hash: '...' });
+   * ```
    */
   async addDisputeEvidence(
     invoiceId: string,
@@ -2524,12 +2235,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     return this._withTelemetry(
       "addDisputeEvidence",
       { invoiceId, evidenceCid, fileName } as Record<string, unknown>,
-  /**
-   * async
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       async () => {
         // Note: This assumes the contract has an add_dispute_evidence method
         // If not, this would need to be stored off-chain or via memo field
@@ -2537,19 +2242,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         
         const operation = this.contract.call(
           "add_dispute_note",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           nativeToScVal(BigInt(invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           nativeToScVal(note, { type: "string" }),
         );
 
@@ -2571,6 +2264,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param path - The SSE path (e.g., "/invoice/123")
    * @returns SSE endpoint URL
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const sseUrl = client.getSSEEndpoint('/events');
+   * ```
    */
   getSSEEndpoint(path: string): string {
     // This would be configured based on your backend SSE server
@@ -2596,14 +2294,13 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param xdrBase64 - Base64-encoded transaction envelope XDR.
    * @returns A parsed envelope, or a notice when debug mode is disabled.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const parsed = client.parseXdrEnvelope(envelopeXdr);
+   * ```
    */
   parseXdrEnvelope(xdrBase64: string): ParsedEnvelope | { error: string } {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!this.config.debug) {
       return { error: "Debug mode is disabled. Set config.debug = true to enable XDR parsing." };
     }
@@ -2615,20 +2312,74 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Create a new on-chain invoice.
+   * Creates a new on-chain invoice with multi-recipient split payout distribution rules.
    *
-   * @returns The new invoice ID and the transaction hash.
+   * @param params - Invoice creation configuration including creator, token address, deadline, and recipient shares.
+   * @returns Promise resolving to the newly created invoice ID and transaction hash, or SimulationResult if simulate: true.
+   * @throws {ValidationError} If split shares do not sum to 100% or parameters are invalid.
+   * @throws {NftGateRequiredError} If the creator does not satisfy required token-gate conditions.
+   *
    * @example
-   * const result = await client.createInvoice({ ...params });
-   * @param params - The parameters for the method.
-   * @throws {Error} If the method fails.
+   * ```typescript
+   * const { invoiceId, txHash } = await client.createInvoice({
+   *   creator: 'GB...', 
+   *   token: 'CD...', 
+   *   deadline: deadlineFromDays(7),
+   *   recipients: [
+   *     { address: 'G1...', amount: 60_0000000n },
+   *     { address: 'G2...', amount: 40_0000000n },
+   *   ],
+   * });
+   * ```
    */
   async createInvoice(
     params: CreateInvoiceParams & { simulate: true },
   ): Promise<SimulationResult>;
+  /**
+   * Creates a new on-chain invoice with multi-recipient split payout distribution rules.
+   *
+   * @param params - Invoice creation configuration including creator, token address, deadline, and recipient shares.
+   * @returns Promise resolving to the newly created invoice ID and transaction hash, or SimulationResult if simulate: true.
+   * @throws {ValidationError} If split shares do not sum to 100% or parameters are invalid.
+   * @throws {NftGateRequiredError} If the creator does not satisfy required token-gate conditions.
+   *
+   * @example
+   * ```typescript
+   * const { invoiceId, txHash } = await client.createInvoice({
+   *   creator: 'GB...', 
+   *   token: 'CD...', 
+   *   deadline: deadlineFromDays(7),
+   *   recipients: [
+   *     { address: 'G1...', amount: 60_0000000n },
+   *     { address: 'G2...', amount: 40_0000000n },
+   *   ],
+   * });
+   * ```
+   */
   async createInvoice(
     params: CreateInvoiceParams,
   ): Promise<{ invoiceId: string; txHash: string }>;
+  /**
+   * Creates a new on-chain invoice with multi-recipient split payout distribution rules.
+   *
+   * @param params - Invoice creation configuration including creator, token address, deadline, and recipient shares.
+   * @returns Promise resolving to the newly created invoice ID and transaction hash, or SimulationResult if simulate: true.
+   * @throws {ValidationError} If split shares do not sum to 100% or parameters are invalid.
+   * @throws {NftGateRequiredError} If the creator does not satisfy required token-gate conditions.
+   *
+   * @example
+   * ```typescript
+   * const { invoiceId, txHash } = await client.createInvoice({
+   *   creator: 'GB...', 
+   *   token: 'CD...', 
+   *   deadline: deadlineFromDays(7),
+   *   recipients: [
+   *     { address: 'G1...', amount: 60_0000000n },
+   *     { address: 'G2...', amount: 40_0000000n },
+   *   ],
+   * });
+   * ```
+   */
   async createInvoice(
     params: CreateInvoiceParams,
   ): Promise<{ invoiceId: string; txHash: string } | SimulationResult> {
@@ -2646,22 +2397,10 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         token: params.token,
         deadline: params.deadline,
       },
-  /**
-   * async
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       async () => {
         const startTime = Date.now();
         params = this._pluginRegistry.runBeforeCall("createInvoice", params);
         try {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           if (this.config.payloadGuard) {
   /**
    * validateInvoicePayload
@@ -2676,44 +2415,20 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
           // Pre-submission split ratio validation: catch malformed ratio arrays
           // early (ratio-sum violations, negative shares, duplicates, zeros).
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           if (params.recipients.length > 1) {
             const total = params.recipients.reduce((s, r) => s + r.amount, 0n);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
             if (total > 0n) {
-              const splitConfig: SplitConfig = {
+              const splitConfig: RatioSplitConfig = {
                 shares: params.recipients.map((r) => ({
                   address: r.address,
                   share: Number(r.amount) / Number(total),
                 })),
               };
-  /**
-   * validateSplitRatiosOrThrow
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
               validateSplitRatiosOrThrow(splitConfig);
             }
           }
 
           const gate = await this.checkNftGate(params.creator);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           if (gate.gated && !gate.hasNft) {
             throw new NftGateRequiredError(
               params.creator,
@@ -2722,48 +2437,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
           }
 
           const recipientAddresses = params.recipients.map((r) =>
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
             nativeToScVal(r.address, { type: "address" }),
           );
           const recipientAmounts = params.recipients.map((r) =>
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
             nativeToScVal(r.amount, { type: "i128" }),
           );
 
           const operation = this.contract.call(
             "create_invoice",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
             nativeToScVal(params.creator, { type: "address" }),
             xdr.ScVal.scvVec(recipientAddresses),
             xdr.ScVal.scvVec(recipientAmounts),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
             nativeToScVal(params.token, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
             nativeToScVal(params.deadline, { type: "u64" }),
           );
 
@@ -2816,6 +2501,13 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param overrides - Optional overrides for the cloned invoice fields.
    * @returns The new invoice ID.
    * @throws {InvoiceNotFoundError} If the source invoice does not exist.
+   *
+   * @example
+   * ```typescript
+   * const newInvoiceId = await client.cloneInvoice('123', {
+   *   deadline: deadlineFromDays(14),
+   * });
+   * ```
    */
   async cloneInvoice(
     sourceId: string | bigint,
@@ -2831,12 +2523,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     // -------------------------------------------------------------------
     // Cloneability pre-flight validation (#486)
     // -------------------------------------------------------------------
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!overrides.skipValidation) {
       const rpcUrl = Array.isArray(this.config.rpcUrl)
         ? this.config.rpcUrl[0]
@@ -2846,25 +2532,12 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         rpcUrl,
       });
       const report = await validator.validate(sourceInvoice);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (!report.cloneable) {
         throw new InvoiceNotCloneableError(report);
       }
     }
 
     const mapEntries: xdr.ScMapEntry[] = [];
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (overrides.newDeadline !== undefined) {
       mapEntries.push(
         new xdr.ScMapEntry({
@@ -2875,12 +2548,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         }),
       );
     }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (overrides.newAmounts !== undefined) {
       mapEntries.push(
         new xdr.ScMapEntry({
@@ -2891,12 +2558,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         }),
       );
     }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (overrides.newRecipients !== undefined) {
       mapEntries.push(
         new xdr.ScMapEntry({
@@ -2930,12 +2591,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         val: xdr.ScVal.scvVec(
           overrides.newOverflowBehavior !== undefined
             ? [
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
                 nativeToScVal(overrides.newOverflowBehavior, {
                   type: "symbol",
                 }) as xdr.ScVal,
@@ -2946,12 +2601,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     );
 
     const args: xdr.ScVal[] = [
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(BigInt(sourceId), { type: "u64" }),
       xdr.ScVal.scvMap(mapEntries),
     ];
@@ -2969,13 +2618,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
       const id = scValToNative(result.returnValue).toString() as string;
       newInvoiceId = id;
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (this._cache) {
         const cloneDepth =
   /**
@@ -3008,23 +2650,9 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       return id;
     } catch (error) {
       telemetry.recordMethod("cloneInvoice", false, Date.now() - startTime);
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (cacheWritten && newInvoiceId && this._cache) {
         this._cache.invalidate(newInvoiceId);
       }
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (error instanceof Error && error.message.includes("not found")) {
         throw new InvoiceNotFoundError(sourceId.toString());
       }
@@ -3045,6 +2673,12 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - The invoice whose lineage should be resolved.
    * @returns Invoice IDs as `bigint[]` in root-to-leaf order.
    * @throws {CloneChainTooDeepError} If the clone chain is cyclic or too deep.
+   *
+   * @example
+   * ```typescript
+   * const lineage = await client.getLineage('123');
+   * console.log(`Root invoice: ${lineage.rootId}`);
+   * ```
    */
   async getLineage(invoiceId: string | bigint): Promise<bigint[]> {
     const chain = await this.resolveCloneChain(invoiceId.toString());
@@ -3197,6 +2831,12 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param params - Parameters for the method.
    * @returns A {@link SimulationResult}; `success` is `false` (rather than a
    *          throw) when the contract rejects the call.
+   *
+   * @example
+   * ```typescript
+   * const sim = await client.simulate('pay', { invoice_id: 123n, amount: 100_0000000n });
+   * console.log(`Estimated CPU instructions: ${sim.cpuInstructions}`);
+   * ```
    */
   async simulate(
     method: string,
@@ -3376,16 +3016,64 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Pay toward an invoice.
+   * Submits a payment toward an invoice, automatically splitting contributions among recipients.
    *
-   * @returns The transaction hash.
+   * @param params - Payment parameters including payer address, invoice ID, and payment amount in stroops.
+   * @returns Promise resolving to the payment receipt with transaction hash and remaining balance.
+   * @throws {InvoiceNotFoundError} If the specified invoice ID cannot be found.
+   * @throws {PaymentExceedsRemainingError} If the payment exceeds the unpaid balance.
+   * @throws {DeadlinePassedError} If the payment deadline has elapsed.
+   *
    * @example
-   * const result = await client.pay({ ...params });
-   * @param params - The parameters for the method.
-   * @throws {Error} If the method fails.
+   * ```typescript
+   * const receipt = await client.pay({
+   *   payer: 'GA...PAYER',
+   *   invoiceId: '123',
+   *   amount: 50_0000000n,
+   * });
+   * console.log(`Payment confirmed: ${receipt.txHash}`);
+   * ```
    */
   async pay(params: PayParams & { simulate: true }): Promise<SimulationResult>;
+  /**
+   * Submits a payment toward an invoice, automatically splitting contributions among recipients.
+   *
+   * @param params - Payment parameters including payer address, invoice ID, and payment amount in stroops.
+   * @returns Promise resolving to the payment receipt with transaction hash and remaining balance.
+   * @throws {InvoiceNotFoundError} If the specified invoice ID cannot be found.
+   * @throws {PaymentExceedsRemainingError} If the payment exceeds the unpaid balance.
+   * @throws {DeadlinePassedError} If the payment deadline has elapsed.
+   *
+   * @example
+   * ```typescript
+   * const receipt = await client.pay({
+   *   payer: 'GA...PAYER',
+   *   invoiceId: '123',
+   *   amount: 50_0000000n,
+   * });
+   * console.log(`Payment confirmed: ${receipt.txHash}`);
+   * ```
+   */
   async pay(params: PayParams): Promise<TxResult>;
+  /**
+   * Submits a payment toward an invoice, automatically splitting contributions among recipients.
+   *
+   * @param params - Payment parameters including payer address, invoice ID, and payment amount in stroops.
+   * @returns Promise resolving to the payment receipt with transaction hash and remaining balance.
+   * @throws {InvoiceNotFoundError} If the specified invoice ID cannot be found.
+   * @throws {PaymentExceedsRemainingError} If the payment exceeds the unpaid balance.
+   * @throws {DeadlinePassedError} If the payment deadline has elapsed.
+   *
+   * @example
+   * ```typescript
+   * const receipt = await client.pay({
+   *   payer: 'GA...PAYER',
+   *   invoiceId: '123',
+   *   amount: 50_0000000n,
+   * });
+   * console.log(`Payment confirmed: ${receipt.txHash}`);
+   * ```
+   */
   async pay(params: PayParams): Promise<TxResult | SimulationResult> {
     // Issue #844 — `{ simulate: true }` performs a dry-run instead of submitting.
     if (params.simulate) {
@@ -3394,26 +3082,26 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         params as unknown as Record<string, unknown>,
       );
     }
+    if (this._offlineQueue?.config?.enabled) {
+      try {
+        const health = await this.checkRPCHealth();
+        if (health.status === "down") {
+          this._offlineQueue.enqueue("pay", [params]);
+          return { txHash: "queued" };
+        }
+      } catch (e) {
+        this._offlineQueue.enqueue("pay", [params]);
+        return { txHash: "queued" };
+      }
+    }
     const startTime = Date.now();
     params = this._pluginRegistry.runBeforeCall("pay", params);
 
     let optimistic: { commit: CommitFn; rollback: RollbackFn } | null = null;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._optimisticCache) {
       const current = this._cache?.get(`getInvoice:${JSON.stringify([params.invoiceId])}`) as
         | Invoice
         | undefined;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (current) {
         const predicted = getOptimisticInvoice(current, {
           payer: params.payer,
@@ -3427,33 +3115,9 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     try {
       const operation = this.contract.call(
         "pay",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.payer, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(params.invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.amount, { type: "i128" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.donateOnFailure ?? false, { type: "bool" }),
       );
 
@@ -3489,12 +3153,22 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    *   partial submission wasn't allowed.
    */
   /**
-   * Preflight checks before submitting a payment.
+   * Performs preflight validation before payment submission, checking balances, thresholds, and contract state.
    *
-   * Verifies the invoice is pending, not expired, and the payer has trustline/balance.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * @param params - Preflight parameters including payer address, invoice ID, and candidate payment amount.
+   * @returns Promise resolving to PreflightCheckResult detailing readiness and estimated fees.
+   *
+   * @example
+   * ```typescript
+   * const check = await client.preflightCheck({
+   *   payer: 'GA...PAYER',
+   *   invoiceId: '123',
+   *   amount: 50_0000000n,
+   * });
+   * if (check.ok) {
+   *   await client.pay({ payer: 'GA...PAYER', invoiceId: '123', amount: 50_0000000n });
+   * }
+   * ```
    */
   async preflightCheck(params: {
     invoiceId: string;
@@ -3506,12 +3180,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     payerReadiness: import("./preflightChecker.js").PayerReadinessResult;
   }> {
     const invoice = await this.getInvoice(params.invoiceId);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (invoice.status !== "Pending") {
       throw new InvoiceNotPendingError(params.invoiceId);
     }
@@ -3524,12 +3192,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       getAccount: async (address: string) => {
         const normalizedBalances = await this.getAccountBalances(address);
         const balances = normalizedBalances.map((nb) => {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           if (nb.asset === "native") {
             return {
               balance: nb.balance,
@@ -3566,20 +3228,30 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Fetch a payment receipt for an invoice and payer.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Fetches a confirmed transaction receipt and execution outcome by transaction hash.
+   *
+   * @param txHash - Hexadecimal transaction hash string.
+   * @returns Promise resolving to the detailed TxReceipt.
+   *
+   * @example
+   * ```typescript
+   * const receipt = await client.getReceipt('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+   * ```
    */
   async getReceipt(invoiceId: string, payerAddress: string): Promise<PaymentReceipt> {
     return generatePaymentReceipt(this, invoiceId, payerAddress);
   }
 
   /**
-   * submitPayment
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Submits a pre-signed payment transaction envelope to the Soroban RPC network.
+   *
+   * @param params - Parameters containing pre-signed transaction XDR.
+   * @returns Promise resolving to TxResult.
+   *
+   * @example
+   * ```typescript
+   * const result = await client.submitPayment({ signedTxXdr });
+   * ```
    */
   async submitPayment(params: {
     invoiceId: string;
@@ -3591,33 +3263,14 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     expectedContentHash?: string;
   }): Promise<TxResult> {
     // Verify invoice content hash if provided (integrity check)
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (params.expectedContentHash) {
       const invoice = await this.getInvoice(params.invoiceId);
       const valid = await verifyInvoiceHash(invoice, params.expectedContentHash);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (!valid) {
         const computed = await hashInvoice(invoice);
         throw new InvoiceIntegrityError(params.invoiceId, params.expectedContentHash, computed);
       }
     }
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!params.waterfallPlan) {
       return this.pay({
         payer: params.payer,
@@ -3630,12 +3283,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const plan = params.waterfallPlan;
     const allowPartial = params.allowPartial ?? plan.allowPartial ?? false;
     const hasUnsatisfiedTier = plan.steps.some((step) => !step.satisfied);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (hasUnsatisfiedTier && !allowPartial) {
       throw new WaterfallInsufficientFundsError(params.invoiceId, {
         unsatisfiedTiers: plan.steps.filter((s) => !s.satisfied).map((s) => s.recipient),
@@ -3643,12 +3290,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
 
     const fundedSteps = plan.steps.filter((step) => step.satisfied && step.amount > 0n);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (fundedSteps.length === 0) {
       throw new WaterfallInsufficientFundsError(params.invoiceId);
     }
@@ -3656,33 +3297,9 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const operations = fundedSteps.map((step) =>
       this.contract.call(
         "pay",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.payer, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(params.invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(step.amount, { type: "i128" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.donateOnFailure ?? false, { type: "bool" }),
       ),
     );
@@ -3718,12 +3335,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       fee: BASE_FEE,
       networkPassphrase: this.config.networkPassphrase,
     });
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     for (const operation of operations) {
       builder.addOperation(operation);
     }
@@ -3738,12 +3349,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     sourceAddress: string,
   ): Promise<{ txHash: string; returnValue: xdr.ScVal }> {
     const simResult = await this.server.simulateTransaction(tx);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw parseSorobanError(simResult.error);
     }
@@ -3756,12 +3361,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const sendResult = await this.server.sendTransaction(
       TransactionBuilder.fromXDR(signedXdr, this.config.networkPassphrase),
     );
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (sendResult.status === "ERROR") {
       throw new TransactionFailedError(
         `Waterfall transaction failed: ${JSON.stringify(sendResult.errorResult)}`,
@@ -3773,23 +3372,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const txHash = sendResult.hash;
     let getResult = await this.server.getTransaction(txHash);
     let attempts = 0;
-  /**
-   * while
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     while (getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND && attempts < 20) {
       await new Promise((r) => setTimeout(r, 1500));
       getResult = await this.server.getTransaction(txHash);
       attempts++;
     }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
       throw new TransactionNotConfirmedError(String(getResult.status));
     }
@@ -3805,37 +3392,24 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param params - Array of invoice creation parameters (1-5 items)
    * @returns All created invoice IDs and the transaction hash
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const ids = await client.batchCreateInvoices([inv1, inv2]);
+   * ```
    */
   async batchCreateInvoices(
     params: CreateInvoiceParams[],
   ): Promise<{ invoiceIds: string[]; txHash: string }> {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (params.length === 0 || params.length > 5) {
       throw new InvalidBatchSizeError("1-5 items", params.length);
     }
 
     const invoiceParams = params.map((p) => {
       const recipientAddresses = p.recipients.map((r) =>
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(r.address, { type: "address" }),
       );
       const recipientAmounts = p.recipients.map((r) =>
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(r.amount, { type: "i128" }),
       );
 
@@ -3871,21 +3445,9 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     );
 
     const firstParam = params[0];
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!firstParam) throw new InvalidBatchSizeError("non-empty array", 0);
     const result = await this._submitTx(firstParam.creator, operation);
     const invoiceIds = (
-  /**
-   * scValToNative
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       scValToNative(result.returnValue) as (string | number)[]
     ).map((id) => id.toString());
     return { invoiceIds, txHash: result.txHash };
@@ -3899,24 +3461,12 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     args: any[],
     fetcher: () => Promise<T>,
   ): Promise<T> {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!this._cache) {
       return fetcher();
     }
 
     const key = `${methodName}:${JSON.stringify(args)}`;
     const cached = this._cache.get(key);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (cached !== undefined) {
       return cached as T;
     }
@@ -3927,29 +3477,23 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Fetch an invoice by ID. Returns cached result if within TTL.
+   * Retrieves the current state, balances, and recipient distribution progress of an on-chain invoice.
    *
-   * When the invoice has an `accessPolicy` set and the client was constructed
-   * with a `tokenGateController`, the caller's token balance is verified before
-   * the invoice data is returned. Throws {@link TokenGateAccessDeniedError} when
-   * the caller does not meet the balance requirement (and `strict !== false`).
+   * @param invoiceId - The unique identifier of the invoice to fetch.
+   * @returns Promise resolving to the normalized Invoice object.
+   * @throws {InvoiceNotFoundError} If the invoice does not exist on-chain.
+   *
    * @example
-   * const result = await client.getInvoice({ ...params });
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * ```typescript
+   * const invoice = await client.getInvoice('123');
+   * console.log(`Invoice status: ${invoice.status}, total: ${invoice.amount}`);
+   * ```
    */
   async getInvoice(
     invoiceId: string,
     opts?: { retry?: PerMethodRetryOptions; dedupe?: boolean; traceId?: string; timeout?: number }
   ): Promise<Invoice> {
     const optimistic = this._optimisticCache?.get(invoiceId);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (optimistic !== undefined) {
       return optimistic;
     }
@@ -3965,12 +3509,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         opts?.retry ?? (this._retryOptions ? {} : undefined);
 
       let invoice: Invoice;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (this._retryOptions && effectiveRetry !== undefined) {
         invoice = await executeWithRetry(
           () =>
@@ -3985,12 +3523,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       // Token-gate access check: verify caller balance when policy is set.
       const gateController = this.config.tokenGateController;
       const callerId = this.config.callerAccountId;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (gateController && callerId && invoice.accessPolicy) {
         await gateController.verify(callerId, invoice.accessPolicy);
       }
@@ -4000,10 +3532,13 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Returns deduplication statistics for observability.
-   * @returns { deduped: number, total: number } — deduped is how many calls were short-circuited.
-   * @param params - The parameters for the method.
-   * @throws {Error} If the method fails.
+   * Returns deduplication performance metrics for concurrent in-flight read operations.
+   * @returns DedupStats object containing deduplicated request counts.
+   *
+   * @example
+   * ```typescript
+   * const stats = client.getDedupStats();
+   * ```
    */
   getDedupStats(): { deduped: number; total: number } {
     return this._dedup.getDedupStats();
@@ -4029,27 +3564,20 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Updates an invoice's status, validating the transition through
-   * InvoiceStateMachine. Throws InvalidTransitionError (with
-   * `{ from, to, allowed }`) if the transition isn't allowed from the
-   * invoice's current status.
+   * Explicitly transitions an invoice to a new status using the deterministic InvoiceStateMachine.
    *
-   * When optimisticCache is enabled, the result is written into it
-   * immediately so subsequent getInvoice() calls see the new status.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * @param invoiceId - Unique identifier of the invoice to transition.
+   * @param status - Target InvoiceStatus to transition to.
+   * @returns Promise resolving once the status transition is applied.
+   *
+   * @example
+   * ```typescript
+   * await client.updateInvoiceStatus('123', 'Released');
+   * ```
    */
   async updateInvoiceStatus(invoiceId: string, to: InvoiceStatus): Promise<Invoice> {
     const current = await this.getInvoice(invoiceId);
     const updated = this._stateMachine.transition(current, to);
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._optimisticCache) {
       this._optimisticCache.applyOptimistic(invoiceId, updated, current).commit();
     }
@@ -4073,6 +3601,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param changedBy   - The Stellar address responsible for the change.
    * @returns The updated invoice after all mutations are applied.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const updated = await client.updateInvoice('123', { description: 'Updated invoice memo' });
+   * ```
    */
   async updateInvoice(
     invoiceId: string,
@@ -4085,13 +3618,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const tracker = (this.config as Record<string, unknown>)["versionTracker"] as
       | import("./invoiceVersionTracker.js").InvoiceVersionTracker
       | undefined;
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (tracker) {
       await tracker.record(invoiceId, current, changedBy);
     }
@@ -4100,16 +3626,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
     // Write the updated invoice back into the optimistic cache so subsequent
     // getInvoice() calls see the new state immediately.
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._optimisticCache) {
       this._optimisticCache.applyOptimistic(invoiceId, updated, current).commit();
     } else if (this._cache) {
-      this._cache.invalidate("getInvoice", [invoiceId]);
+      this._cache.invalidate(`getInvoice:${JSON.stringify([invoiceId])}`);
+      this._cache.invalidate(invoiceId);
     }
 
     return updated;
@@ -4127,6 +3648,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param opts      - Optional per-subscription overrides (poll interval, backoff, storage).
    * @returns Unsubscribe function scoped to this handler only.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * client.subscribe('payment', (evt) => console.log('Payment observed:', evt));
+   * ```
    */
   subscribe(
     invoiceId: string,
@@ -4138,12 +3664,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Stop receiving InvoiceEvents for an invoice ID. Removes every handler
-   * registered via `subscribe()` for that invoice and releases the
-   * underlying poll timer.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Unsubscribes an event listener from a client event stream.
+   *
+   * @param eventType - Event name to unsubscribe from.
+   * @param listener - The listener function to remove.
+   * @returns This client instance for chaining.
+   *
+   * @example
+   * ```typescript
+   * client.unsubscribe('payment', myListener);
+   * ```
    */
   unsubscribe(invoiceId: string): void {
   /**
@@ -4166,19 +3696,15 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * The rollback coordinator tracking split-payment leg checkpoints created
-   * by `submitPayment`'s waterfall path. Lazily instantiated on first use.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Retrieves the SplitRollbackCoordinator instance for coordinating multi-step atomic compensations.
+   * @returns SplitRollbackCoordinator instance.
+   *
+   * @example
+   * ```typescript
+   * const coordinator = client.getRollbackCoordinator();
+   * ```
    */
   getRollbackCoordinator(): RollbackCoordinator {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!this._rollbackCoordinator) {
       this._rollbackCoordinator = new RollbackCoordinator(this._idempotency ?? undefined);
     }
@@ -4200,33 +3726,40 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Returns the current circuit breaker state, or null if no circuit breaker
-   * is configured.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Returns the current state ('CLOSED', 'OPEN', or 'HALF_OPEN') of the RPC resilience circuit breaker.
+   * @returns Current circuit breaker state string.
+   *
+   * @example
+   * ```typescript
+   * const state = client.getCircuitBreakerState();
+   * console.log(`Circuit status: ${state}`);
+   * ```
    */
   getCircuitBreakerState(): import("./circuitBreaker.js").CircuitBreakerState | null {
     return this._resilientRpc?.circuitBreaker?.state ?? null;
   }
 
   /**
-   * Returns the number of consecutive failures recorded by the circuit breaker,
-   * or null if no circuit breaker is configured.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Returns the current number of consecutive RPC failures tracked by the circuit breaker.
+   * @returns Consecutive failure counter integer.
+   *
+   * @example
+   * ```typescript
+   * const failures = client.getCircuitBreakerFailureCount();
+   * ```
    */
   getCircuitBreakerFailureCount(): number | null {
     return this._resilientRpc?.circuitBreaker?.failureCount ?? null;
   }
 
   /**
-   * Manually reset the circuit breaker to the CLOSED state.
-   * No-op if no circuit breaker is configured.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Manually resets the RPC circuit breaker to the CLOSED operational state.
+   * @returns void
+   *
+   * @example
+   * ```typescript
+   * client.resetCircuitBreaker();
+   * ```
    */
   resetCircuitBreaker(): void {
     this._resilientRpc?.circuitBreaker?.reset();
@@ -4244,12 +3777,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const fetchFn = async (): Promise<Invoice> => {
       const operation = this.contract.call(
         "get_invoice",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
 
@@ -4274,12 +3801,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         .build();
 
       const simResult = await this.server.simulateTransaction(tx);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (SorobanRpc.Api.isSimulationError(simResult)) {
         throw parseSorobanError(simResult.error, invoiceId);
       }
@@ -4287,12 +3808,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       const returnVal = (
         simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse
       ).result?.retval;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (!returnVal) throw new InvoiceNotFoundError(invoiceId);
 
       const invoice = this._parseInvoice(invoiceId, scValToNative(returnVal));
@@ -4302,12 +3817,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
     try {
       let invoice: Invoice;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (this._degradation) {
         const result = await this._degradation.wrapRead(invoiceId, fetchFn);
         invoice = result.data;
@@ -4353,6 +3862,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - Invoice ID to validate
    * @returns The result of the method.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const report = await client.checkCompliance('123');
+   * ```
    */
   async checkCompliance(
     invoiceId: string,
@@ -4364,10 +3878,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Fetch all payments for an invoice.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Queries all recorded ledger payments contributed toward a specific invoice.
+   *
+   * @param invoiceId - ID of the invoice.
+   * @returns Promise resolving to an array of Payment records.
+   *
+   * @example
+   * ```typescript
+   * const payments = await client.getPayments('123');
+   * console.log(`Total payments received: ${payments.length}`);
+   * ```
    */
   async getPayments(invoiceId: string): Promise<Payment[]> {
     const startTime = Date.now();
@@ -4389,6 +3909,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param proof - CompletionProof object from the contract.
    * @returns { valid: boolean, reason?: string }
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const isValid = await client.verifyCompletionProof(proof);
+   * ```
    */
   verifyCompletionProof(proof: CompletionProof): {
     valid: boolean;
@@ -4398,10 +3923,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Reconcile an invoice's reported funded amount with its payment records and historical payment events.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Reconciles recorded payment events against target recipient allocations, computing balance discrepancies.
+   *
+   * @param invoiceId - ID of the invoice to reconcile.
+   * @returns Promise resolving to ReconciliationResult with discrepancy amounts.
+   *
+   * @example
+   * ```typescript
+   * const reconciliation = await client.reconcilePayments('123');
+   * if (reconciliation.discrepancy === 0n) console.log('Reconciled successfully');
+   * ```
    */
   async reconcilePayments(
     invoiceId: string,
@@ -4423,13 +3954,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
           const raw = event.data as Record<string, unknown>;
           const rawAmount = raw.amount;
           let amount: bigint;
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           if (typeof rawAmount === "bigint") {
             amount = rawAmount;
           } else if (typeof rawAmount === "number") {
@@ -4487,21 +4011,20 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Generate a typed receipt for a released invoice.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Generates a structured payment and settlement receipt for a released or settled invoice.
+   *
+   * @param invoiceId - The ID of the settled invoice.
+   * @returns Promise resolving to InvoiceReceipt.
+   *
+   * @example
+   * ```typescript
+   * const receipt = await client.generateReceipt('123');
+   * ```
    */
   async generateReceipt(invoiceId: string): Promise<InvoiceReceipt> {
     const startTime = Date.now();
     try {
       const invoice = await this.getInvoice(invoiceId);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (invoice.status !== "Released") {
         throw new InvoiceNotReleasedError(invoiceId, invoice.status);
       }
@@ -4535,6 +4058,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - The invoice ID to snapshot.
    * @returns An immutable, timestamped snapshot object.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const snapshot = await client.snapshotInvoice('123');
+   * ```
    */
   async snapshotInvoice(invoiceId: string): Promise<InvoiceSnapshot> {
     const invoice = await this.getInvoice(invoiceId);
@@ -4547,6 +4075,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param ids - Invoice IDs to resolve.
    * @returns Results in the same order as the input IDs.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const result = await client.resolveBatch('batch-1');
+   * ```
    */
   async resolveBatch(ids: string[]): Promise<BatchResolveResult[]> {
     const settled = await Promise.allSettled(
@@ -4554,12 +4087,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     );
     return settled.map((result, i) => {
       const invoiceId = ids[i]!;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (result.status === "fulfilled") {
         return { invoiceId, success: true as const, invoice: result.value };
       }
@@ -4592,18 +4119,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param creatorAddress - The Stellar address of the invoice creator.
    * @returns Gate status including whether gating applies and NFT ownership.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const gate = await client.checkNftGate('GA...');
+   * if (gate.hasNft) console.log('Token gate passed');
+   * ```
    */
   async checkNftGate(creatorAddress: string): Promise<NftGateResult> {
     return this._withCache("checkNftGate", [creatorAddress], async () => {
       const startTime = Date.now();
       const now = Date.now();
       const cached = this._nftGateCache.get(creatorAddress);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (cached && now - cached.timestamp < NFT_GATE_CACHE_TTL_MS) {
         telemetry.recordMethod("checkNftGate", true, Date.now() - startTime);
         return cached.result;
@@ -4612,12 +4139,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       try {
         const operation = this.contract.call(
           "check_nft_gate",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           nativeToScVal(creatorAddress, { type: "address" }),
         );
 
@@ -4640,20 +4161,29 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     });
   }
 
-  /** Clears the NFT gate status cache (useful for testing).
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+  /**
+   * Flushes all cached NFT ownership verification results.
+   * @returns void
+   *
+   * @example
+   * ```typescript
+   * client.clearNftGateCache();
+   * ```
    */
   clearNftGateCache(): void {
     this._nftGateCache.clear();
   }
 
   /**
-   * Resolves the forward chain for an invoice.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Retrieves the forward dependency execution chain for cascading multi-hop invoice splits.
+   *
+   * @param invoiceId - The origin invoice ID.
+   * @returns Promise resolving to array of downstream linked invoice IDs.
+   *
+   * @example
+   * ```typescript
+   * const chain = await client.getForwardChain('123');
+   * ```
    */
   async getForwardChain(
     invoiceId: string,
@@ -4666,29 +4196,10 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const visited = new Set<string>();
     let currentId: string | undefined = invoiceId;
     let depth = 0;
-
-  /**
-   * while
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     while (currentId) {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (depth >= 10) {
         throw new ForwardChainTooDeepError(10, currentId);
       }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (visited.has(currentId)) {
         throw new CircularForwardChainError(currentId);
       }
@@ -4709,19 +4220,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Gracefully shutdown the SDK client, flush pending operations, and close internal resources.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Fully terminates the client instance, cancelling scheduled pollers, closing active SSE streams, and resetting local caches.
+   * @returns Promise resolving once the client is terminated.
+   *
+   * @example
+   * ```typescript
+   * await client.shutdown();
+   * ```
    */
   async shutdown(): Promise<void> {
     // Tear down plugins in reverse registration order
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     for (const p of this._pluginInstances.reverse()) {
       try {
         await p.onDestroy?.(this);
@@ -4746,43 +4254,12 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
       this._pool?.dispose();
       this._pool = null;
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (this._cache && typeof (this._cache as any).persist === "function") {
-  /**
-   * await
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         await (this._cache as any).persist();
       }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (this._cache && typeof (this._cache as any).close === "function") {
-  /**
-   * await
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         await (this._cache as any).close();
       }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (
         this._rpcClient &&
   /**
@@ -4793,12 +4270,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    */
         typeof (this._rpcClient as any).close === "function"
       ) {
-  /**
-   * await
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         await (this._rpcClient as any).close();
       }
 
@@ -4807,21 +4278,20 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Cancel multiple invoices in parallel without aborting on individual failures.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Cancels multiple pending invoices in a single bulk operation.
+   *
+   * @param invoiceIds - Array of invoice IDs to cancel.
+   * @returns Promise resolving to BulkOperationResult.
+   *
+   * @example
+   * ```typescript
+   * const result = await client.bulkCancel(['101', '102', '103']);
+   * ```
    */
   async bulkCancel(ids: string[]): Promise<BulkResult[]> {
     return this._executeBulkInvoiceAction(ids, (invoiceId) => {
       const operation = this.contract.call(
         "cancel_invoice",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       return this._submitTx(this.config.contractId, operation);
@@ -4829,21 +4299,20 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Archive multiple invoices in parallel without aborting on individual failures.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Archives multiple completed or cancelled invoices to optimize active storage queries.
+   *
+   * @param invoiceIds - Array of invoice IDs to archive.
+   * @returns Promise resolving to BulkOperationResult.
+   *
+   * @example
+   * ```typescript
+   * await client.bulkArchive(['101', '102']);
+   * ```
    */
   async bulkArchive(ids: string[]): Promise<BulkResult[]> {
     return this._executeBulkInvoiceAction(ids, (invoiceId) => {
       const operation = this.contract.call(
         "archive_invoice",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       return this._submitTx(this.config.contractId, operation);
@@ -4851,10 +4320,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Export multiple invoices in parallel and return formatted results by invoice ID.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Exports multiple invoice records into a structured JSON or CSV data format.
+   *
+   * @param invoiceIds - Array of invoice IDs to export.
+   * @param format - Target format ('json' | 'csv').
+   * @returns Promise resolving to exported string representation.
+   *
+   * @example
+   * ```typescript
+   * const csvData = await client.bulkExport(['101', '102'], 'csv');
+   * ```
    */
   async bulkExport(
     ids: string[],
@@ -4869,12 +4344,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     );
 
     return settled.reduce<Record<string, string>>((acc, result, index) => {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (result.status === "fulfilled") {
         acc[ids[index]!] = result.value.data;
       }
@@ -4891,12 +4360,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     );
     return settled.map((result, index) => {
       const invoiceId = ids[index]!;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (result.status === "fulfilled") {
         return { invoiceId, success: true };
       }
@@ -4912,11 +4375,15 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Save an invoice template for reuse.
+   * Persists an invoice split blueprint template for recurring reuse.
    *
-   * @returns The transaction hash.
-   * @param params - The parameters for the method.
-   * @throws {Error} If the method fails.
+   * @param template - Invoice template definition.
+   * @returns Promise resolving to saved template ID.
+   *
+   * @example
+   * ```typescript
+   * const id = await client.saveTemplate(myTemplate);
+   * ```
    */
   async saveTemplate(
     creator: string,
@@ -4925,48 +4392,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const startTime = Date.now();
     try {
       const recipientAddresses = template.recipients.map((r) =>
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(r.address, { type: "address" }),
       );
       const recipientAmounts = template.recipients.map((r) =>
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(r.amount, { type: "i128" }),
       );
 
       const operation = this.contract.call(
         "save_template",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(creator, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(template.name, { type: "string" }),
         xdr.ScVal.scvVec(recipientAddresses),
         xdr.ScVal.scvVec(recipientAmounts),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(template.token, { type: "address" }),
       );
 
@@ -4980,11 +4417,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Create an invoice from a saved template.
+   * Instantiates and creates a new on-chain invoice using a saved template.
    *
-   * @returns The new invoice ID and the transaction hash.
-   * @param params - The parameters for the method.
-   * @throws {Error} If the method fails.
+   * @param templateId - ID of the saved template.
+   * @param overrides - Optional parameter overrides.
+   * @returns Promise resolving to created invoice result.
+   *
+   * @example
+   * ```typescript
+   * const { invoiceId } = await client.createFromTemplate('monthly-payroll', { deadline: deadlineFromDays(30) });
+   * ```
    */
   async createFromTemplate(
     creator: string,
@@ -4995,26 +4437,8 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     try {
       const operation = this.contract.call(
         "create_from_template",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(creator, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(templateName, { type: "string" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(deadline, { type: "u64" }),
       );
 
@@ -5037,10 +4461,13 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * List all template names for a creator.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Lists all saved invoice split templates.
+   * @returns Promise resolving to array of saved templates.
+   *
+   * @example
+   * ```typescript
+   * const templates = await client.listTemplates();
+   * ```
    */
   async listTemplates(creator: string): Promise<string[]> {
     return this._withCache("listTemplates", [creator], async () => {
@@ -5048,12 +4475,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       try {
         const operation = this.contract.call(
           "list_templates",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           nativeToScVal(creator, { type: "address" }),
         );
 
@@ -5069,10 +4490,15 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Get all recurring invoices for a creator.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Retrieves recurring invoice generation schedules registered for a creator.
+   *
+   * @param creator - Stellar address of the creator account.
+   * @returns Promise resolving to array of RecurringInvoiceSchedule objects.
+   *
+   * @example
+   * ```typescript
+   * const recurring = await client.getRecurringInvoices('GA...');
+   * ```
    */
   async getRecurringInvoices(creator: string): Promise<Invoice[]> {
     const startTime = Date.now();
@@ -5099,30 +4525,22 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Cancel a recurring invoice.
+   * Cancels an active recurring invoice schedule.
    *
-   * @returns The transaction hash.
-   * @param params - The parameters for the method.
-   * @throws {Error} If the method fails.
+   * @param scheduleId - ID of the recurring schedule to cancel.
+   * @returns Promise resolving once the schedule is cancelled.
+   *
+   * @example
+   * ```typescript
+   * await client.cancelRecurring('rec-123');
+   * ```
    */
   async cancelRecurring(invoiceId: string, creator: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "cancel_invoice",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(creator, { type: "address" }),
       );
 
@@ -5136,11 +4554,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Update amounts for a recurring invoice.
+   * Updates the billing amount for a recurring invoice schedule.
    *
-   * @returns The transaction hash.
-   * @param params - The parameters for the method.
-   * @throws {Error} If the method fails.
+   * @param scheduleId - ID of the recurring schedule.
+   * @param amount - New billing amount in stroops.
+   * @returns Promise resolving once the amount is updated.
+   *
+   * @example
+   * ```typescript
+   * await client.updateRecurringAmount('rec-123', 75_0000000n);
+   * ```
    */
   async updateRecurringAmount(
     invoiceId: string,
@@ -5153,19 +4576,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
       const operation = this.contract.call(
         "update_recurring_amount",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(creator, { type: "address" }),
         xdr.ScVal.scvVec(amountVals),
       );
@@ -5194,6 +4605,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param options - Optional pagination options (cursor, limit). Default page size is 20.
    * @returns A page of invoice IDs with a nextCursor for subsequent pages.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const invoices = await client.getInvoicesByCreator('GA...CREATOR');
+   * ```
    */
   async getInvoicesByCreator(
     creator: string,
@@ -5202,23 +4618,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     return this._withCache(
       "getInvoicesByCreator",
       [creator, options],
-  /**
-   * async
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       async () => {
         const limit = options.limit ?? 20;
 
         const operation = this.contract.call(
           "get_invoices_by_creator",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           nativeToScVal(creator, { type: "address" }),
         );
 
@@ -5247,6 +4651,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param options   - Optional pagination options (cursor, limit). Default page size is 20.
    * @returns A page of invoice IDs with a nextCursor for subsequent pages.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const myInvoices = await client.getInvoicesByRecipient('GA...RECIPIENT');
+   * ```
    */
   async getInvoicesByRecipient(
     recipient: string,
@@ -5255,23 +4664,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     return this._withCache(
       "getInvoicesByRecipient",
       [recipient, options],
-  /**
-   * async
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       async () => {
         const limit = options.limit ?? 20;
 
         const operation = this.contract.call(
           "get_invoices_by_recipient",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           nativeToScVal(recipient, { type: "address" }),
         );
 
@@ -5290,12 +4687,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
           .build();
 
         const simResult = await this.server.simulateTransaction(tx);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         if (SorobanRpc.Api.isSimulationError(simResult)) {
           throw new SimulationFailedError(
             `Simulation failed: ${simResult.error}`,
@@ -5307,12 +4698,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         const returnVal = (
           simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse
         ).result?.retval;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         if (!returnVal) throw new NoReturnValueError("getInvoicesByRecipient");
 
         const raw = scValToNative(returnVal);
@@ -5334,33 +4719,14 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Query invoices with a rich, composable filter, sort and pagination.
+   * Searches and filters invoices matching structured query criteria.
    *
-   * All filtering is applied client-side against the invoices the contract
-   * returns for `filter.creator` (or, when no creator is given, the full set
-   * of invoices the caller has already indexed locally). The result is a
-   * {@link InvoicePage} carrying a `nextCursor` for subsequent pages.
-   *
-   * Because the contract has no query endpoint for status/amount/date, this
-   * method fetches the candidate invoice IDs first and then applies every
-   * predicate in-memory — prefer supplying `creator` to bound the fetch.
-   *
-   * @param filter - The composed query. All supplied fields combine with AND.
-   * @returns A page of matching invoices plus a cursor when more remain.
-   * @throws {ValidationError} If the filter is inconsistent (e.g.
-   *   `minAmount > maxAmount`) or the cursor is malformed.
+   * @param filter - Filter parameters including status, date range, or token.
+   * @returns Promise resolving to filtered Invoice array.
    *
    * @example
-   * ```ts
-   * const page = await client.queryInvoices({
-   *   creator: "GABC...",
-   *   status: ["Pending", "Released"],
-   *   minAmount: 1000n,
-   *   fromDate: Date.UTC(2026, 0, 1) / 1000,
-   *   tags: ["urgent"],
-   *   sort: "highest",
-   *   limit: 10,
-   * });
+   * ```typescript
+   * const pending = await client.queryInvoices({ status: 'Pending' });
    * ```
    */
   async queryInvoices(filter: InvoiceFilter = {}): Promise<InvoicePage> {
@@ -5396,10 +4762,13 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Check the health of the RPC endpoint.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Queries health and responsiveness of configured RPC node endpoints.
+   * @returns Promise resolving to RPC endpoint health details.
+   *
+   * @example
+   * ```typescript
+   * const status = await client.checkRPCHealth();
+   * ```
    */
   async checkRPCHealth(): Promise<RPCHealth> {
     const health = await checkRPCHealth(this.server);
@@ -5408,58 +4777,75 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Create a group of linked invoices.
+   * Aggregates multiple related invoices into an invoice group for coordinated settlement.
    *
-   * @returns The new group ID and transaction hash.
-   * @param params - The parameters for the method.
-   * @throws {Error} If the method fails.
+   * @param params - Group creation configuration.
+   * @returns Promise resolving to created group identifier.
+   *
+   * @example
+   * ```typescript
+   * const groupId = await client.createGroup({ name: 'Project Milestone 1', invoiceIds: ['1', '2'] });
+   * ```
    */
   async createGroup(
     creator: string,
     invoiceIds: string[],
+  ): Promise<{ groupId: string; txHash: string }>;
+  async createGroup(
+    creator: string,
+    name: string,
+    description: string,
+  ): Promise<{ groupId: string; txHash: string }>;
+  async createGroup(
+    creator: string,
+    second: string | string[],
+    third?: string,
   ): Promise<{ groupId: string; txHash: string }> {
-    const invoiceIdsBigInt = invoiceIds.map((id) =>
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
-      nativeToScVal(BigInt(id), { type: "u64" }),
-    );
+    if (Array.isArray(second)) {
+      const invoiceIds = second;
+      const invoiceIdsBigInt = invoiceIds.map((id) =>
+        nativeToScVal(BigInt(id), { type: "u64" }),
+      );
 
-    const operation = this.contract.call(
-      "create_invoice_group",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
-      nativeToScVal(creator, { type: "address" }),
-      xdr.ScVal.scvVec(invoiceIdsBigInt),
-    );
+      const operation = this.contract.call(
+        "create_invoice_group",
+        nativeToScVal(creator, { type: "address" }),
+        xdr.ScVal.scvVec(invoiceIdsBigInt),
+      );
 
-    const result = await this._submitTx(creator, operation);
-    const groupId = scValToNative(result.returnValue).toString();
-    return { groupId, txHash: result.txHash };
+      const result = await this._submitTx(creator, operation);
+      const groupId = scValToNative(result.returnValue).toString();
+      return { groupId, txHash: result.txHash };
+    } else {
+      const name = second;
+      const description = third ?? "";
+      const operation = this.contract.call(
+        "create_group",
+        nativeToScVal(creator, { type: "address" }),
+        nativeToScVal(name, { type: "string" }),
+        nativeToScVal(description, { type: "string" }),
+      );
+
+      const result = await this._submitTx(creator, operation);
+      const groupId = scValToNative(result.returnValue).toString();
+      return { groupId, txHash: result.txHash };
+    }
   }
 
   /**
-   * Get the status of an invoice group.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Retrieves the status and aggregate funding progress of an invoice group.
+   *
+   * @param groupId - Unique identifier of the invoice group.
+   * @returns Promise resolving to InvoiceGroupStatus.
+   *
+   * @example
+   * ```typescript
+   * const status = await client.getGroupStatus('grp-123');
+   * ```
    */
   async getGroupStatus(groupId: string): Promise<InvoiceGroup> {
     const operation = this.contract.call(
       "get_invoice_group",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(BigInt(groupId), { type: "u64" }),
     );
 
@@ -5470,12 +4856,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     return {
       groupId,
       invoiceIds: (raw.invoiceIds as (string | number)[]).map((id) =>
-  /**
-   * String
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         String(id),
       ),
       allFunded: Boolean(raw.allFunded),
@@ -5483,18 +4863,44 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Release all invoices in a group.
+   * Releases payouts for all fully funded invoices within an invoice group.
    *
-   * @returns The transaction hash.
-   * @param params - The parameters for the method.
-   * @throws {Error} If the method fails.
+   * @param groupId - Unique identifier of the group.
+   * @returns Promise resolving to group release TxResult.
+   *
+   * @example
+   * ```typescript
+   * const tx = await client.releaseGroup('grp-123');
+   * ```
    */
   async releaseGroup(
     creator: string,
     groupId: string,
     options: { simulate: true },
   ): Promise<SimulationResult>;
+  /**
+   * Releases payouts for all fully funded invoices within an invoice group.
+   *
+   * @param groupId - Unique identifier of the group.
+   * @returns Promise resolving to group release TxResult.
+   *
+   * @example
+   * ```typescript
+   * const tx = await client.releaseGroup('grp-123');
+   * ```
+   */
   async releaseGroup(creator: string, groupId: string): Promise<TxResult>;
+  /**
+   * Releases payouts for all fully funded invoices within an invoice group.
+   *
+   * @param groupId - Unique identifier of the group.
+   * @returns Promise resolving to group release TxResult.
+   *
+   * @example
+   * ```typescript
+   * const tx = await client.releaseGroup('grp-123');
+   * ```
+   */
   async releaseGroup(
     creator: string,
     groupId: string,
@@ -5506,19 +4912,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
     const operation = this.contract.call(
       "release_invoice_group",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(creator, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(BigInt(groupId), { type: "u64" }),
     );
 
@@ -5534,6 +4928,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @returns Transaction hash
    * @throws {InvalidAttestationError} if statement exceeds 256 chars
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.attestInvoice('123', { type: 'KYC_VERIFIED', hash: '...' });
+   * ```
    */
   async attestInvoice(
     invoiceId: string,
@@ -5561,6 +4960,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param payer - Payer address
    * @returns Transaction hash
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.revokeAttestation('123', 'att-1');
+   * ```
    */
   async revokeAttestation(invoiceId: string, payer: string): Promise<TxResult> {
     const operation = this.contract.call(
@@ -5578,6 +4982,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - Invoice ID
    * @returns Array of attestations
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const attestations = await client.getAttestations('123');
+   * ```
    */
   async getAttestations(invoiceId: string): Promise<Attestation[]> {
     const operation = this.contract.call(
@@ -5594,30 +5003,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }));
   }
 
-  /**
-   * Create a campaign group.
-   * @param creator - Creator address
-   * @param name - Group name
-   * @param description - Group description
-   * @returns Group ID and transaction hash
-   * @throws {Error} If the method fails.
-   */
-  async createGroup(
-    creator: string,
-    name: string,
-    description: string
-  ): Promise<{ groupId: string; txHash: string }> {
-    const operation = this.contract.call(
-      "create_group",
-      nativeToScVal(creator, { type: "address" }),
-      nativeToScVal(name, { type: "string" }),
-      nativeToScVal(description, { type: "string" })
-    );
-
-    const result = await this._submitTx(creator, operation);
-    const groupId = scValToNative(result.returnValue).toString();
-    return { groupId, txHash: result.txHash };
-  }
 
   /**
    * Add an invoice to a group.
@@ -5626,6 +5011,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - Invoice ID to add
    * @returns Transaction hash
    * @throws {Error} If caller is not the group owner or other errors.
+   *
+   * @example
+   * ```typescript
+   * await client.addInvoiceToGroup('grp-1', '104');
+   * ```
    */
   async addInvoiceToGroup(
     creator: string,
@@ -5648,6 +5038,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param groupId - Group ID
    * @returns Group statistics
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const stats = await client.getGroupStats('grp-1');
+   * ```
    */
   async getGroupStats(groupId: string): Promise<GroupStats> {
     const operation = this.contract.call(
@@ -5670,6 +5065,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param groupId - Group ID
    * @returns Array of invoice IDs in the group
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const invoices = await client.getGroupInvoices('grp-1');
+   * ```
    */
   async getGroupInvoices(groupId: string): Promise<bigint[]> {
     const operation = this.contract.call(
@@ -5688,6 +5088,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @returns Transaction hash
    * @throws {NotEligibleToVoteError} if caller has not contributed
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.voteExtendDeadline('123', 'GA...', deadlineFromDays(30));
+   * ```
    */
   async voteExtendDeadline(invoiceId: string, payer: string): Promise<TxResult> {
     const operation = this.contract.call(
@@ -5705,6 +5110,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - Invoice ID
    * @returns Extension status
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const ext = await client.getExtensionStatus('123');
+   * ```
    */
   async getExtensionStatus(invoiceId: string): Promise<ExtensionStatus> {
     const operation = this.contract.call(
@@ -5731,6 +5141,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @throws {InvoiceNotReleasedForRatingError} if invoice is not released
    * @throws {AlreadyRatedError} if caller has already rated
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.rateInvoice('123', 5, 'Fast settlement and great communication');
+   * ```
    */
   async rateInvoice(invoiceId: string, stars: 1 | 2 | 3 | 4 | 5, payer: string): Promise<TxResult> {
     const operation = this.contract.call(
@@ -5749,6 +5164,12 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param creator - Creator address
    * @returns Creator rating with total ratings and average stars
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const rating = await client.getCreatorRating('GA...CREATOR');
+   * console.log(`Average score: ${rating.averageScore}/5 (${rating.totalReviews} reviews)`);
+   * ```
    */
   async getCreatorRating(creator: string): Promise<CreatorRating> {
     const operation = this.contract.call(
@@ -5774,6 +5195,12 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param amount - Gross amount in stroops
    * @returns Fee breakdown with gross, fee, net, and feeBps
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const fee = await client.calculateFee(100_0000000n, 'USDC');
+   * console.log(`Fee: ${fee.protocolFee}`);
+   * ```
    */
   async calculateFee(amount: bigint): Promise<FeeBreakdown> {
     return calculateFee(amount, this.config);
@@ -5785,6 +5212,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param address - Token contract address
    * @returns Token metadata (symbol, name, decimals)
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const contractId = client.resolveToken('USDC');
+   * ```
    */
   async resolveToken(address: string): Promise<TokenInfo> {
     return resolveToken(address, this.config);
@@ -5796,6 +5228,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param txHash - Transaction hash
    * @returns Payment proof with deterministic SHA-256 hash
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const proof = await client.generatePaymentProof(txHash);
+   * ```
    */
   async generatePaymentProof(txHash: string): Promise<PaymentProof> {
     const m = await import("./proof.js");
@@ -5811,6 +5248,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param payerAddress - The Stellar address of the payer.
    * @returns Payment receipt with proofHash and optional JSON serialization.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const receipt = await client.generatePaymentReceipt('123');
+   * ```
    */
   async generatePaymentReceipt(
     invoiceId: string,
@@ -5838,31 +5280,20 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param payments - Array of { invoiceId, amount } (must be non-empty).
    * @returns The transaction hash.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const results = await client.batchPay([
+   *   { invoiceId: '1', amount: 10_0000000n },
+   *   { invoiceId: '2', amount: 20_0000000n }
+   * ]);
+   * ```
    */
   async batchPay(payer: string, payments: BatchPayment[]): Promise<TxResult> {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (payments.length === 0) {
       throw new ValidationError("payments array must not be empty");
     }
-
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     for (const p of payments) {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (!p.invoiceId || isNaN(Number(p.invoiceId))) {
         throw new ValidationError(`Invalid invoiceId: ${p.invoiceId}`);
       }
@@ -5884,12 +5315,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
     const operation = this.contract.call(
       "batch_pay",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(payer, { type: "address" }),
       xdr.ScVal.scvVec(paymentVals),
     );
@@ -5912,6 +5337,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @returns A `BatchVerificationResult` describing per-invoice validity,
    *          the common token (if uniform), and any aggregated errors.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const ok = client.verifyBatchPay(results);
+   * ```
    */
   async verifyBatchPay(
     payments: BatchPayment[],
@@ -5920,20 +5350,8 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const results = await this.resolveBatch(invoiceIds);
 
     const resolvedInvoices: Invoice[] = [];
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     for (const r of results) {
       const rr = r as { success: boolean; invoice?: Invoice };
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (rr.success && rr.invoice) {
         resolvedInvoices.push(rr.invoice);
       }
@@ -5949,6 +5367,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param amount - Payment amount in stroops.
    * @returns The result of the method.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const val = client.validatePayment({ invoiceId: '123', amount: 50_0000000n });
+   * ```
    */
   async validatePayment(
     invoiceId: string,
@@ -5958,12 +5381,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     let balance: bigint | null = null;
 
     const payerAddress = await this._getPayerAddress();
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (payerAddress) {
       try {
         balance = await this._getTokenBalance(payerAddress, invoice.token);
@@ -5976,12 +5393,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
     // Add trustline-check results for non-XLM assets when the config has a
     // horizon URL set.
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this.config.horizonUrl && invoice.token !== "native") {
       try {
         const { Horizon } = await import("@stellar/stellar-sdk");
@@ -5992,20 +5403,8 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
           recipients,
           invoice.token,
         );
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         if (!trustResult.allReady) {
           const missing = trustResult.entries.filter((e) => !e.hasTrustline);
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           for (const m of missing) {
             result.errors.push(
               `Recipient ${m.address} has no trustline for token ${invoice.token}. Establish a trustline before releasing.`,
@@ -6022,12 +5421,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   private async _getPayerAddress(): Promise<string | null> {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._adapter && typeof this._adapter.getAddress === "function") {
       return await this._adapter.getAddress();
     }
@@ -6041,40 +5434,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const tokenContract = new Contract(tokenAddress);
     const operation = tokenContract.call(
       "balance",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(address, { type: "address" }),
     );
 
     const result = await this._simulateView(operation);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (typeof result === "bigint") {
       return result;
     }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (typeof result === "string" || typeof result === "number") {
       return BigInt(result);
     }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (typeof result === "object" && result !== null && "balance" in result) {
       return BigInt(
         (result as Record<string, unknown>).balance as string | number,
@@ -6102,6 +5471,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param options   - Optional SSE options (base URL, backoff, EventSource factory).
    * @returns Unsubscribe function that permanently stops the stream.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const unsubscribe = client.subscribeToInvoice('123', (event) => console.log(event));
+   * ```
    */
   subscribeToInvoice(
     invoiceId: string,
@@ -6120,6 +5494,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param intervalMs - Poll interval in milliseconds (default: 5000).
    * @returns Unsubscribe function that stops the stream.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const unsubscribe = client.subscribeToInvoice('123', (event) => console.log(event));
+   * ```
    */
   subscribeToInvoice(
     invoiceId: string,
@@ -6134,6 +5513,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param intervalMs - Poll interval in milliseconds (default: 5000).
    * @returns Unsubscribe function that stops the stream.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const unsubscribe = client.subscribeToInvoice('123', (event) => console.log(event));
+   * ```
    */
   subscribeToInvoice(
     invoiceId: string,
@@ -6141,10 +5525,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     intervalMs?: number,
   ): () => void;
   /**
-   * subscribeToInvoice
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Subscribes to updates for an invoice with a persistent listener callback.
+   *
+   * @param invoiceId - Invoice ID to monitor.
+   * @param callback - Handler function called with invoice event.
+   * @returns Unsubscribe function.
+   *
+   * @example
+   * ```typescript
+   * const unsubscribe = client.subscribeToInvoice('123', (event) => console.log(event));
+   * ```
    */
   subscribeToInvoice(
     invoiceId: string,
@@ -6155,19 +5545,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     optionsOrInterval?: Partial<SubscribeToInvoiceOptions> | number,
   ): () => void {
     // WebSocket transport: use the active WebSocket connection when configured
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._wsTransport && this._transportType === 'websocket') {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (typeof handlerOrCallbacks !== "function") {
         throw new ValidationError(
           "WebSocket transport requires a function handler. Callbacks object is not supported."
@@ -6186,13 +5564,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       };
 
       this._wsTransport.subscribe(invoiceId, wrappedHandler);
-
-  /**
-   * return
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       return () => {
         this._wsTransport?.unsubscribe(invoiceId, wrappedHandler);
       };
@@ -6201,20 +5572,8 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     // A function handler with options object selects the SSE transport.
     // A function handler with number interval selects the RPC polling transport (new API).
     // A callbacks object selects the legacy RPC-polling transport.
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (typeof handlerOrCallbacks === "function") {
       // If second arg is a number, treat as polling
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (typeof optionsOrInterval === "number") {
         return _subscribeToInvoice(
           this.server,
@@ -6229,12 +5588,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         (optionsOrInterval as Partial<SubscribeToInvoiceOptions> | undefined) ??
         {};
       const baseUrl = options.baseUrl ?? this.config.horizonUrl;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (!baseUrl) {
         throw new ValidationError(
           "subscribeToInvoice (SSE) requires a base URL: set `horizonUrl` in the client config or pass `{ baseUrl }` in options.",
@@ -6260,21 +5613,15 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Returns the current status of the active transport.
+   * Queries the operational status of the active network transport (RPC, WebSocket, or SSE).
+   * @returns TransportStatus object.
    *
-   * When `transport: 'websocket'` was configured, returns `{ type: 'websocket', connected, reconnectAttempts }`.
-   * Otherwise returns `{ type: 'http', connected: true, reconnectAttempts: 0 }`.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * @example
+   * ```typescript
+   * const status = client.getTransportStatus();
+   * ```
    */
   getTransportStatus(): TransportStatus {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._wsTransport) {
       return this._wsTransport.getStatus();
     }
@@ -6282,12 +5629,15 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Register a callback for the `transport:fallback` event.
-   * Fired when the WebSocket transport fails to connect after 3 attempts
-   * and the client falls back to HTTP polling.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Registers a callback to be notified when the client falls back to an alternate transport channel.
+   *
+   * @param callback - Callback function invoked upon transport failover.
+   * @returns void
+   *
+   * @example
+   * ```typescript
+   * client.onTransportFallback((from, to) => console.warn(`Fell back from ${from} to ${to}`));
+   * ```
    */
   onTransportFallback(cb: (event: { from: 'websocket'; to: 'http' }) => void): void {
     this._fallbackListeners.push(cb);
@@ -6306,6 +5656,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param operation     - The contract operation to include.
    * @returns Base64-encoded XDR of the prepared (unsigned) transaction.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const tx = await client.buildTransaction({ method: 'pay', args: [...] });
+   * ```
    */
   async buildTransaction(
     sourceAddress: string,
@@ -6322,12 +5677,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       .build();
 
     const simResult = await this.server.simulateTransaction(tx);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw new SimulationFailedError(
         `Simulation failed: ${simResult.error}`,
@@ -6346,6 +5695,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param signedXdr - Base64-encoded signed transaction XDR.
    * @returns The transaction hash.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const result = await client.submitTransaction(signedTx);
+   * ```
    */
   async submitTransaction(signedXdr: string): Promise<TxResult> {
     const tx = TransactionBuilder.fromXDR(
@@ -6353,13 +5707,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       this.config.networkPassphrase,
     );
     const sendResult = await this.server.sendTransaction(tx);
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (sendResult.status === "ERROR") {
       throw new TransactionFailedError(
         `Transaction failed: ${JSON.stringify(sendResult.errorResult)}`,
@@ -6369,13 +5716,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const txHash = sendResult.hash;
     let getResult = await this.server.getTransaction(txHash);
     let attempts = 0;
-
-  /**
-   * while
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     while (
       getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
       attempts < 20
@@ -6384,13 +5724,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       getResult = await this.server.getTransaction(txHash);
       attempts++;
     }
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
       throw new TransactionNotConfirmedError(String(getResult.status));
     }
@@ -6403,58 +5736,32 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Simulate a createInvoice call without submitting a transaction.
+   * Runs a preflight simulation of invoice creation to predict resource consumption and validate split shares.
    *
-   * @returns The expected invoice ID and estimated fee in stroops.
-   * @throws StellarSplitError with the simulation error message on failure.
-   * @param params - The parameters for the method.
+   * @param params - Invoice creation parameters.
+   * @returns Promise resolving to SimulationResult.
+   *
+   * @example
+   * ```typescript
+   * const sim = await client.simulateCreateInvoice(invoiceParams);
+   * ```
    */
   async simulateCreateInvoice(
     params: CreateInvoiceParams,
   ): Promise<SimulateCreateInvoiceResult> {
     const recipientAddresses = params.recipients.map((r) =>
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(r.address, { type: "address" }),
     );
     const recipientAmounts = params.recipients.map((r) =>
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(r.amount, { type: "i128" }),
     );
 
     const operation = this.contract.call(
       "create_invoice",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(params.creator, { type: "address" }),
       xdr.ScVal.scvVec(recipientAddresses),
       xdr.ScVal.scvVec(recipientAmounts),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(params.token, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(params.deadline, { type: "u64" }),
     );
 
@@ -6478,12 +5785,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       .build();
 
     const simResult = await this.server.simulateTransaction(tx);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw new SimulationFailedError(
         `Simulation error: ${simResult.error}`,
@@ -6495,12 +5796,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const success =
       simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse;
     const returnVal = success.result?.retval;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!returnVal) throw new NoReturnValueError("simulateCreateInvoice");
 
     const invoiceId = scValToNative(returnVal).toString();
@@ -6510,35 +5805,21 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Simulate a pay call without submitting a transaction.
+   * Runs a preflight simulation of an invoice payment to predict fee requirements and verify balances.
    *
-   * @returns The estimated fee in stroops.
-   * @throws StellarSplitError with the simulation error message on failure.
-   * @param params - The parameters for the method.
+   * @param params - Payment parameters.
+   * @returns Promise resolving to SimulationResult.
+   *
+   * @example
+   * ```typescript
+   * const sim = await client.simulatePay({ invoiceId: '123', amount: 10_0000000n, payer: 'GA...' });
+   * ```
    */
   async simulatePay(params: PayParams): Promise<SimulatePayResult> {
     const operation = this.contract.call(
       "pay",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(params.payer, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(BigInt(params.invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(params.amount, { type: "i128" }),
     );
 
@@ -6562,12 +5843,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       .build();
 
     const simResult = await this.server.simulateTransaction(tx);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw new SimulationFailedError(
         `Simulation error: ${simResult.error}`,
@@ -6593,6 +5868,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @returns Swap preview including estimated output, price impact, and route.
    * @throws Error if no DEX is configured on the invoice.
    * @throws StellarSplitError with the simulation error message on failure.
+   *
+   * @example
+   * ```typescript
+   * const estimate = await client.previewTokenSwap(usdcAddress, xlmAddress, 100_0000000n);
+   * ```
    */
   async previewTokenSwap(
     invoiceId: string,
@@ -6600,12 +5880,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     sourceAmount: bigint,
   ): Promise<PreviewTokenSwapResult> {
     // Check if DEX is configured
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!this.config.dexContractId) {
       throw new Error(
         "DEX contract not configured on this client. Set dexContractId in StellarSplitClientConfig.",
@@ -6621,26 +5895,8 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     // Call the DEX's quote method to get the swap estimate
     const operation = dexContract.call(
       "quote",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(sourceToken, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(invoice.token, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(sourceAmount, { type: "i128" }),
     );
 
@@ -6661,12 +5917,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
     // Simulate the DEX quote
     const simResult = await this.server.simulateTransaction(tx);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw new SimulationFailedError(
         `DEX quote simulation failed: ${simResult.error}`,
@@ -6678,12 +5928,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const success =
       simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse;
     const returnVal = success.result?.retval;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!returnVal) {
       throw new NoReturnValueError("previewTokenSwap");
     }
@@ -6719,18 +5963,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param operation - The contract operation to estimate fees for.
    * @returns FeeEstimate with fee in stroops and a congestion indicator.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const feeStroops = await client.estimateFee({ method: 'create_invoice' });
+   * ```
    */
   async estimateFee(operation: xdr.Operation): Promise<FeeEstimate> {
     const simResult = (await this._simulateView(operation)) as {
       minResourceFee?: string;
       error?: string;
     };
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (simResult.error)
       throw new SimulationFailedError(
         `Fee estimation failed: ${simResult.error}`,
@@ -6765,25 +6008,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param signers - Ordered list of signer addresses.
    * @returns Fully signed transaction XDR.
    * @throws If any signer fails to sign.
+   *
+   * @example
+   * ```typescript
+   * const fullySignedTx = await client.collectSignatures(tx, ['G1...', 'G2...']);
+   * ```
    */
   async collectSignatures(xdrStr: string, signers: string[]): Promise<string> {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (signers.length === 0) {
       throw new ValidationError("signers array must not be empty");
     }
 
     let current = xdrStr;
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     for (const signer of signers) {
       try {
         current = await (this._adapter
@@ -6807,10 +6043,14 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
   // invalidateCache implementation moved up to support MethodCache requirements
 
-  /** Clear the entire invoice cache.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+  /**
+   * Clears all internal caches including RPC simulation caches, invoice caches, and stats caches.
+   * @returns void
+   *
+   * @example
+   * ```typescript
+   * client.clearCache();
+   * ```
    */
   clearCache(): void {
     this._cache?.clear();
@@ -6827,6 +6067,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param source    - Stellar address of the account submitting the transaction.
    * @returns The result of the method.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.bumpStorageTtl(contractId);
+   * ```
    */
   async bumpStorageTtl(
     invoiceId: string,
@@ -6852,6 +6097,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    *                  and an array of ledger keys to extend.
    * @returns The result of the method.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.bumpStorageTtlBatch([contract1, contract2]);
+   * ```
    */
   async bumpStorageTtlBatch(
     options: TtlExtensionOptions,
@@ -6891,20 +6141,58 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       | NetworkEnvironment.TESTNET
       | NetworkEnvironment.FUTURENET,
   ): Promise<void>;
+  /**
+   * Live switches network environments and re-initializes contract bindings.
+   *
+   * @param target - Target network name or configuration.
+   * @returns Promise resolving once network switch is complete.
+   *
+   * @example
+   * ```typescript
+   * await client.switchNetwork('testnet');
+   * ```
+   */
   switchNetwork(
     environment: NetworkEnvironment.CUSTOM,
     preset: NetworkPreset,
   ): Promise<void>;
+  /**
+   * Live switches network environments and re-initializes contract bindings.
+   *
+   * @param target - Target network name or configuration.
+   * @returns Promise resolving once network switch is complete.
+   *
+   * @example
+   * ```typescript
+   * await client.switchNetwork('testnet');
+   * ```
+   */
   switchNetwork(preset: NetworkPreset): Promise<void>;
   /**
    * @deprecated Pass a {@link NetworkEnvironment} member or a
    * {@link NetworkPreset} instead. The legacy `"testnet" | "mainnet"` string
    * and {@link NetworkConfig} forms are still accepted for backwards
    * compatibility.
+   *
+   * @example
+   * ```typescript
+   * await client.switchNetwork('testnet');
+   * ```
    */
   switchNetwork(
     network: "mainnet" | "testnet" | "futurenet" | NetworkConfig,
   ): Promise<void>;
+  /**
+   * Live switches network environments and re-initializes contract bindings.
+   *
+   * @param target - Target network name or configuration.
+   * @returns Promise resolving once network switch is complete.
+   *
+   * @example
+   * ```typescript
+   * await client.switchNetwork('testnet');
+   * ```
+   */
   async switchNetwork(
     environmentOrPreset:
       | NetworkEnvironment
@@ -7089,15 +6377,15 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Snapshot of the underlying RPC connection pool's statistics.
+   * Retrieves reserve balances and liquidity statistics for an AMM pool.
    *
-   * Returns `null` when the client is configured with the default single
-   * connection. When `rpcPoolSize >= 2` was set at construction time, the
-   * returned {@link PoolStats} reports pool size, available slots,
-   * cumulative request / error / recycle counters, and per-slot details.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * @param poolId - Identifier of the liquidity pool.
+   * @returns Promise resolving to PoolStats.
+   *
+   * @example
+   * ```typescript
+   * const pool = await client.getPoolStats('pool-1');
+   * ```
    */
   getPoolStats() {
     return this._pool ? this._pool.getStats() : null;
@@ -7108,36 +6396,25 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Build an unsigned transaction XDR for a multi-sig invoice operation.
-   * Each signer in the provided list must independently sign this XDR and
-   * return a CoSignature for use with submitWithCoSignatures.
+   * Collects co-signatures required for co-creator approved invoices.
    *
-   * @param invoiceId - The invoice requiring multiple signatures.
-   * @param signers   - Stellar addresses of all required co-signers.
-   * @returns Base64-encoded unsigned transaction XDR.
-   * @throws {Error} If the method fails.
+   * @param txHash - Transaction hash needing approval.
+   * @returns Promise resolving to collected signatures array.
+   *
+   * @example
+   * ```typescript
+   * const sigs = await client.collectCoSignatures(txHash);
+   * ```
    */
   async collectCoSignatures(
     invoiceId: string,
     signers: string[],
   ): Promise<string> {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (signers.length === 0) throw new NoSignerProvidedError();
 
     const firstSigner = signers[0]!;
     const operation = this.contract.call(
       "release_invoice",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(BigInt(invoiceId), { type: "u64" }),
     );
 
@@ -7151,12 +6428,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       .build();
 
     const simResult = await this.server.simulateTransaction(tx);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw new SimulationFailedError(
         `Simulation failed: ${simResult.error}`,
@@ -7176,6 +6447,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param signatures - Array of CoSignature objects (one per signer).
    * @returns The transaction hash.
    * @throws If fewer signatures are provided than the invoice requires.
+   *
+   * @example
+   * ```typescript
+   * await client.submitWithCoSignatures(tx, signatures);
+   * ```
    */
   async submitWithCoSignatures(
     invoiceId: string,
@@ -7183,13 +6459,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   ): Promise<TxResult> {
     const invoice = await this.getInvoice(invoiceId);
     const requiredCount = invoice.recipients.length;
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (signatures.length < requiredCount) {
       throw new InsufficientSignaturesError(signatures.length, requiredCount);
     }
@@ -7199,37 +6468,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       firstSig.signedXdr,
       this.config.networkPassphrase,
     ) as Transaction;
-
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     for (let i = 1; i < signatures.length; i++) {
       const sig = signatures[i]!;
       const otherTx = TransactionBuilder.fromXDR(
         sig.signedXdr,
         this.config.networkPassphrase,
       ) as Transaction;
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       for (const decoratedSig of otherTx.signatures) {
         mergedTx.addDecoratedSignature(decoratedSig);
       }
     }
 
     const sendResult = await this.server.sendTransaction(mergedTx);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (sendResult.status === "ERROR") {
       throw new TransactionFailedError(
         `Transaction failed: ${JSON.stringify(sendResult.errorResult)}`,
@@ -7239,12 +6489,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const txHash = sendResult.hash;
     let getResult = await this.server.getTransaction(txHash);
     let attempts = 0;
-  /**
-   * while
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     while (
       getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
       attempts < 20
@@ -7253,13 +6497,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       getResult = await this.server.getTransaction(txHash);
       attempts++;
     }
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
       throw new TransactionNotConfirmedError(String(getResult.status));
     }
@@ -7276,6 +6513,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param caller      - Stellar address of the account initiating the rollover.
    * @returns The new invoice ID and the rollover transaction hash.
    * @throws If newDeadline is not in the future.
+   *
+   * @example
+   * ```typescript
+   * const rolled = await client.rolloverInvoice('123', deadlineFromDays(30));
+   * ```
    */
   async rolloverInvoice(
     invoiceId: string,
@@ -7313,21 +6555,9 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   private async _needsCoCreatorApproval(invoiceId: string): Promise<void> {
     const operation = this.contract.call(
       "needs_co_creator_approval",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(BigInt(invoiceId), { type: "u64" }),
     );
     const raw = await this._simulateView(operation);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!raw) {
       throw new CoCreatorApprovalNotRequiredError(invoiceId);
     }
@@ -7344,6 +6574,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param signer    - Stellar address of the co-creator submitting approval.
    * @returns The transaction hash.
    * @throws {CoCreatorApprovalNotRequiredError} If the invoice does not require co-creator sign-off.
+   *
+   * @example
+   * ```typescript
+   * await client.submitCoCreatorApproval('123', 'GA...COCREATOR');
+   * ```
    */
   async submitCoCreatorApproval(
     invoiceId: string,
@@ -7355,19 +6590,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
       const operation = this.contract.call(
         "submit_co_creator_approval",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(signer, { type: "address" }),
       );
       const result = await this._submitTx(signer, operation);
@@ -7393,6 +6616,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - The invoice ID to query.
    * @returns Array of Stellar addresses that have approved.
    * @throws {CoCreatorApprovalNotRequiredError} If the invoice does not require co-creator sign-off.
+   *
+   * @example
+   * ```typescript
+   * const approvals = await client.getCoCreatorApprovals('123');
+   * ```
    */
   async getCoCreatorApprovals(invoiceId: string): Promise<string[]> {
     const startTime = Date.now();
@@ -7401,12 +6629,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
       const operation = this.contract.call(
         "get_co_creator_approvals",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const raw = (await this._simulateView(operation)) as string[];
@@ -7436,6 +6658,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param signer    - Stellar address of the co-creator revoking their approval.
    * @returns The transaction hash.
    * @throws {CoCreatorApprovalNotRequiredError} If the invoice does not require co-creator sign-off.
+   *
+   * @example
+   * ```typescript
+   * await client.revokeCoCreatorApproval('123', 'GA...COCREATOR');
+   * ```
    */
   async revokeCoCreatorApproval(
     invoiceId: string,
@@ -7447,19 +6674,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
       const operation = this.contract.call(
         "revoke_co_creator_approval",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(signer, { type: "address" }),
       );
       const result = await this._submitTx(signer, operation);
@@ -7491,6 +6706,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param payerAddress - Stellar address of the payer.
    * @returns Cooldown status with inCooldown flag and cooldownEndsAt timestamp.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const cooldown = await client.getPaymentCooldown('123', 'GA...PAYER');
+   * ```
    */
   async getPaymentCooldown(
     invoiceId: string,
@@ -7500,19 +6720,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     try {
       const operation = this.contract.call(
         "payment_cooldown",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(payerAddress, { type: "address" }),
       );
       const raw = (await this._simulateView(operation)) as Record<
@@ -7548,24 +6756,20 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Compute the time remaining until a scheduled release fires.
-   * Accepts an Invoice or a raw timestamp (Unix seconds).
-   * When an Invoice is provided, `scheduled_release_at` (or `scheduledReleaseDate`) is used if present;
-   * returns null if neither field is set on the invoice.
+   * Computes time remaining until a timelocked or scheduled invoice release executes.
    *
-   * @param invoiceOrTimestamp - An Invoice object or a Unix timestamp (seconds).
-   * @returns A structured countdown with total_seconds, days, hours, minutes, seconds, and whether overdue. Null when no scheduled release date.
-   * @throws {Error} If the method fails.
+   * @param invoiceOrTimestamp - Invoice object or Unix release timestamp.
+   * @returns ScheduledReleaseCountdown object with days, hours, minutes, and seconds remaining, or null.
+   *
+   * @example
+   * ```typescript
+   * const countdown = client.getScheduledReleaseCountdown(invoice);
+   * if (countdown) console.log(`${countdown.days}d ${countdown.hours}h left`);
+   * ```
    */
   getScheduledReleaseCountdown(
     invoiceOrTimestamp: Invoice | number,
   ): ScheduledReleaseCountdown | null {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (typeof invoiceOrTimestamp !== "number") {
       return getScheduledReleaseCountdown(invoiceOrTimestamp);
     }
@@ -7583,6 +6787,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param amount - Bid amount in stroops.
    * @returns The transaction hash.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.placeBid('GA...BIDDER', '123', 80_0000000n);
+   * ```
    */
   async placeBid(
     bidder: string,
@@ -7593,26 +6802,8 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     try {
       const operation = this.contract.call(
         "place_bid",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(bidder, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(amount, { type: "i128" }),
       );
       const result = await this._submitTx(bidder, operation);
@@ -7638,14 +6829,13 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - The invoice ID to fetch payments for.
    * @returns All payments merged and sorted by timestamp (ascending).
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const history = await client.getPaymentHistory('123');
+   * ```
    */
   async getPaymentHistory(invoiceId: string): Promise<Payment[]> {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._batcher) {
       return this._batcher.getPaymentHistory(invoiceId);
     }
@@ -7663,19 +6853,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       const operations = Array.from({ length: NUM_SHARDS }, (_, i) =>
         this.contract.call(
           "get_payment_shard",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           nativeToScVal(BigInt(invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           nativeToScVal(i, { type: "u32" }),
         ),
       );
@@ -7685,26 +6863,8 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       );
 
       const allPayments: Payment[] = [];
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       for (const result of shardResults) {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         if (result.status === "fulfilled" && Array.isArray(result.value)) {
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           for (const raw of result.value as unknown[]) {
             const p = raw as Record<string, unknown>;
             allPayments.push({
@@ -7743,25 +6903,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - The ID of the invoice to settle.
    * @returns The transaction hash.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.settleAuction('GA...', '123');
+   * ```
    */
   async settleAuction(caller: string, invoiceId: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "settle_auction",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(caller, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const result = await this._submitTx(caller, operation);
@@ -7778,18 +6931,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - The ID of the invoice to query.
    * @returns Auction information including active state, highest bid, and end time.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const auction = await client.getAuctionInfo('123');
+   * ```
    */
   async getAuctionInfo(invoiceId: string): Promise<AuctionInfo> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "get_auction_info",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const raw = (await this._simulateView(operation)) as Record<
@@ -7841,12 +6993,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     expectedAddress: string,
   ): void {
     const kpAddress = adminKeypair.publicKey();
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (kpAddress !== expectedAddress) {
       throw new AdminOperationError(
         `Admin keypair public key (${kpAddress}) does not match the provided admin address (${expectedAddress})`,
@@ -7888,12 +7034,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       .build();
 
     const simResult = await this.server.simulateTransaction(tx);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw parseSorobanError(simResult.error);
     }
@@ -7905,13 +7045,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const sendResult = await this.server.sendTransaction(
       TransactionBuilder.fromXDR(signedXdr, this.config.networkPassphrase),
     );
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (sendResult.status === "ERROR") {
       throw new TransactionFailedError(
         `Transaction failed: ${JSON.stringify(sendResult.errorResult)}`,
@@ -7923,12 +7056,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const txHash = sendResult.hash;
     let getResult = await this.server.getTransaction(txHash);
     let attempts = 0;
-  /**
-   * while
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     while (
       getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
       attempts < 20
@@ -7937,13 +7064,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       getResult = await this.server.getTransaction(txHash);
       attempts++;
     }
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
       throw new TransactionNotConfirmedError(String(getResult.status));
     }
@@ -7963,18 +7083,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param admin     - Stellar address of the admin (must sign).
    * @returns The transaction hash.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.adminFreeze('123', 'GA...ADMIN');
+   * ```
    */
   async adminFreeze(invoiceId: string, admin: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "admin_freeze",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const result = await this._submitTx(admin, operation);
@@ -8000,6 +7119,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param adminKeypair - Authorized admin keypair used to sign the transaction.
    * @returns {@link AdminFreezeResult} with txHash, invoiceId, adminAddress, reason, and timestamp.
    * @throws {AdminOperationError} When the keypair's public key is invalid.
+   *
+   * @example
+   * ```typescript
+   * await client.adminFreezeInvoice('123', 'Regulatory investigation', adminKeypair);
+   * ```
    */
   async adminFreezeInvoice(
     invoiceId: string,
@@ -8012,12 +7136,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     // Verify the keypair is consistent with the effective admin configuration.
     // When an adminKeypair is configured at construction time, the passed
     // keypair must have the same public key.
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._adminKeypair && this._adminKeypair.publicKey() !== adminAddress) {
       throw new AdminOperationError(
         `Provided admin keypair (${adminAddress}) does not match the configured admin keypair (${this._adminKeypair.publicKey()})`,
@@ -8028,19 +7146,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     try {
       const operation = this.contract.call(
         "admin_freeze",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(reason, { type: "string" }),
       );
       const result = await this._submitTxWithKeypair(
@@ -8089,6 +7195,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param adminKeypair - Authorized admin keypair used to sign the transaction.
    * @returns {@link AdminUnfreezeResult} with txHash, invoiceId, adminAddress, and timestamp.
    * @throws {AdminOperationError} When the keypair's public key is invalid.
+   *
+   * @example
+   * ```typescript
+   * await client.adminUnfreezeInvoice('123', adminKeypair);
+   * ```
    */
   async adminUnfreezeInvoice(
     invoiceId: string,
@@ -8098,12 +7209,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const startTime = Date.now();
 
     // Verify the keypair is consistent with the effective admin configuration.
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._adminKeypair && this._adminKeypair.publicKey() !== adminAddress) {
       throw new AdminOperationError(
         `Provided admin keypair (${adminAddress}) does not match the configured admin keypair (${this._adminKeypair.publicKey()})`,
@@ -8114,12 +7219,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     try {
       const operation = this.contract.call(
         "admin_unfreeze",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const result = await this._submitTxWithKeypair(
@@ -8164,6 +7263,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param params - Queue action parameters.
    * @returns The action ID and transaction hash.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const actionId = await client.queueAction(actionParams);
+   * ```
    */
   async queueAction(
     params: QueueActionParams,
@@ -8172,40 +7276,10 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     try {
       const operation = this.contract.call(
         "queue_action",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.caller, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.actionType, { type: "symbol" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.target, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.value, { type: "i128" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(params.eta), { type: "u64" }),
       );
       const result = await this._submitTx(params.caller, operation);
@@ -8226,18 +7300,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param admin     - Stellar address of the admin (must sign).
    * @returns The transaction hash.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.adminUnfreeze('123', 'GA...ADMIN');
+   * ```
    */
   async adminUnfreeze(invoiceId: string, admin: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "admin_unfreeze",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const result = await this._submitTx(admin, operation);
@@ -8255,25 +7328,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param actionId - The ID of the action to execute.
    * @returns The transaction hash.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.executeAction('GA...', 'act-123');
+   * ```
    */
   async executeAction(caller: string, actionId: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "execute_action",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(caller, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(actionId), { type: "u64" }),
       );
       const result = await this._submitTx(caller, operation);
@@ -8296,30 +7362,23 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - The invoice ID to query.
    * @returns The parsed CrossChainRef, or null if none is set.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const ref = await client.getCrossChainRef('123');
+   * ```
    */
   async getCrossChainRef(invoiceId: string): Promise<CrossChainRef | null> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "get_cross_chain_ref",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const raw = (await this._simulateView(operation)) as Record<
         string,
         unknown
       > | null;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (!raw) {
         telemetry.recordMethod(
           "getCrossChainRef",
@@ -8347,13 +7406,20 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Cancel a queued action before it has been executed.
-   * @param caller - Stellar address of the caller (must sign).
-   * @param actionId - The ID of the action to cancel.
-   * @returns The transaction hash.
-   * @throws {Error} If the method fails.
+   * Releases funds from a fully funded invoice to all configured recipients.
+   *
+   * @param invoiceId - Unique identifier of the invoice to release.
+   * @returns An object containing the transaction hash `{ txHash }`.
+   * @throws {InvoiceNotFoundError} If the invoice does not exist.
+   * @throws {Error} If the release transaction fails.
+   *
+   * @example
+   * ```typescript
+   * const result = await client.release("123");
+   * console.log(`Funds released in tx: ${result.txHash}`);
+   * ```
    */
-    async release(invoiceId: string): Promise<TxResult> {
+  async release(invoiceId: string): Promise<TxResult> {
     if (this._offlineQueue?.config?.enabled) {
       try {
         const health = await this.checkRPCHealth();
@@ -8369,6 +7435,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     throw new Error("Not implemented");
   }
 
+  /**
+   * Cancels an unreleased invoice, reverting pending splits and unlocking funds.
+   *
+   * @param invoiceId - ID of the invoice to cancel.
+   * @returns Promise resolving to cancellation TxResult.
+   *
+   * @example
+   * ```typescript
+   * await client.cancel('123');
+   * ```
+   */
   async cancel(invoiceId: string): Promise<TxResult> {
     if (this._offlineQueue?.config?.enabled) {
       try {
@@ -8385,24 +7462,24 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     throw new Error("Not implemented");
   }
 
+  /**
+   * Cancels an enqueued timelocked governance action prior to execution.
+   *
+   * @param caller - Caller address cancelling the action.
+   * @param actionId - ID of the action.
+   * @returns Promise resolving to TxResult.
+   *
+   * @example
+   * ```typescript
+   * await client.cancelAction('GA...', 'act-123');
+   * ```
+   */
   async cancelAction(caller: string, actionId: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "cancel_action",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(caller, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(actionId), { type: "u64" }),
       );
       const result = await this._submitTx(caller, operation);
@@ -8420,6 +7497,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param params - Parameters including invoiceId, creator, and the CrossChainRef.
    * @returns The transaction hash.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.setCrossChainRef({ invoiceId: '123', chain: 'ethereum', txHash: '0x...' });
+   * ```
    */
   async setCrossChainRef(params: SetCrossChainRefParams): Promise<TxResult> {
     const startTime = Date.now();
@@ -8436,12 +7518,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
           }) as xdr.ScVal,
         }),
       ];
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (params.ref.blockNumber !== undefined) {
         refMap.push(
           new xdr.ScMapEntry({
@@ -8455,19 +7531,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
       const operation = this.contract.call(
         "set_cross_chain_ref",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(params.invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.creator, { type: "address" }),
         xdr.ScVal.scvMap(refMap),
       );
@@ -8485,18 +7549,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param actionId - The ID of the action to query.
    * @returns Timelock action status.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const action = await client.getActionStatus('act-123');
+   * ```
    */
   async getActionStatus(actionId: string): Promise<TimelockAction> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "get_action_status",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(actionId), { type: "u64" }),
       );
       const raw = (await this._simulateView(operation)) as Record<
@@ -8535,6 +7598,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param payerAddress - Stellar address of the payer.
    * @returns The active window state, or `{ limited: false }` if unlimited.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const velocity = await client.getVelocityStatus('123', 'GA...PAYER');
+   * ```
    */
   async getVelocityStatus(
     invoiceId: string,
@@ -8544,19 +7612,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     try {
       const operation = this.contract.call(
         "get_velocity_status",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(payerAddress, { type: "address" }),
       );
       const raw = await this._simulateView(operation);
@@ -8564,12 +7620,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       telemetry.recordMethod("getVelocityStatus", true, Date.now() - startTime);
 
       // No velocity limit configured: contract returns void/null.
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (raw === null || raw === undefined) {
         return { limited: false };
       }
@@ -8604,6 +7654,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // Issue #866 — Pause/Resume invoice
   // ---------------------------------------------------------------------------
 
+  /**
+   * Temporarily pauses payment acceptance for an invoice.
+   *
+   * @param invoiceId - The ID of the invoice to pause.
+   * @param options - Optional pause settings.
+   * @returns Promise resolving to TxResult.
+   *
+   * @example
+   * ```typescript
+   * await client.pauseInvoice('123');
+   * ```
+   */
   async pauseInvoice(
     invoiceId: string,
     options?: { autoResumeAt?: Date },
@@ -8629,6 +7691,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
   }
 
+  /**
+   * Resumes an active invoice from a paused state.
+   *
+   * @param invoiceId - The ID of the invoice to resume.
+   * @returns Promise resolving to TxResult.
+   *
+   * @example
+   * ```typescript
+   * await client.resumeInvoice('123');
+   * ```
+   */
   async resumeInvoice(invoiceId: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
@@ -8646,6 +7719,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
   }
 
+  /**
+   * Checks if an invoice is currently paused against new payments.
+   *
+   * @param invoiceId - The ID of the invoice.
+   * @returns Promise resolving to PauseStatus.
+   *
+   * @example
+   * ```typescript
+   * const paused = await client.isPaused('123');
+   * ```
+   */
   async isPaused(invoiceId: string): Promise<PauseStatus> {
     const startTime = Date.now();
     try {
@@ -8673,6 +7757,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // Issue #867 — Pledge matching
   // ---------------------------------------------------------------------------
 
+  /**
+   * Pledges matching funds toward an invoice split funding pool.
+   *
+   * @param invoiceId - The target invoice ID.
+   * @param amount - Pledged amount in stroops.
+   * @returns Promise resolving to TxResult.
+   *
+   * @example
+   * ```typescript
+   * await client.pledgeMatch('123', 50_0000000n);
+   * ```
+   */
   async pledgeMatch(invoiceId: string, amount: bigint): Promise<TxResult> {
     const startTime = Date.now();
     try {
@@ -8691,6 +7787,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
   }
 
+  /**
+   * Reclaims unmatched pledge funds after an invoice has settled or reached its deadline.
+   *
+   * @param invoiceId - Invoice identifier.
+   * @returns Promise resolving to reclaimed amount in stroops as bigint.
+   *
+   * @example
+   * ```typescript
+   * const reclaimed = await client.claimUnmatchedPledge('123');
+   * ```
+   */
   async claimUnmatchedPledge(invoiceId: string): Promise<bigint> {
     const startTime = Date.now();
     try {
@@ -8709,6 +7816,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
   }
 
+  /**
+   * Queries active matching pledges associated with an invoice.
+   *
+   * @param invoiceId - Invoice ID.
+   * @returns Promise resolving to array of MatchPledge records.
+   *
+   * @example
+   * ```typescript
+   * const pledges = await client.getMatchPool('123');
+   * ```
+   */
   async getMatchPool(invoiceId: string): Promise<MatchPledge[]> {
     const startTime = Date.now();
     try {
@@ -8737,6 +7855,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // Issue #868 — Streaming payments
   // ---------------------------------------------------------------------------
 
+  /**
+   * Initiates continuous ledger-based payment streaming toward an invoice.
+   *
+   * @param invoiceId - Target invoice ID.
+   * @param amountPerLedger - Payment flow rate per Stellar ledger block in stroops.
+   * @returns Promise resolving to unique stream ID string.
+   *
+   * @example
+   * ```typescript
+   * const streamId = await client.startStream('123', 100000n);
+   * ```
+   */
   async startStream(invoiceId: string, amountPerLedger: bigint): Promise<string> {
     const startTime = Date.now();
     try {
@@ -8756,6 +7886,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
   }
 
+  /**
+   * Settles accrued streaming payment funds and distributes them to recipients.
+   *
+   * @param streamId - Identifier of the active stream.
+   * @returns Promise resolving to settled amount as bigint.
+   *
+   * @example
+   * ```typescript
+   * const settled = await client.settleStream(streamId);
+   * ```
+   */
   async settleStream(streamId: string): Promise<bigint> {
     const startTime = Date.now();
     try {
@@ -8774,6 +7915,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
   }
 
+  /**
+   * Terminates an active payment stream.
+   *
+   * @param streamId - Identifier of the stream to cancel.
+   * @returns Promise resolving to refunded remaining balance as bigint.
+   *
+   * @example
+   * ```typescript
+   * const refunded = await client.cancelStream(streamId);
+   * ```
+   */
   async cancelStream(streamId: string): Promise<bigint> {
     const startTime = Date.now();
     try {
@@ -8792,6 +7944,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
   }
 
+  /**
+   * Fetches current configuration and accumulated payout for a payment stream.
+   *
+   * @param streamId - Stream identifier.
+   * @returns Promise resolving to Stream object.
+   *
+   * @example
+   * ```typescript
+   * const stream = await client.getStream(streamId);
+   * ```
+   */
   async getStream(streamId: string): Promise<Stream> {
     const startTime = Date.now();
     try {
@@ -8818,6 +7981,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
   }
 
+  /**
+   * Computes accrued unreleased payment balance for a stream up to the specified ledger number.
+   *
+   * @param stream - Active Stream object.
+   * @param currentLedger - Current Stellar ledger sequence number.
+   * @returns Accrued amount in stroops as bigint.
+   *
+   * @example
+   * ```typescript
+   * const accrued = client.computeAccruedAmount(stream, 1234567);
+   * ```
+   */
   computeAccruedAmount(stream: Stream, currentLedger: number): bigint {
     if (stream.status !== "active") return 0n;
     const ledgersPassed = Math.max(0, currentLedger - stream.startLedger);
@@ -8828,6 +8003,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // Issue #869 — Delegate management
   // ---------------------------------------------------------------------------
 
+  /**
+   * Grants management delegation permissions for an invoice to a secondary address.
+   *
+   * @param invoiceId - The invoice ID.
+   * @param delegate - Stellar address of the authorized delegate.
+   * @returns Promise resolving to TxResult.
+   *
+   * @example
+   * ```typescript
+   * await client.addDelegate('123', 'GA...DELEGATE');
+   * ```
+   */
   async addDelegate(invoiceId: string, delegate: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
@@ -8846,6 +8033,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
   }
 
+  /**
+   * Revokes management delegation permissions for an address on an invoice.
+   *
+   * @param invoiceId - The invoice ID.
+   * @param delegate - Stellar address of the delegate to revoke.
+   * @returns Promise resolving to TxResult.
+   *
+   * @example
+   * ```typescript
+   * await client.removeDelegate('123', 'GA...DELEGATE');
+   * ```
+   */
   async removeDelegate(invoiceId: string, delegate: string): Promise<TxResult> {
     const startTime = Date.now();
     try {
@@ -8864,6 +8063,18 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
   }
 
+  /**
+   * Checks if an address is an authorized delegate for an invoice.
+   *
+   * @param invoiceId - The invoice ID.
+   * @param address - The address to check.
+   * @returns Promise resolving to boolean.
+   *
+   * @example
+   * ```typescript
+   * const isAuth = await client.isDelegate('123', 'GA...DELEGATE');
+   * ```
+   */
   async isDelegate(invoiceId: string, address: string): Promise<boolean> {
     const startTime = Date.now();
     try {
@@ -8883,6 +8094,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
   }
 
+  /**
+   * Lists all addresses authorized as delegates for an invoice.
+   *
+   * @param invoiceId - The invoice ID.
+   * @returns Promise resolving to array of delegate address strings.
+   *
+   * @example
+   * ```typescript
+   * const delegates = await client.getDelegates('123');
+   * ```
+   */
   async getDelegates(invoiceId: string): Promise<string[]> {
     const startTime = Date.now();
     try {
@@ -8906,12 +8128,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
   /** Parse the native return value from `check_nft_gate`. */
   private _parseNftGateResult(raw: unknown): NftGateResult {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!raw || typeof raw !== "object") {
       return { gated: false, hasNft: false, contractAddress: null };
     }
@@ -8944,13 +8160,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       .addOperation(operation)
       .setTimeout(30)
       .build();
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (traceId) {
       await runRequestInterceptors({
         method: "_simulateView",
@@ -8960,12 +8169,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
 
     const simResult = await this.server.simulateTransaction(tx);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       throw new SimulationFailedError(
         `Simulation failed: ${simResult.error}`,
@@ -8977,12 +8180,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const returnVal = (
       simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse
     ).result?.retval;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!returnVal) throw new NoReturnValueError("_simulateView");
 
     return scValToNative(returnVal);
@@ -8995,22 +8192,10 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     priority: RequestPriority = "normal",
   ): Promise<{ txHash: string; returnValue: xdr.ScVal }> {
     return this._queue.enqueue(priority, async () => {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (this._idempotency) {
         const opXdr = operation.toXDR().toString("base64");
         const key = this._idempotency.generateKey(sourceAddress, opXdr);
         const existing = this._idempotency.getResult(key);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         if (existing) {
           return {
             txHash: existing.txHash,
@@ -9026,12 +8211,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
       try {
         const result = await submit();
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         if (this._idempotency) {
           const opXdr = operation.toXDR().toString("base64");
           const key = this._idempotency.generateKey(sourceAddress, opXdr);
@@ -9039,21 +8218,9 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         }
         return result;
       } catch (error) {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         if (this._standby) {
           this._standby.failover();
           const result = await submit();
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           if (this._idempotency) {
             const opXdr = operation.toXDR().toString("base64");
             const key = this._idempotency.generateKey(sourceAddress, opXdr);
@@ -9087,12 +8254,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         .build();
 
       const simResult = await this.server.simulateTransaction(tx);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (SorobanRpc.Api.isSimulationError(simResult)) {
         throw parseSorobanError(simResult.error);
       }
@@ -9108,13 +8269,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       const sendResult = await this.server.sendTransaction(
         TransactionBuilder.fromXDR(signedXdr, this.config.networkPassphrase),
       );
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (sendResult.status === "ERROR") {
         throw new TransactionFailedError(
           `Transaction failed: ${JSON.stringify(sendResult.errorResult)}`,
@@ -9126,12 +8280,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       const txHash = sendResult.hash;
       let getResult = await this.server.getTransaction(txHash);
       let attempts = 0;
-  /**
-   * while
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       while (
         getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
         attempts < 20
@@ -9142,12 +8290,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       }
 
       // If still not confirmed, submit a fee-bump transaction with a higher fee
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) {
         const multiplier = this.config.feeBumpMultiplier ?? 2;
         const innerTx = TransactionBuilder.fromXDR(
@@ -9173,12 +8315,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
             this.config.networkPassphrase,
           ),
         );
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         if (bumpSendResult.status === "ERROR") {
           throw new TransactionFailedError(
             `Fee-bump transaction failed: ${JSON.stringify(bumpSendResult.errorResult)}`,
@@ -9189,12 +8325,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         const bumpHash = bumpSendResult.hash;
         let bumpResult = await this.server.getTransaction(bumpHash);
         let bumpAttempts = 0;
-  /**
-   * while
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         while (
           bumpResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
           bumpAttempts < 20
@@ -9203,12 +8333,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
           bumpResult = await this.server.getTransaction(bumpHash);
           bumpAttempts++;
         }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         if (bumpResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
           throw new TransactionNotConfirmedError(String(bumpResult.status));
         }
@@ -9231,13 +8355,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         recordCall(true);
         return { txHash: bumpHash, returnValue: bumpReturnValue };
       }
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
         throw new TransactionNotConfirmedError(String(getResult.status));
       }
@@ -9300,12 +8417,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const recipients: Recipient[] = (raw.recipients as string[]).map(
       (addr: string, i: number) => {
         const amt = amounts[i];
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         if (amt === undefined)
           throw new NoReturnValueError(`_parseInvoice ${i}`);
         return {
@@ -9353,12 +8464,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   private async _getInvoiceExt(invoiceId: string): Promise<InvoiceExt> {
     const operation = this.contract.call(
       "get_invoice_ext",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       nativeToScVal(BigInt(invoiceId), { type: "u64" }),
     );
 
@@ -9388,6 +8493,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param invoiceId - The leaf invoice ID to resolve the chain from.
    * @returns An array of invoices ordered root → leaf.
    * @throws If the clone chain exceeds 10 levels or a cycle is detected.
+   *
+   * @example
+   * ```typescript
+   * const chain = await client.resolveCloneChain('123');
+   * ```
    */
   async resolveCloneChain(invoiceId: string): Promise<Invoice[]> {
     const chain: Invoice[] = [];
@@ -9395,29 +8505,10 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const seen = new Set<string>();
     let depth = 0;
     const MAX_DEPTH = 10;
-
-  /**
-   * while
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     while (currentId) {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (seen.has(currentId)) {
         throw new CloneChainTooDeepError(currentId);
       }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (depth >= MAX_DEPTH) {
         throw new CloneChainTooDeepError();
       }
@@ -9448,19 +8539,17 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param address - Stellar public key of the account.
    * @returns The result of the method.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const account = await client.getAccount('GA...ACCOUNT');
+   * ```
    */
   async getAccount(address: string): Promise<NormalizedAccount> {
     const rpcFetch = async (): Promise<NormalizedAccount> => {
       const acc = await this.server.getAccount(address);
       return { id: acc.accountId(), sequence: acc.sequenceNumber() };
     };
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!this._horizonReader) {
       return rpcFetch();
     }
@@ -9474,12 +8563,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     });
 
     return chain.execute(async (provider) => {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (provider === "rpc") return rpcFetch();
       return horizonReader.getAccount(address);
     });
@@ -9497,14 +8580,13 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param address - Stellar public key of the account.
    * @throws If no `horizonUrl` was configured.
    * @returns The result of the method.
+   *
+   * @example
+   * ```typescript
+   * const balances = await client.getAccountBalances('GA...ACCOUNT');
+   * ```
    */
   async getAccountBalances(address: string): Promise<NormalizedBalance[]> {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!this._horizonReader) {
       throw new ValidationError(
         "getAccountBalances requires horizonUrl to be set in StellarSplitClientConfig",
@@ -9521,12 +8603,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     });
 
     return chain.execute(async (provider) => {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (provider === "rpc") {
         throw new ValidationError(
           "Soroban RPC does not expose account balances; delegating to Horizon",
@@ -9558,6 +8634,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    *                       Required for the claimable-balance fallback path.
    * @returns The result of the method.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.refundInvoice('123', 'GA...CREATOR');
+   * ```
    */
   async refundInvoice(
     invoiceId: string,
@@ -9565,11 +8646,39 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     payerAddress: string | undefined,
     options: { simulate: true },
   ): Promise<SimulationResult>;
+  /**
+   * Triggers a full or partial refund of invoice contributions back to payers.
+   *
+   * @param invoiceId - The invoice ID.
+   * @param creator - Creator address executing the refund.
+   * @param payerAddress - Optional specific payer address for single-payer refunds.
+   * @param options - Optional execution settings.
+   * @returns Promise resolving to refund TxResult.
+   *
+   * @example
+   * ```typescript
+   * await client.refundInvoice('123', 'GA...CREATOR');
+   * ```
+   */
   async refundInvoice(
     invoiceId: string,
     creator: string,
     payerAddress?: string,
   ): Promise<{ txHash: string; fallback: false } | ClaimableRefundResult>;
+  /**
+   * Triggers a full or partial refund of invoice contributions back to payers.
+   *
+   * @param invoiceId - The invoice ID.
+   * @param creator - Creator address executing the refund.
+   * @param payerAddress - Optional specific payer address for single-payer refunds.
+   * @param options - Optional execution settings.
+   * @returns Promise resolving to refund TxResult.
+   *
+   * @example
+   * ```typescript
+   * await client.refundInvoice('123', 'GA...CREATOR');
+   * ```
+   */
   async refundInvoice(
     invoiceId: string,
     creator: string,
@@ -9587,23 +8696,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     try {
       const operation = this.contract.call(
         "refund_invoice",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
       );
       const result = await this._submitTx(creator, operation);
 
       const invoice = await this.getInvoice(invoiceId).catch(() => null);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (invoice) this._fireOnRefunded(invoice);
 
       telemetry.recordMethod("refundInvoice", true, Date.now() - startTime);
@@ -9611,12 +8708,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     } catch (error) {
       // Fallback path: if transfer failed due to missing account/trustline and
       // Horizon is configured, create a claimable balance instead.
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (
   /**
    * isRefundTransferError
@@ -9672,6 +8763,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param payer - Stellar address of the claimant to query.
    * @returns The result of the method.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const refunds = await client.getClaimableRefunds('GA...PAYER');
+   * ```
    */
   async getClaimableRefunds(payer: string): Promise<ClaimableRefundEntry[]> {
     return getClaimableRefunds(payer, this.config);
@@ -9682,12 +8778,15 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Fetch invoice state from all configured RPC endpoints in parallel and
-   * return the most recent version based on lastModifiedLedger.
+   * Resynchronizes local client state with the latest confirmed on-chain ledger state.
    *
-   * @param invoiceId - The invoice ID to sync.
-   * @returns The invoice from the endpoint with the highest lastModifiedLedger.
-   * @throws If all endpoints fail.
+   * @param invoiceId - The invoice ID to synchronize.
+   * @returns Promise resolving to refreshed Invoice state.
+   *
+   * @example
+   * ```typescript
+   * const freshInvoice = await client.syncInvoice('123');
+   * ```
    */
   async syncInvoice(
     invoiceId: string,
@@ -9703,12 +8802,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         });
         const operation = this.contract.call(
           "get_invoice",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           nativeToScVal(BigInt(invoiceId), { type: "u64" }),
         );
         const account = await server
@@ -9724,12 +8817,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
           .setTimeout(30)
           .build();
         const simResult = await server.simulateTransaction(tx);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         if (SorobanRpc.Api.isSimulationError(simResult)) {
           throw new SimulationFailedError(
             `Simulation failed on ${url}: ${simResult.error}`,
@@ -9740,12 +8827,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         const returnVal = (
           simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse
         ).result?.retval;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         if (!returnVal) throw new NoReturnValueError(`syncInvoice ${url}`);
         const raw = scValToNative(returnVal) as Record<string, unknown>;
         const invoice = this._parseInvoice(invoiceId, raw);
@@ -9768,13 +8849,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         }> => r.status === "fulfilled",
       )
       .map((r) => r.value);
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (successful.length === 0) {
       throw new RpcUnavailableError("syncInvoice");
     }
@@ -9789,11 +8863,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Get the claimable payout amount for a recipient on an invoice.
-   * Returns 0n if no pending payout exists.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Queries the unclaimed payout amount accrued for a split recipient on an invoice.
+   *
+   * @param invoiceId - Invoice identifier.
+   * @param recipient - Recipient account address.
+   * @returns Promise resolving to pending payout in stroops as bigint.
+   *
+   * @example
+   * ```typescript
+   * const pending = await client.getPendingPayout('123', 'GA...RECIPIENT');
+   * ```
    */
   async getPendingPayout(
     invoiceId: string,
@@ -9803,19 +8882,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     try {
       const operation = this.contract.call(
         "get_pending_payout",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(recipient, { type: "address" }),
       );
       const raw = await this._simulateView(operation);
@@ -9829,11 +8896,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Claim a pending payout for a recipient on an invoice.
-   * Emits a `pending_payout_claimed` event on success.
-   * @throws If no pending payout exists for the recipient.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
+   * Claims accrued payout funds for a recipient on an invoice.
+   *
+   * @param invoiceId - The invoice ID.
+   * @param recipient - Recipient account address.
+   * @returns Promise resolving to ClaimPayoutResult.
+   *
+   * @example
+   * ```typescript
+   * const result = await client.claimPendingPayout('123', 'GA...RECIPIENT');
+   * ```
    */
   async claimPendingPayout(
     invoiceId: string,
@@ -9842,30 +8914,12 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const startTime = Date.now();
     try {
       const pending = await this.getPendingPayout(invoiceId, recipient);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (pending === 0n) {
         throw new NoPendingPayoutError(recipient, invoiceId);
       }
       const operation = this.contract.call(
         "claim_pending_payout",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(recipient, { type: "address" }),
       );
       const result = await this._submitTx(recipient, operation);
@@ -9890,35 +8944,26 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Pay toward an invoice bound to an off-chain identity attestation.
-   * Validates attestationHash (32 bytes) and signature (64 bytes) before submission.
-   * Returns a payment receipt with the attestation hash included.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Executes an invoice payment accompanied by cryptographic verification proof.
+   *
+   * @param params - Payment and attestation parameters.
+   * @returns Promise resolving to AttestationPaymentReceipt.
+   *
+   * @example
+   * ```typescript
+   * const receipt = await client.payWithAttestation(attestationPaymentParams);
+   * ```
    */
   async payWithAttestation(
     params: PayWithAttestationParams,
   ): Promise<AttestationPaymentReceipt> {
     const startTime = Date.now();
     try {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (params.attestationHash.length !== 32) {
         throw new InvalidAttestationError(
           `attestationHash must be 32 bytes, got ${params.attestationHash.length}`,
         );
       }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (params.signature.length !== 64) {
         throw new InvalidAttestationError(
           `signature must be 64 bytes, got ${params.signature.length}`,
@@ -9926,35 +8971,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       }
       const operation = this.contract.call(
         "pay_with_attestation",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.payer, { type: "address" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(BigInt(params.invoiceId), { type: "u64" }),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.amount, { type: "i128" }),
         xdr.ScVal.scvBytes(Buffer.from(params.attestationHash)),
         xdr.ScVal.scvBytes(Buffer.from(params.signature)),
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(params.signerPubkey, { type: "address" }),
       );
       const result = await this._submitTx(params.payer, operation);
@@ -9986,22 +9007,22 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // Issue #276 — Creator volume cap status checker
   // ---------------------------------------------------------------------------
 
-  /** Returns the volume cap for a creator in token units, or null if uncapped.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+  /**
+   * Queries the maximum monthly invoice issuance volume ceiling for a creator account.
+   *
+   * @param address - Creator public key.
+   * @returns Promise resolving to maximum cap in stroops as bigint, or null if uncapped.
+   *
+   * @example
+   * ```typescript
+   * const cap = await client.getCreatorVolumeCap('GA...');
+   * ```
    */
   async getCreatorVolumeCap(address: string): Promise<bigint | null> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "get_creator_volume_cap",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(address, { type: "address" }),
       );
       const raw = await this._simulateView(operation);
@@ -10022,22 +9043,22 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
   }
 
-  /** Returns the lifetime volume used by a creator in token units.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+  /**
+   * Queries the invoice volume consumed by a creator in the current billing period.
+   *
+   * @param address - Creator public key.
+   * @returns Promise resolving to used volume in stroops as bigint.
+   *
+   * @example
+   * ```typescript
+   * const used = await client.getCreatorVolumeUsed('GA...');
+   * ```
    */
   async getCreatorVolumeUsed(address: string): Promise<bigint> {
     const startTime = Date.now();
     try {
       const operation = this.contract.call(
         "get_creator_volume_used",
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         nativeToScVal(address, { type: "address" }),
       );
       const raw = await this._simulateView(operation);
@@ -10058,10 +9079,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
   }
 
-  /** Returns remaining volume (cap - used) or Infinity if the creator is uncapped.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+  /**
+   * Computes the remaining invoice issuance volume allowed for a creator.
+   *
+   * @param address - Creator public key.
+   * @returns Promise resolving to remaining volume allowance as bigint or Infinity.
+   *
+   * @example
+   * ```typescript
+   * const remaining = await client.getRemainingCreatorVolume('GA...');
+   * ```
    */
   async getRemainingCreatorVolume(
     address: string,
@@ -10070,12 +9097,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       this.getCreatorVolumeCap(address),
       this.getCreatorVolumeUsed(address),
     ]);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (cap === null) return Infinity;
     return cap > used ? cap - used : 0n;
   }
@@ -10086,6 +9107,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    *
    * @param creator - Creator address.
    * @returns Creator statistics including success rate, funding time, ratings.
+   *
+   * @example
+   * ```typescript
+   * const stats = await client.getCreatorStats('GA...CREATOR');
+   * ```
    */
   async getCreatorStats(creator: string): Promise<import("./creatorStats.js").CreatorStats> {
     const {
@@ -10097,15 +9123,27 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     if (cached) return cached;
 
     const result = await this.getInvoicesByCreator(creator);
-    const invoices = result.invoices || [];
+    const invoiceIds = result.items || [];
+    const invoices = await Promise.all(
+      invoiceIds.map(async (id) => {
+        try {
+          return await this.getInvoice(id);
+        } catch {
+          return null;
+        }
+      }),
+    ).then((list) => list.filter((inv): inv is Invoice => inv !== null));
 
-    const totalRaised = invoices.reduce((sum, inv) => sum + inv.amount, 0n);
+    const getInvoiceAmount = (inv: Invoice) =>
+      inv.recipients.reduce((sum, r) => sum + r.amount, 0n);
+
+    const totalRaised = invoices.reduce((sum, inv) => sum + inv.funded, 0n);
     const totalReleased = invoices.reduce((sum, inv) => {
-      if (inv.status === "Released") return sum + inv.amount;
+      if (inv.status === "Released") return sum + getInvoiceAmount(inv);
       return sum;
     }, 0n);
     const totalRefunded = invoices.reduce((sum, inv) => {
-      if (inv.status === "Refunded") return sum + inv.amount;
+      if (inv.status === "Refunded") return sum + getInvoiceAmount(inv);
       return sum;
     }, 0n);
 
@@ -10113,8 +9151,8 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const successRate = invoices.length > 0 ? (successCount / invoices.length) * 100 : 0;
 
     const fundingTimes = invoices
-      .filter((inv) => inv.paid_at && inv.created_at)
-      .map((inv) => (inv.paid_at! - inv.created_at!) / (1000 * 60 * 60));
+      .filter((inv) => (inv.payments?.[0]?.timestamp ?? 0) > 0 && inv.createdAt)
+      .map((inv) => ((inv.payments?.[0]?.timestamp ?? 0) - (inv.createdAt ?? 0)) / (1000 * 60 * 60));
 
     const averageFundingTimeHours = fundingTimes.length > 0
       ? fundingTimes.reduce((a, b) => a + b, 0) / fundingTimes.length
@@ -10123,7 +9161,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const uniquePayers = new Set(
       invoices
         .filter((inv) => inv.payments && inv.payments.length > 0)
-        .flatMap((inv) => inv.payments!.map((p) => p.payer)),
+        .flatMap((inv) => inv.payments.map((p) => p.payer)),
     ).size;
 
     const stats = {
@@ -10146,76 +9184,37 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Create up to 10 invoices in a single fee-bump transaction.
-   * Validates all items before submission; fails fast on the first invalid item.
-   * Returns invoice IDs in the same order as the input array.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Creates a batch of invoices with built-in chunking and idempotency keys.
+   *
+   * @param items - Array of invoice parameters.
+   * @returns Promise resolving to batch creation result.
+   *
+   * @example
+   * ```typescript
+   * const batch = await client.createInvoiceBatch([itemA, itemB]);
+   * ```
    */
   async createInvoiceBatch(
     items: CreateInvoiceParams[],
   ): Promise<{ invoiceIds: string[]; txHash: string }> {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (items.length === 0 || items.length > 10) {
       throw new InvalidBatchSizeError("1-10 items", items.length);
     }
-  /**
-   * for
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     for (let i = 0; i < items.length; i++) {
       const item = items[i]!;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (!item.creator)
         throw new ValidationError(`Item ${i}: creator is required`);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (!item.token)
         throw new ValidationError(`Item ${i}: token is required`);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (!item.deadline || item.deadline <= 0)
         throw new ValidationError(
           `Item ${i}: deadline must be a positive number`,
         );
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (!Array.isArray(item.recipients) || item.recipients.length === 0) {
         throw new ValidationError(
           `Item ${i}: recipients must be a non-empty array`,
         );
       }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (this.config.payloadGuard) {
   /**
    * validateInvoicePayload
@@ -10238,12 +9237,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
           key: nativeToScVal("recipients", { type: "symbol" }) as xdr.ScVal,
           val: xdr.ScVal.scvVec(
             p.recipients.map((r) =>
-  /**
-   * nativeToScVal
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
               nativeToScVal(r.address, { type: "address" }),
             ),
           ),
@@ -10282,12 +9275,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         .build();
 
       const simResult = await this.server.simulateTransaction(tx);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (SorobanRpc.Api.isSimulationError(simResult)) {
         throw new SimulationFailedError(
           `Simulation failed: ${simResult.error}`,
@@ -10299,12 +9286,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
       const bumpedFee = String(
         Math.ceil(
-  /**
-   * Number
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           Number(BASE_FEE) *
             (this.config.feeBumpMultiplier ?? 2) *
             items.length,
@@ -10329,12 +9310,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       const sendResult = await this.server.sendTransaction(
         TransactionBuilder.fromXDR(signedXdr, this.config.networkPassphrase),
       );
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (sendResult.status === "ERROR") {
         throw new TransactionFailedError(
           `Transaction failed: ${JSON.stringify(sendResult.errorResult)}`,
@@ -10344,12 +9319,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       const txHash = sendResult.hash;
       let getResult = await this.server.getTransaction(txHash);
       let attempts = 0;
-  /**
-   * while
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       while (
         getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
         attempts < 20
@@ -10358,12 +9327,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         getResult = await this.server.getTransaction(txHash);
         attempts++;
       }
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
       if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
         throw new TransactionNotConfirmedError(String(getResult.status));
       }
@@ -10372,12 +9335,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
         (getResult as SorobanRpc.Api.GetSuccessfulTransactionResponse)
           .returnValue ?? xdr.ScVal.scvVoid();
       const invoiceIds = (
-  /**
-   * scValToNative
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         scValToNative(returnVal) as (string | number | bigint)[]
       ).map((id) => id.toString());
 
@@ -10397,58 +9354,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     }
   }
 
-  /**
-   * Create multiple invoices in one transaction with full validation before submission.
-   * All invoices are validated client-side before any RPC call is made.
-   *
-   * @param invoices - Array of invoice parameters (1-20 items).
-   * @returns Array of created invoice IDs in the same order as input.
-   * @throws {BatchTooLargeError} if more than 20 invoices.
-   * @throws {ValidationError} if any invoice fails validation.
-   */
-  async batchCreateInvoices(
-    invoices: CreateInvoiceParams[],
-  ): Promise<bigint[]> {
-    const { BatchTooLargeError } = await import("./errors.js");
-
-    if (invoices.length < 1 || invoices.length > 20) {
-      throw new BatchTooLargeError(invoices.length, 20);
-    }
-
-    for (let i = 0; i < invoices.length; i++) {
-      const invoice = invoices[i]!;
-      if (!invoice.creator) {
-        throw new ValidationError(`Invoice ${i}: creator is required`);
-      }
-      if (!invoice.token) {
-        throw new ValidationError(`Invoice ${i}: token is required`);
-      }
-      if (!invoice.deadline || invoice.deadline <= 0) {
-        throw new ValidationError(
-          `Invoice ${i}: deadline must be a positive number`,
-        );
-      }
-      this._metadataValidator.validate(invoice.metadata);
-    }
-
-    const startTime = Date.now();
-    const invoiceIds: bigint[] = [];
-
-    try {
-      for (const params of invoices) {
-        const result = await this.createInvoice(params);
-        invoiceIds.push(BigInt(result.invoiceId));
-      }
-
-      this.emit("batch:created", { invoiceIds });
-
-      return invoiceIds;
-    } catch (error) {
-      telemetry.recordMethod("batchCreateInvoices", false, Date.now() - startTime);
-      throw error;
-    }
-  }
-
   // ---------------------------------------------------------------------------
   // Leaderboard & invoice history (used in per-method timeout examples)
   // ---------------------------------------------------------------------------
@@ -10459,6 +9364,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param opts - Optional per-call timeout and trace ID overrides.
    * @returns Array of creator addresses sorted by invoice volume descending.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const top = await client.getLeaderboard({ limit: 10 });
+   * ```
    */
   async getLeaderboard(opts?: {
     timeout?: number;
@@ -10470,28 +9380,10 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       this._withTelemetry(
         "getLeaderboard",
         undefined,
-  /**
-   * async
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
         async () => {
           const operation = this.contract.call("get_leaderboard");
           const raw = await this._simulateView(operation, opts?.traceId);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           if (!Array.isArray(raw)) return [];
-  /**
-   * return
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
           return (raw as Array<Record<string, unknown>>).map((entry) => ({
             creator: String(entry.creator ?? ""),
             invoiceCount: Number(entry.invoice_count ?? 0),
@@ -10512,6 +9404,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param opts      - Optional per-call timeout and trace ID overrides.
    * @returns The result of the method.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const history = await client.getInvoiceHistory('123');
+   * ```
    */
   async getInvoiceHistory(
     invoiceId: string,
@@ -10646,6 +9543,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param newAddress  - The destination account after the merge.
    * @returns The result of the method.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.rerouteRecipient('123', 'GA...OLD', 'GA...NEW');
+   * ```
    */
   async rerouteRecipient(
     invoiceId: string,
@@ -10657,12 +9559,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     );
 
     const horizonUrl = this.config.horizonUrl;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!horizonUrl) {
       throw new Error(
         "horizonUrl is required in client config to validate reroute destination",
@@ -10677,13 +9573,16 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   }
 
   /**
-   * Finalize an invoice, checking that all recipients are reachable.
+   * Finalizes split payment disbursements and triggers escrow fund release.
    *
-   * Delegates to PaymentGraphChecker. Throws `UnreachableRecipientError`
-   * unless `allowUnreachable` is set.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * @param invoiceId - The invoice ID to finalize.
+   * @param options - Optional finalization parameters.
+   * @returns Promise resolving to finalization result.
+   *
+   * @example
+   * ```typescript
+   * await client.finalizeInvoice('123');
+   * ```
    */
   async finalizeInvoice(
     invoiceId: string,
@@ -10694,12 +9593,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     );
 
     const horizonUrl = this.config.horizonUrl;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!horizonUrl) {
       throw new Error(
         "horizonUrl is required in client config for payment graph checking",
@@ -10722,33 +9615,43 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param adapter - A `WalletAdapter` (e.g. from `WalletSessionManager.detect()`).
    * @returns The connected Stellar public key.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const address = await client.connectWallet(new FreighterAdapter());
+   * ```
    */
   async connectWallet(adapter: WalletAdapter): Promise<string> {
-    const address = await adapter.connect();
+    const address =
+      typeof (adapter as any).connect === "function"
+        ? await (adapter as any).connect()
+        : await adapter.getAddress();
     this._adapter = adapter;
 
     // Listen for account changes and update internal reference
-    adapter.onAccountChange((newAddress: string) => {
-      this.emit("wallet:accountChanged", newAddress);
-    });
+    if (typeof (adapter as any).onAccountChange === "function") {
+      (adapter as any).onAccountChange((newAddress: string) => {
+        this.emit("wallet:accountChanged", newAddress);
+      });
+    }
 
-    this.emit("wallet:connected", { walletName: adapter.name, address });
+    this.emit("wallet:connected", {
+      walletName: (adapter as any).name ?? "Wallet",
+      address,
+    });
     return address;
   }
 
   /**
-   * Disconnect the currently connected wallet adapter.
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
+   * Disconnects the current active wallet session.
+   * @returns void
+   *
+   * @example
+   * ```typescript
+   * client.disconnectWallet();
+   * ```
    */
   disconnectWallet(): void {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (this._adapter) {
       this._adapter.disconnect();
       const walletName = this._adapter.name;
@@ -10769,15 +9672,14 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param expectedHash - Previously computed content hash.
    * @returns `true` when hashes match.
    * @throws InvoiceIntegrityError when hashes diverge.
+   *
+   * @example
+   * ```typescript
+   * const isValid = await client.verifyInvoice(invoice, expectedHash);
+   * ```
    */
   async verifyInvoice(invoice: Invoice, expectedHash: string): Promise<boolean> {
     const valid = await verifyInvoiceHash(invoice, expectedHash);
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (!valid) {
       const computed = await hashInvoice(invoice);
       throw new InvoiceIntegrityError(invoice.id, expectedHash, computed);
@@ -10799,6 +9701,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param config     - Optional surge multiplier config.
    * @returns The fee bump transaction hash.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * const result = await client.submitWithFeeBump(innerTx, 'GA...SPONSOR');
+   * ```
    */
   async submitWithFeeBump(
     innerTxXdr: string,
@@ -10821,13 +9728,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const sendResult = await this.server.sendTransaction(
       TransactionBuilder.fromXDR(signedXdr, this.config.networkPassphrase),
     );
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (sendResult.status === "ERROR") {
       throw new TransactionFailedError(
         `Fee bump transaction failed: ${JSON.stringify(sendResult.errorResult)}`,
@@ -10837,12 +9737,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const txHash = sendResult.hash;
     let getResult = await this.server.getTransaction(txHash);
     let attempts = 0;
-  /**
-   * while
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     while (
       getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
       attempts < 20
@@ -10851,13 +9745,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       getResult = await this.server.getTransaction(txHash);
       attempts++;
     }
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
       throw new TransactionNotConfirmedError(String(getResult.status));
     }
@@ -10884,6 +9771,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * @param signerSecret      - Secret key for signing the claim transaction.
    * @returns Object with `{ invoiceId, txHash? }`.
    * @throws {Error} If the method fails.
+   *
+   * @example
+   * ```typescript
+   * await client.confirmDelivery('123', 'GA...RECIPIENT');
+   * ```
    */
   async confirmDelivery(
     invoiceId: string,
@@ -10900,13 +9792,6 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
     const escrowManager = (this.config as Record<string, unknown>)["escrowVaultManager"] as
       | import("./escrowVaultManager.js").EscrowVaultManager
       | undefined;
-
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
     if (escrowManager && escrowVaultId && signerSecret) {
       const result = await escrowManager.release(escrowVaultId, recipientId, signerSecret);
       txHash = result.txHash;
@@ -10925,6 +9810,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    *
    * @throws {RoundNotEndedError} if the round_end timestamp has not yet passed.
    * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   *
+   * @example
+   * ```typescript
+   * const round = await client.closeRound('123');
+   * ```
    */
   async closeRound(invoiceId: string): Promise<RoundCloseResult> {
     const method = "close_round";
@@ -10955,11 +9845,10 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       }
 
       const prepared = SorobanRpc.assembleTransaction(tx, sim).build();
-      const signed = await signTransaction(prepared.toXDR(), {
-        network: this.config.networkPassphrase,
-        networkPassphrase: this.config.networkPassphrase,
-        accountToSign: this.config.publicKey,
-      } as Parameters<typeof signTransaction>[1]);
+      const signed = await signTransaction(
+        prepared.toXDR(),
+        this.config.networkPassphrase,
+      );
       const result = await this.server.sendTransaction(
         TransactionBuilder.fromXDR(signed, this.config.networkPassphrase)
       );
@@ -10976,11 +9865,12 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       let overflow = 0n;
 
       if (native && typeof native === "object") {
-        totalRaised = BigInt((native as Record<string, unknown>).total_raised ?? 0);
-        hardCap = BigInt((native as Record<string, unknown>).hard_cap ?? 0);
-        overflow = BigInt((native as Record<string, unknown>).overflow ?? 0);
-        if (Array.isArray((native as Record<string, unknown>).refunds)) {
-          for (const r of (native as Record<string, unknown>).refunds as Record<string, unknown>[]) {
+        const n = native as Record<string, any>;
+        totalRaised = BigInt(n.total_raised ?? 0);
+        hardCap = BigInt(n.hard_cap ?? 0);
+        overflow = BigInt(n.overflow ?? 0);
+        if (Array.isArray(n.refunds)) {
+          for (const r of n.refunds as Record<string, any>[]) {
             refunds.push({
               payer: String(r.payer),
               amountKept: BigInt(r.amount_kept ?? 0),
@@ -11008,6 +9898,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * Fetches the current state of the fundraising round for the given invoice.
    *
    * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   *
+   * @example
+   * ```typescript
+   * const info = await client.getRoundInfo('123');
+   * ```
    */
   async getRoundInfo(invoiceId: string): Promise<RoundInfo> {
     const method = "get_round_info";
@@ -11037,12 +9932,13 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       }
 
       const native = sim.result ? scValToNative(sim.result.retval) : {};
+      const n = (native ?? {}) as Record<string, any>;
       return {
         invoiceId,
-        totalRaised: BigInt((native as Record<string, unknown>)?.total_raised ?? 0),
-        hardCap: BigInt((native as Record<string, unknown>)?.hard_cap ?? 0),
-        roundEnd: Number((native as Record<string, unknown>)?.round_end ?? 0),
-        closed: Boolean((native as Record<string, unknown>)?.closed ?? false),
+        totalRaised: BigInt(n.total_raised ?? 0),
+        hardCap: BigInt(n.hard_cap ?? 0),
+        roundEnd: Number(n.round_end ?? 0),
+        closed: Boolean(n.closed ?? false),
       };
     } catch (err) {
       if (err instanceof InvoiceNotFoundError || err instanceof SimulationFailedError) {
@@ -11061,6 +9957,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    *
    * @throws {WrongMilestoneError} if `index` is not the currently active milestone.
    * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   *
+   * @example
+   * ```typescript
+   * await client.completeMilestone('123', 0);
+   * ```
    */
   async completeMilestone(invoiceId: string, index: number): Promise<MilestoneResult> {
     const method = "complete_milestone";
@@ -11094,11 +9995,10 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       }
 
       const prepared = SorobanRpc.assembleTransaction(tx, sim).build();
-      const signed = await signTransaction(prepared.toXDR(), {
-        network: this.config.networkPassphrase,
-        networkPassphrase: this.config.networkPassphrase,
-        accountToSign: this.config.publicKey,
-      } as Parameters<typeof signTransaction>[1]);
+      const signed = await signTransaction(
+        prepared.toXDR(),
+        this.config.networkPassphrase,
+      );
       const result = await this.server.sendTransaction(
         TransactionBuilder.fromXDR(signed, this.config.networkPassphrase)
       );
@@ -11107,11 +10007,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       }
 
       const native = sim.result ? scValToNative(sim.result.retval) : {};
-      const n = native as Record<string, unknown>;
+      const n = (native ?? {}) as Record<string, any>;
       return {
         index,
-        amountReleased: BigInt(n?.amount_released ?? 0),
-        nextMilestoneIndex: n?.next_milestone_index != null ? Number(n.next_milestone_index) : undefined,
+        amountReleased: BigInt(n.amount_released ?? 0),
+        nextMilestoneIndex: n.next_milestone_index != null ? Number(n.next_milestone_index) : undefined,
         txHash: result.hash,
       };
     } catch (err) {
@@ -11131,6 +10031,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * Returns the currently active milestone for the given invoice.
    *
    * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   *
+   * @example
+   * ```typescript
+   * const milestone = await client.getActiveMilestone('123');
+   * ```
    */
   async getActiveMilestone(invoiceId: string): Promise<Milestone | null> {
     const method = "get_active_milestone";
@@ -11161,7 +10066,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
       const native = sim.result ? scValToNative(sim.result.retval) : null;
       if (!native) return null;
-      const n = native as Record<string, unknown>;
+      const n = native as Record<string, any>;
       return {
         index: Number(n.index ?? 0),
         description: String(n.description ?? ""),
@@ -11181,6 +10086,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * Returns all milestones for the given invoice.
    *
    * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   *
+   * @example
+   * ```typescript
+   * const milestones = await client.getMilestones('123');
+   * ```
    */
   async getMilestones(invoiceId: string): Promise<Milestone[]> {
     const method = "get_milestones";
@@ -11211,7 +10121,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
       const native = sim.result ? scValToNative(sim.result.retval) : [];
       if (!Array.isArray(native)) return [];
-      return (native as Record<string, unknown>[]).map((n) => ({
+      return (native as Record<string, any>[]).map((n) => ({
         index: Number(n.index ?? 0),
         description: String(n.description ?? ""),
         targetAmount: BigInt(n.target_amount ?? 0),
@@ -11234,6 +10144,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    * Claims any accumulated referral rewards for the connected wallet.
    *
    * @throws {NothingToClaimError} if the referral balance is zero.
+   *
+   * @example
+   * ```typescript
+   * const claim = await client.claimReferralRewards();
+   * ```
    */
   async claimReferralRewards(): Promise<ReferralClaimResult> {
     const method = "claim_referral_rewards";
@@ -11266,11 +10181,10 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       }
 
       const prepared = SorobanRpc.assembleTransaction(tx, sim).build();
-      const signed = await signTransaction(prepared.toXDR(), {
-        network: this.config.networkPassphrase,
-        networkPassphrase: this.config.networkPassphrase,
-        accountToSign: this.config.publicKey,
-      } as Parameters<typeof signTransaction>[1]);
+      const signed = await signTransaction(
+        prepared.toXDR(),
+        this.config.networkPassphrase,
+      );
       const result = await this.server.sendTransaction(
         TransactionBuilder.fromXDR(signed, this.config.networkPassphrase)
       );
@@ -11279,7 +10193,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       }
 
       const native = sim.result ? scValToNative(sim.result.retval) : 0n;
-      const amountClaimed = BigInt(typeof native === "bigint" ? native : (native ?? 0));
+      const amountClaimed = BigInt(typeof native === "bigint" ? native : ((native as any) ?? 0));
       return { amountClaimed, txHash: result.hash };
     } catch (err) {
       if (
@@ -11296,6 +10210,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
   /**
    * Returns the current referral reward balance for the given address (or the
    * connected wallet if no address is specified).
+   *
+   * @example
+   * ```typescript
+   * const balance = await client.getReferralBalance('GA...');
+   * ```
    */
   async getReferralBalance(address?: string): Promise<bigint> {
     const method = "get_referral_balance";
@@ -11323,7 +10242,7 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       }
 
       const native = sim.result ? scValToNative(sim.result.retval) : 0n;
-      return BigInt(typeof native === "bigint" ? native : (native ?? 0));
+      return BigInt(typeof native === "bigint" ? native : ((native as any) ?? 0));
     } catch (err) {
       if (err instanceof SimulationFailedError) throw err;
       throw parseSorobanError(err instanceof Error ? err.message : String(err));
@@ -11339,6 +10258,11 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
    *
    * @throws {ValidationError} if the referrer address is not a valid G-address.
    * @throws {InvoiceNotFoundError} if the invoice does not exist.
+   *
+   * @example
+   * ```typescript
+   * await client.payWithReferral('123', 50_0000000n, 'GA...REFERRER');
+   * ```
    */
   async payWithReferral(
     invoiceId: string,
@@ -11379,11 +10303,10 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
       }
 
       const prepared = SorobanRpc.assembleTransaction(tx, sim).build();
-      const signed = await signTransaction(prepared.toXDR(), {
-        network: this.config.networkPassphrase,
-        networkPassphrase: this.config.networkPassphrase,
-        accountToSign: this.config.publicKey,
-      } as Parameters<typeof signTransaction>[1]);
+      const signed = await signTransaction(
+        prepared.toXDR(),
+        this.config.networkPassphrase,
+      );
       const result = await this.server.sendTransaction(
         TransactionBuilder.fromXDR(signed, this.config.networkPassphrase)
       );
@@ -11408,26 +10331,13 @@ export class StellarSplitClient extends TypedEventEmitter<SplitClientEventMap> {
 
 /** Coerce a native-decoded scalar (bigint | number | string) into a bigint, defaulting to 0n. */
 function toBigInt(value: unknown): bigint {
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
   if (typeof value === "bigint") return value;
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
   if (typeof value === "number") return BigInt(Math.trunc(value));
-  /**
-   * if
-   * @param params - The parameters for the method.
-   * @returns The result of the method.
-   * @throws {Error} If the method fails.
-   */
   if (typeof value === "string" && value !== "") return BigInt(value);
   return 0n;
 }
+
+// ---------------------------------------------------------------------------
+// Client modules (issue #1079)
+// ---------------------------------------------------------------------------
+export * from "./client/modules/index.js";

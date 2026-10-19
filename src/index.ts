@@ -12,6 +12,13 @@ import type { ExportFormat } from "./export.js";
 export { StellarSplitClient } from "./client.js";
 export { FinalityChecker } from "./finalityChecker.js";
 export { buildPaymentMemo, parsePaymentMemo } from "./memoBuilder.js";
+export {
+  parseAmount,
+  formatAmount,
+  isValidStellarAddress,
+  truncateAddress,
+  isExpired,
+} from "./utils.js";
 export type {
   StellarSplitClientConfig,
   NetworkConfig,
@@ -37,6 +44,24 @@ export type {
 
 export { PluginRegistry, LoggingPlugin, MetricsPlugin } from "./plugin.js";
 export type { SdkPlugin, SdkMethodName, PluginArgs, PluginResult, StellarSplitClientContext } from "./plugin.js";
+
+export {
+  LogLevel,
+  SdkLogger,
+  parseLogLevel,
+  logLevelToString,
+  sanitizeLogValue,
+  defaultLogFormatter,
+  defaultConsoleSink,
+} from "./logger.js";
+export type {
+  Logger,
+  LoggerOptions,
+  LogLevelString,
+  LogEntry,
+  LogFormatter,
+  LogSink,
+} from "./logger.js";
 
 export {
   serializeInvoiceTemplate,
@@ -222,7 +247,7 @@ export {
   // New: Horizon Error Classifier
   ClassifiedHorizonError,
   isClassifiedHorizonError,
-  HorizonErrorClassification,
+  type HorizonErrorClassification,
   FinalityTimeoutError,
   isFinalityTimeoutError,
   ApprovalTimeoutError,
@@ -237,12 +262,108 @@ export {
   // Batch operations errors (issue #855)
   BatchTooLargeError,
   isBatchTooLargeError,
+  // Invoice versioning errors (#1056)
+  InvoiceVersionNotFoundError,
+  isInvoiceVersionNotFoundError,
+  UnsafeRollbackError,
+  isUnsafeRollbackError,
+  InvalidVersionError,
+  isInvalidVersionError,
+  // Smart contract ABI cache errors (#1054)
+  AbiFetchError,
+  isAbiFetchError,
+  AbiNotFoundError,
+  isAbiNotFoundError,
+  // Invoice collaboration errors (#1053)
+  CollaborationError,
+  isCollaborationError,
+  CommentNotFoundError,
+  isCommentNotFoundError,
+  ApprovalRequestNotFoundError,
+  isApprovalRequestNotFoundError,
+  UnauthorizedCollaborationError,
+  isUnauthorizedCollaborationError,
 } from "./errors.js";
 
 // Invoice metadata JSON Schema validator (issue #533)
 export { InvoiceMetadataValidator } from "./validators/invoiceMetadataValidator.js";
 export type { MetadataValidationResult } from "./validators/invoiceMetadataValidator.js";
 export { validateMetadataKeys, MAX_METADATA_KEY_LENGTH } from "./validators/invoiceMetadataValidator.js";
+
+// Deadline validator (issue #1064)
+export {
+  validateDeadline,
+  validateDeadlineOrThrow,
+  isFutureDeadline,
+  parseDeadline,
+  DeadlineValidator,
+  MAX_U64 as MAX_DEADLINE_U64,
+  MS_TIMESTAMP_THRESHOLD as DEADLINE_MS_TIMESTAMP_THRESHOLD,
+} from "./validators/deadlineValidator.js";
+export type {
+  DeadlineValidationResult,
+  DeadlineValidationOptions,
+} from "./validators/deadlineValidator.js";
+
+// Amount validator (issue #1063)
+export {
+  validateAmount,
+  validateAmountOrThrow,
+  isValidAmount,
+  parseToStroops,
+  AmountValidator,
+  STELLAR_MAX_INT64,
+  STELLAR_MIN_AMOUNT,
+  STELLAR_MAX_DECIMALS,
+  STROOPS_PER_UNIT as AMOUNT_STROOPS_PER_UNIT,
+} from "./validators/amountValidator.js";
+export type {
+  AmountValidationResult,
+  AmountValidationOptions,
+  AmountUnit,
+} from "./validators/amountValidator.js";
+
+// Address validator (issue #1062)
+export {
+  validateAddress,
+  validateAddressOrThrow,
+  isStellarAddress,
+  detectAddressType,
+  verifyAddressChecksum,
+  AddressValidator,
+  STELLAR_ADDRESS_LENGTHS,
+} from "./validators/addressValidator.js";
+export type {
+  StellarAddressType,
+  AddressValidationResult,
+  AddressValidationOptions,
+} from "./validators/addressValidator.js";
+
+// Signature validator (issue #1061)
+export {
+  validateEd25519Signature,
+  validateEd25519SignatureOrThrow,
+  validateMultiSig,
+  validateMultiSigOrThrow,
+  validateWebhookSignature as validateWebhookSignaturePayload,
+  isValidSignatureFormat,
+  normalizeSignature,
+  normalizePublicKey,
+  normalizeMessage,
+  SignatureValidator,
+  ED25519_SIGNATURE_BYTE_LENGTH,
+  ED25519_PUBLIC_KEY_BYTE_LENGTH,
+} from "./validators/signatureValidator.js";
+export type {
+  SignatureValidationResult,
+  Ed25519ValidationParams,
+  MultiSigEntry,
+  SignerWeightConfig,
+  MultiSigValidationParams,
+  MultiSigValidationResult,
+  WebhookValidationParams,
+} from "./validators/signatureValidator.js";
+
 
 // ---------------------------------------------------------------------------
 // Lifecycle management (graceful shutdown)
@@ -404,7 +525,7 @@ export { watchContractUpgrade } from "./upgrade.js";
 
 export { calculateFee } from "./fee.js";
 
-export { formatAddress } from "./utils.js";
+export { formatAddress, parseAmount, formatAmount } from "./utils.js";
 
 export { resolveToken } from "./token.js";
 
@@ -540,9 +661,61 @@ export { checkPayerReadiness, checkInvoiceExpiry, checkSponsorReserve, checkReci
 export type { PayerReadinessResult, PayerReadinessReason, InvoiceExpiryResult, InvoiceExpiryReason, SponsorReserveCheck, RecipientFlagsCheck, RunPreflightOptions } from "./preflightChecker.js";
 
 export { inspectFlags, hasAnyRestrictiveFlag } from "./accountFlagsInspector.js";
-export type { AccountFlagSet } from "./types.js";
+export { detectLockState, assertAccountUnlocked } from "./accountStateDetector.js";
+export { AccountFrozenError, AccountLockedError } from "./errors.js";
+export type { AccountFlagSet, AccountLockState } from "./types.js";
 
 export { getSuggestion } from "./errorSuggestions.js";
+
+// Comprehensive error codes — descriptions and retryability (issue #1067)
+export {
+  SDK_ERROR_CODE_DESCRIPTIONS,
+  RETRYABLE_ERROR_CODES,
+  describeSdkErrorCode,
+  isRetryableErrorCode,
+  InvalidContractAddressError,
+  isInvalidContractAddressError,
+  TransactionVerificationError,
+  isTransactionVerificationError,
+} from "./errors.js";
+
+// Soroban contract address validation (issue #1065)
+export {
+  validateContractAddress,
+  isValidContractAddress,
+  assertValidContractAddress,
+  CONTRACT_ADDRESS_LENGTH,
+  CONTRACT_ADDRESS_PREFIX,
+} from "./contractAddressValidator.js";
+export type { ContractAddressValidationResult } from "./contractAddressValidator.js";
+
+// Pre-submit transaction verification (issue #1066)
+export {
+  verifyTransaction,
+  verifyTransactionSignatures,
+  assertTransactionVerified,
+} from "./transactionVerifier.js";
+export type {
+  TransactionCheckName,
+  TransactionCheckResult,
+  TransactionVerificationOptions,
+  TransactionVerificationResult,
+  SignatureVerificationResult,
+} from "./transactionVerifier.js";
+
+// Error recovery strategies (issue #1068)
+export {
+  RECOVERY_STRATEGY_TABLE,
+  getRecoveryStrategy,
+  getRecoveryPlan,
+  executeWithRecovery,
+} from "./errorRecovery.js";
+export type {
+  RecoveryAction,
+  RecoveryStrategy,
+  RecoveryPlan,
+  RecoveryRunOptions,
+} from "./errorRecovery.js";
 
 // ---------------------------------------------------------------------------
 // XDR Decoder — structured logging of Stellar XDR
@@ -1527,6 +1700,16 @@ export { LazyInitializer } from "./client/LazyInitializer.js";
 export { SplitClient } from "./client/SplitClient.js";
 export type { SplitClientConfig } from "./client/SplitClient.js";
 export {
+  BaseClientModule,
+  InvoiceModule,
+  PaymentModule,
+  DisputeModule,
+  AdminModule,
+  GroupModule,
+  TemplateModule,
+  MilestoneModule,
+} from "./client/modules/index.js";
+export {
   RpcConnectionError,
   isRpcConnectionError,
 } from "./errors.js";
@@ -1679,7 +1862,7 @@ export {
   TemplateNotFoundError,
   TemplateAccessDeniedError,
 } from "./templates.js";
-export type { InvoiceTemplate, CreateFromTemplateParams, SaveTemplateParams } from "./types/templates.js";
+export type { CreateFromTemplateParams, SaveTemplateParams } from "./types/templates.js";
 
 // Recurring subscriptions
 export {
@@ -1692,7 +1875,7 @@ export {
   SubscriptionNotFoundError,
   TooEarlyToTriggerError,
 } from "./subscriptions.js";
-export type { Subscription, SubscriptionStatus, CreateSubscriptionParams } from "./types/subscriptions.js";
+export type { SubscriptionStatus, CreateSubscriptionParams } from "./types/subscriptions.js";
 
 // Invoice recommendation AI (#980)
 export { InvoiceRecommendationEngine } from "./invoiceRecommendation.js";
@@ -1715,47 +1898,59 @@ export type {
   RetirementEventMap,
 } from "./invoiceRetirement.js";
 
-// Input sanitization and validation (#1057)
+// Multi-wallet support (#1027)
 export {
-  InputSanitizationError,
-  sanitizeString,
-  validateAmount,
-  validateAndParseAmount,
-  validateAddress,
-  sanitizeObject,
-} from "./inputSanitizer.js";
+  MultiWalletManager,
+  MetaMaskConnector,
+  WalletConnectConnector,
+  LedgerConnector,
+  MetaMaskAdapter,
+  MetaMaskNotInstalledError,
+  MetaMaskConnectionError,
+  UserRejectedError,
+  WalletFallbackExhaustedError,
+  WalletNotAvailableError,
+} from "./multiWallet.js";
 export type {
-  SanitizeStringOptions,
-  AmountValidationOptions,
-  AddressValidationOptions,
-  SanitizeObjectOptions,
-} from "./inputSanitizer.js";
+  WalletAttemptLog,
+  MultiWalletOptions,
+  MultiWalletEvent,
+  MultiWalletEventType,
+  MultiWalletEventListener,
+} from "./multiWallet.js";
 
-// Outbound request rate limiting (#1058)
-export { RateLimiter, RateLimitStore } from "./rateLimiter.js";
-export type { RateLimiterConfig, RateLimitCheck } from "./rateLimiter.js";
-
-// CSRF protection utilities (#1059)
+// Transaction simulation before execution (#1028)
 export {
-  CsrfTokenManager,
-  CsrfError,
-  generateCsrfToken,
-  hashCsrfToken,
-  csrfTokensMatch,
-  extractCsrfToken,
-  CSRF_HEADER_NAME,
-  CSRF_COOKIE_NAME,
-} from "./csrf.js";
-export type { CsrfTokenManagerOptions } from "./csrf.js";
+  TransactionSimulator,
+  TransactionSimulationError,
+} from "./transactionSimulator.js";
+export type {
+  SimulationRequest,
+  SimulationReport,
+  SimulationStatus,
+  SimulationErrorCode,
+  SimulationErrorDetail,
+  SimulationResourceUsage,
+  SimulationEvent,
+  TransactionSimulatorOptions,
+} from "./transactionSimulator.js";
 
-// Secure private-key storage (#1060)
+// Automatic nonce management (#1029)
 export {
-  SecureKeyStore,
-  MemoryKeyStoreBackend,
-  KeyStorageError,
-  KeyNotFoundError,
-  KeyIntegrityError,
-  KeyRotationError,
-} from "./secureKeyStore.js";
-export type { KeyStoreBackend, SecureKeyStoreOptions } from "./secureKeyStore.js";
+  NonceManager,
+  NonceError,
+  InvalidNonceError,
+  DuplicateNonceError,
+  StaleNonceError,
+  NonceGapError,
+} from "./nonceManager.js";
+export type {
+  NonceState,
+  NonceManagerOptions,
+  NonceResetOptions,
+  NonceValidationResult,
+  NonceEvent,
+  NonceEventType,
+  NonceEventListener,
+} from "./nonceManager.js";
 

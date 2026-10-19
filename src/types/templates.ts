@@ -2,7 +2,7 @@
  * Invoice template types for template-based invoice creation.
  */
 
-import type { CreateInvoiceParams, Recipient } from "./index.js";
+import type { CreateInvoiceParams, Recipient } from "../types.js";
 
 export interface InvoiceTemplate {
   id: bigint;

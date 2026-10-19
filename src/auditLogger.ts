@@ -34,6 +34,85 @@ export interface AuditEvent {
 /** Handler invoked for every emitted {@link AuditEvent}. */
 export type AuditEventListener = (event: AuditEvent) => void;
 
+/**
+ * A single invoice notification subscription.
+ *
+ * Represents a consumer's interest in receiving notifications for a given
+ * invoice. Subscriptions are keyed by `invoiceId` and may be filtered by the
+ * notification `events` the subscriber cares about.
+ */
+export interface InvoiceNotificationSubscription {
+  /** Unique identifier for the subscription. */
+  id: string;
+  /** The invoice this subscription is bound to. */
+  invoiceId: string;
+  /** Callback invoked when a matching invoice notification is emitted. */
+  handler: (notification: InvoiceNotification) => void;
+  /** Optional subset of events to receive; when omitted, all events fire. */
+  events?: InvoiceNotificationEvent[];
+}
+
+/** Notification event types emitted for invoice lifecycle changes. */
+export type InvoiceNotificationEvent =
+  | "invoice_created"
+  | "invoice_paid"
+  | "invoice_settled"
+  | "invoice_expired"
+  | "invoice_cancelled";
+
+/** A notification payload delivered to matching invoice subscribers. */
+export interface InvoiceNotification {
+  /** The invoice the notification pertains to. */
+  invoiceId: string;
+  /** The lifecycle event that triggered the notification. */
+  event: InvoiceNotificationEvent;
+  /** Epoch ms at which the notification was emitted. */
+  timestamp: number;
+  /** Optional additional context for the notification. */
+  data?: Record<string, unknown>;
+}
+
+/**
+ * A single cross-tenant invoice audit record.
+ *
+ * Captures which tenant performed an action against an invoice owned by
+ * another tenant, so cross-tenant access can be recorded, queried, and
+ * verified after the fact.
+ */
+export interface CrossTenantInvoiceAuditEntry {
+  /** Tenant that owns the invoice being acted upon. */
+  ownerTenantId: string;
+  /** Tenant that performed the action. */
+  actorTenantId: string;
+  /** Invoice the action targeted. */
+  invoiceId: string;
+  /** Action performed (e.g. "read", "settle", "refund"). */
+  action: string;
+  /** Whether the cross-tenant access was authorized. */
+  authorized: boolean;
+  /** When the action occurred (epoch ms). */
+  timestamp: number;
+  /** Optional free-form context for the action. */
+  metadata?: Record<string, unknown>;
+}
+
+/** Lifecycle events emitted by the cross-tenant invoice auditor. */
+export type CrossTenantAuditEvent =
+  | { type: "invoice_audited"; entry: CrossTenantInvoiceAuditEntry }
+  | { type: "cross_tenant_access_detected"; entry: CrossTenantInvoiceAuditEntry }
+  | { type: "cross_tenant_access_denied"; entry: CrossTenantInvoiceAuditEntry };
+
+export type CrossTenantAuditEventListener = (
+  event: CrossTenantAuditEvent,
+) => void;
+
+/** Lifecycle events emitted when SDK debug mode is toggled. */
+export type DebugModeEvent =
+  | { type: "debug_mode_enabled" }
+  | { type: "debug_mode_disabled" };
+
+export type DebugModeEventListener = (event: DebugModeEvent) => void;
+
 const STELLAR_ADDRESS_RE = /^G[A-Z0-9]{55}$/;
 
 /** Detect if a string value looks like base64-encoded XDR. */
@@ -46,10 +125,68 @@ export class AuditLogger {
   private readonly sink: (entry: AuditEntry) => void;
   private readonly splitAuditTrails = new Map<string, SplitAuditEntry[]>();
   private readonly listeners = new Set<AuditEventListener>();
+  private readonly invoiceSubscriptions = new Map<
+    string,
+    InvoiceNotificationSubscription[]
+  >();
+  private readonly crossTenantAudits: CrossTenantInvoiceAuditEntry[] = [];
+  private readonly crossTenantListeners = new Set<CrossTenantAuditEventListener>();
+  private readonly debugListeners = new Set<DebugModeEventListener>();
+  private debugEnabled = false;
   private sequence = 0;
 
   constructor(sink: (entry: AuditEntry) => void) {
     this.sink = sink;
+  }
+
+  /**
+   * Enable or disable SDK debug mode.
+   *
+   * When enabled, verbose diagnostic output is written for every audit
+   * operation. Toggling emits a `debug_mode_enabled` / `debug_mode_disabled`
+   * event to all subscribers registered via {@link onDebugModeChange}.
+   */
+  setDebugMode(enabled: boolean): void {
+    if (this.debugEnabled === enabled) {
+      return;
+    }
+    this.debugEnabled = enabled;
+    this.emitDebugMode({
+      type: enabled ? "debug_mode_enabled" : "debug_mode_disabled",
+    });
+  }
+
+  /** Whether SDK debug mode is currently enabled. */
+  isDebugModeEnabled(): boolean {
+    return this.debugEnabled;
+  }
+
+  /**
+   * Subscribe to debug mode state changes.
+   *
+   * @returns an unsubscribe function.
+   */
+  onDebugModeChange(listener: DebugModeEventListener): () => void {
+    this.debugListeners.add(listener);
+    return () => {
+      this.debugListeners.delete(listener);
+    };
+  }
+
+  /** Emit a verbose debug log line when debug mode is enabled. */
+  private debugLog(message: string, context?: Record<string, unknown>): void {
+    if (!this.debugEnabled) {
+      return;
+    }
+    const suffix = context ? ` ${JSON.stringify(context)}` : "";
+    // eslint-disable-next-line no-console
+    console.debug(`[AuditLogger] ${message}${suffix}`);
+  }
+
+  private emitDebugMode(event: DebugModeEvent): void {
+    for (const listener of this.debugListeners) {
+      listener(event);
+    }
   }
 
   /**

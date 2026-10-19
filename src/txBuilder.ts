@@ -15,6 +15,7 @@ import { signTransaction } from "./wallet.js";
 import { SimulationFailedError, TransactionFailedError, TransactionNotConfirmedError } from "./errors.js";
 import { checkInvoiceExpiry } from "./preflightChecker.js";
 import type { LedgerCloseEstimator } from "./ledgerCloseEstimator.js";
+import { detectFeeSurge, type FeeSurgeConfig } from "./feeSurgeDetector.js";
 
 /** Builder for composing multi-operation StellarSplit transactions. */
 export class StellarSplitTxBuilder {

@@ -175,7 +175,7 @@ export class SubscriptionManager {
   private _saveCursor(storage: StorageAdapter, cursor: EventCursor): void {
     try {
       storage.setItem(this._cursorKey(cursor.invoiceId), JSON.stringify(cursor));
-      this.onLifecycleEvent?.({ type: "cursor_persisted", invoiceId: cursor.invoiceId, cursor });
+      this.onLifecycleEvent?.({ kind: "CursorPersisted", type: "cursor_persisted", invoiceId: cursor.invoiceId, cursor });
     } catch {
       // Best-effort persistence — an in-memory replay window still applies.
     }
@@ -236,7 +236,7 @@ export class SubscriptionManager {
 
       state.retryAttempt = 0;
       state.backoffMs = this.options.initialBackoffMs;
-      this.onLifecycleEvent?.({ type: "connected", invoiceId: state.invoiceId });
+      this.onLifecycleEvent?.({ kind: "Connected", type: "connected", invoiceId: state.invoiceId });
 
       if (!state.stopped) {
         state.pollTimer = setTimeout(() => void this._poll(state, storage), this.options.pollIntervalMs);
@@ -245,7 +245,7 @@ export class SubscriptionManager {
       if (state.stopped) return;
       const err = error instanceof Error ? error : new Error(String(error));
       state.retryAttempt += 1;
-      this.onLifecycleEvent?.({ type: "disconnected", invoiceId: state.invoiceId, error: err });
+      this.onLifecycleEvent?.({ kind: "Disconnected", type: "disconnected", invoiceId: state.invoiceId, error: err });
 
       if (state.retryAttempt > this.options.maxRetries) {
         this._stop(state);
@@ -254,6 +254,7 @@ export class SubscriptionManager {
 
       const delay = Math.min(state.backoffMs, this.options.maxBackoffMs);
       this.onLifecycleEvent?.({
+        kind: "Reconnecting",
         type: "reconnecting",
         invoiceId: state.invoiceId,
         attempt: state.retryAttempt,

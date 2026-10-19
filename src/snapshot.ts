@@ -3,6 +3,7 @@ import type {
   Invoice,
   Payment,
   ReminderSchedule,
+  SplitLeg,
   SplitRollbackCheckpoint,
 } from "./types.js";
 
@@ -139,7 +140,7 @@ export function snapshotSplitRollback(
     capturedAt,
     checkpoint: Object.freeze({
       ...checkpoint,
-      legs: Object.freeze([...checkpoint.legs]),
+      legs: Object.freeze([...checkpoint.legs]) as unknown as SplitLeg[],
     }),
   });
 }

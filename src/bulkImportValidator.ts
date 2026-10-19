@@ -107,6 +107,7 @@ export function validateBulkImport(
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
+    if (!row) continue;
     let rowValid = true;
 
     // --- recipients must be present ---
@@ -121,6 +122,7 @@ export function validateBulkImport(
       // --- every recipient amount must be positive ---
       for (let j = 0; j < row.recipients.length; j++) {
         const recipient = row.recipients[j];
+        if (!recipient) continue;
         if (recipient.amount <= 0n) {
           errors.push({
             row: i,
