@@ -1715,49 +1715,59 @@ export type {
   RetirementEventMap,
 } from "./invoiceRetirement.js";
 
-// Real-time invoice state subscription (#1034)
+// Multi-wallet support (#1027)
 export {
-  InvoiceStateSubscriber,
-  matchesFilter,
-} from "./invoiceStateSubscription.js";
+  MultiWalletManager,
+  MetaMaskConnector,
+  WalletConnectConnector,
+  LedgerConnector,
+  MetaMaskAdapter,
+  MetaMaskNotInstalledError,
+  MetaMaskConnectionError,
+  UserRejectedError,
+  WalletFallbackExhaustedError,
+  WalletNotAvailableError,
+} from "./multiWallet.js";
 export type {
-  InvoiceStateUpdate,
-  InvoiceStateFilter,
-  InvoiceStateSubscriberConfig,
-  InvoiceStateSubscriptionHandle,
-  ReconnectConfig,
-} from "./invoiceStateSubscription.js";
+  WalletAttemptLog,
+  MultiWalletOptions,
+  MultiWalletEvent,
+  MultiWalletEventType,
+  MultiWalletEventListener,
+} from "./multiWallet.js";
 
-// Webhook client library (#1035)
+// Transaction simulation before execution (#1028)
 export {
-  WebhookClient,
-  WebhookError,
-  WebhookVerificationError,
-  WebhookTimestampError,
-  WebhookPayloadMalformedError,
-} from "./webhookClient.js";
+  TransactionSimulator,
+  TransactionSimulationError,
+} from "./transactionSimulator.js";
 export type {
-  WebhookClientConfig,
-  WebhookEventPayload,
-  WebhookProcessResult,
-  WebhookHandler,
-  WebhookErrorHandler,
-  WebhookClientMiddleware,
-} from "./webhookClient.js";
+  SimulationRequest,
+  SimulationReport,
+  SimulationStatus,
+  SimulationErrorCode,
+  SimulationErrorDetail,
+  SimulationResourceUsage,
+  SimulationEvent,
+  TransactionSimulatorOptions,
+} from "./transactionSimulator.js";
 
-// Analytics tracking & privacy controls (#1036)
+// Automatic nonce management (#1029)
 export {
-  AnalyticsTracker,
-  PrivacyController,
-  AnalyticsCollector,
-  wrapClientWithAnalytics,
-} from "./analyticsTracking.js";
+  NonceManager,
+  NonceError,
+  InvalidNonceError,
+  DuplicateNonceError,
+  StaleNonceError,
+  NonceGapError,
+} from "./nonceManager.js";
 export type {
-  PrivacyLevel,
-  AnalyticsPrivacyConfig,
-  AnalyticsEventInput,
-  AnalyticsEvent,
-  MethodMetric,
-  AnalyticsReport,
-  AnalyticsTrackerOptions,
-} from "./analyticsTracking.js";
+  NonceState,
+  NonceManagerOptions,
+  NonceResetOptions,
+  NonceValidationResult,
+  NonceEvent,
+  NonceEventType,
+  NonceEventListener,
+} from "./nonceManager.js";
+
