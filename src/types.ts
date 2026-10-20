@@ -173,6 +173,8 @@ export interface CreateInvoiceParams {
   token: string;
   /** Unix timestamp deadline (seconds). */
   deadline: number;
+  /** Optional memo / description attached to the invoice. */
+  memo?: string;
 }
 
 /** Generic hardware/software wallet adapter interface. */

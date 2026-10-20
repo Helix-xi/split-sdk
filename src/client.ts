@@ -95,7 +95,7 @@ import { ConnectionPool } from "./connectionPool.js";
 import { snapshotInvoice as _snapshotInvoice } from "./snapshot.js";
 import type { InvoiceSnapshot } from "./snapshot.js";
 import { SimpleCache } from "./cache.js";
-import { parseSorobanError } from "./errors.js";
+import { parseSorobanError, CoCreatorApprovalNotRequiredError } from "./errors.js";
 import { validateOrThrow } from "./configValidator.js";
 import { extendStorageTtl, buildInvoiceDataLedgerKey } from "./ttlExtension.js";
 import type { TtlExtensionOptions, TtlExtensionResult } from "./ttlExtension.js";
@@ -203,6 +203,7 @@ export interface StellarSplitClientConfig {
     /** Flush interval in milliseconds. Default: 60_000. */
     flushIntervalMs?: number;
   };
+  /**
    * Optional idempotency configuration for write methods.
    * When provided, duplicate submissions are detected and short-circuited.
    */
@@ -212,6 +213,7 @@ export interface StellarSplitClientConfig {
    * When provided, invoice payloads are checked before submission.
    */
   payloadGuard?: PayloadGuardConfig;
+  /**
    * Optional list of plugins to register at construction time.
    * Each plugin's `install()` is called during the constructor, and
    * `onInit()` is invoked once all subsystems are ready.

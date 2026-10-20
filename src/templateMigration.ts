@@ -41,11 +41,11 @@ export function diffTemplate(
       added.push({
         field: key,
         from: undefined,
-        to: (schema as Record<string, unknown>)[key],
+        to: (schema as unknown as Record<string, unknown>)[key],
       });
     } else {
-      const existingVal = (existing as Record<string, unknown>)[key];
-      const schemaVal = (schema as Record<string, unknown>)[key];
+      const existingVal = (existing as unknown as Record<string, unknown>)[key];
+      const schemaVal = (schema as unknown as Record<string, unknown>)[key];
       if (
         isObject(existingVal) &&
         isObject(schemaVal) &&
@@ -66,7 +66,7 @@ export function diffTemplate(
     if (!schemaKeys.has(key)) {
       removed.push({
         field: key,
-        from: (existing as Record<string, unknown>)[key],
+        from: (existing as unknown as Record<string, unknown>)[key],
         to: undefined,
       });
     }
@@ -84,7 +84,7 @@ export function migrateTemplate(
 
   for (const key of schemaKeys) {
     if (migrated[key] === undefined) {
-      migrated[key] = (schema as Record<string, unknown>)[key];
+      migrated[key] = (schema as unknown as Record<string, unknown>)[key];
     }
   }
 

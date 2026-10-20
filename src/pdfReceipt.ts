@@ -123,7 +123,7 @@ class PdfBuilder {
     const pages = this._writeObject({
       Type: "/Pages",
       Kids: "[3 0 R]",
-      Count: 1,
+      Count: "1",
     });
 
     const content = this.textContent.join(" ");
@@ -158,7 +158,7 @@ class PdfBuilder {
         objContent.copy(pdf, offset);
         offset += objContent.length;
       } else {
-        const objContent = Buffer.from(`<<${this._dictToString(objects[i] as Record<string, string>)}>>\nendobj\n`, "utf8");
+        const objContent = Buffer.from(`<<${this._dictToString(objects[i] as unknown as Record<string, string>)}>>\nendobj\n`, "utf8");
         objContent.copy(pdf, offset);
         offset += objContent.length;
       }
@@ -185,7 +185,7 @@ class PdfBuilder {
     return new Uint8Array(pdf.slice(0, offset));
   }
 
-  private _writeObject(obj: Record<string, string>, isStream = false): number {
+  private _writeObject(obj: Record<string, string> | string, isStream = false): number {
     this.objectCount++;
     this.objects.set(this.objectCount, Buffer.from(""));
     return this.objectCount;

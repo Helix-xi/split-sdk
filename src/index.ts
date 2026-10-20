@@ -19,7 +19,14 @@ export type { ProfileReport } from "./profiler.js";
 export { enrichInvoice, registerInvoiceFetcher } from "./enricher.js";
 export type { EnrichedInvoice } from "./enricher.js";
 
-export { Deduplicator } from "./dedup.js";
+export {
+  Deduplicator,
+  generateIdempotencyKey,
+  isKnownKey,
+  registerKey,
+  clearKeys,
+} from "./dedup.js";
+export type { IdempotencyKeyParams } from "./dedup.js";
 
 export { TxQueue } from "./queue.js";
 
@@ -319,7 +326,7 @@ export {
 } from "./configValidator.js";
 export type {
   ConfigValidation,
-  ConfigValidationError as ConfigValidationErrorType,
+  ConfigValidationErrorType,
 } from "./configValidator.js";
 
 export { FundingVelocityAlert } from "./velocityAlert.js";
@@ -391,3 +398,30 @@ export type {
   ForecastConfig,
   HistoricalInvoiceSample,
 } from "./forecast.js";
+
+export { searchInvoices, searchByMemo } from "./search.js";
+export type {
+  SearchQuery,
+  SearchResult,
+  SearchByMemoOptions,
+} from "./search.js";
+
+export { RequestCache, generateCacheKey } from "./requestCache.js";
+export type { CacheStats, RequestCacheOptions } from "./requestCache.js";
+
+export {
+  LoadTester,
+  computeLatencyStats,
+  formatLoadTestReport,
+} from "./loadTesting.js";
+export type {
+  LoadTestOptions,
+  LoadTestContext,
+  LoadTestIterationResult,
+  LatencyStats,
+  LoadTestReport,
+  LoadTestEventMap,
+  LoadTestEventType,
+} from "./loadTesting.js";
+
+

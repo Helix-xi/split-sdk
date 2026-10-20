@@ -2,15 +2,17 @@ import type { StellarSplitClientConfig } from "./client.js";
 import { isValidAddress } from "./utils.js";
 import { StrKey } from "@stellar/stellar-sdk";
 
-export interface ConfigValidationError {
+export interface ConfigValidationIssue {
   field: string;
   message: string;
   severity: "error" | "warning";
 }
 
+export type ConfigValidationErrorType = ConfigValidationIssue;
+
 export interface ConfigValidation {
   valid: boolean;
-  errors: ConfigValidationError[];
+  errors: ConfigValidationIssue[];
 }
 
 const KNOWN_NETWORKS = [
@@ -23,7 +25,7 @@ const KNOWN_NETWORKS = [
 export function validateClientConfig(
   config: StellarSplitClientConfig
 ): ConfigValidation {
-  const errors: ConfigValidationError[] = [];
+  const errors: ConfigValidationIssue[] = [];
 
   if (!config.rpcUrl) {
     errors.push({
@@ -153,9 +155,10 @@ export function validateClientConfig(
   }
 
   if (config.retry) {
+    const retry = config.retry as any;
     if (
-      config.retry.maxRetries !== undefined &&
-      typeof config.retry.maxRetries !== "number"
+      retry.maxRetries !== undefined &&
+      typeof retry.maxRetries !== "number"
     ) {
       errors.push({
         field: "retry.maxRetries",
@@ -165,8 +168,8 @@ export function validateClientConfig(
     }
 
     if (
-      config.retry.baseDelayMs !== undefined &&
-      typeof config.retry.baseDelayMs !== "number"
+      retry.baseDelayMs !== undefined &&
+      typeof retry.baseDelayMs !== "number"
     ) {
       errors.push({
         field: "retry.baseDelayMs",
@@ -259,9 +262,9 @@ export function validateOrThrow(config: StellarSplitClientConfig): void {
 }
 
 export class ConfigValidationError extends Error {
-  readonly validationErrors: ConfigValidationError[];
+  readonly validationErrors: ConfigValidationIssue[];
 
-  constructor(message: string, validationErrors: ConfigValidationError[]) {
+  constructor(message: string, validationErrors: ConfigValidationIssue[]) {
     super(message);
     this.name = "ConfigValidationError";
     this.validationErrors = validationErrors;

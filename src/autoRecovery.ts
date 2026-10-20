@@ -37,7 +37,7 @@ export class AutoRecoveryMonitor {
    * @param client - StellarSplitClient instance with server and loadBalancer
    */
   async start(
-    client: StellarSplitClient & { server: SorobanRpc.Server; loadBalancer: LoadBalancer }
+    client: { server: SorobanRpc.Server; loadBalancer: LoadBalancer }
   ): Promise<void> {
     if (this.intervalId !== null) {
       return;

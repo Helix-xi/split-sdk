@@ -1,5 +1,6 @@
 import {
   Account,
+  Address,
   Contract,
   Operation,
   TransactionBuilder,
@@ -27,10 +28,9 @@ export function buildContractDataLedgerKey(
   key: xdr.ScVal,
   durability: "persistent" | "temporary" = "persistent"
 ): xdr.LedgerKey {
-  const contractHash = xdr.Hash.fromXdr(StrKey.decodeContract(contractId));
   return xdr.LedgerKey.contractData(
     new xdr.LedgerKeyContractData({
-      contract: xdr.ScAddress.contract(contractHash),
+      contract: new Address(contractId).toScAddress(),
       key,
       durability:
         durability === "persistent"
@@ -78,7 +78,7 @@ export async function extendStorageTtl(
       writeBytes: 0,
     }),
     resourceFee: xdr.Int64.fromString("0"),
-    ext: new xdr.ExtensionPoint(0),
+    ext: new (xdr.ExtensionPoint as any)(0),
   });
 
   const account = await server.getAccount(options.source);
@@ -88,7 +88,7 @@ export async function extendStorageTtl(
     sorobanData,
   })
     .addOperation(
-      Operation.extendFootprintTTL({
+      Operation.extendFootprintTtl({
         extendTo: options.extendTo,
       })
     )
