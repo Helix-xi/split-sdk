@@ -14,10 +14,30 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
   };
 
   describe("Issue #855 - batchCreateInvoices", () => {
-    it("should validate batch size limit (1-20)", () => {
+    it("should validate batch size limit (1-20)", async () => {
       const client = new StellarSplitClient(config);
-      expect(() => client.batchCreateInvoices([])).rejects.toThrow(BatchTooLargeError);
-      expect(() => client.batchCreateInvoices(Array(21).fill({}))).rejects.toThrow(BatchTooLargeError);
+      await expect(client.batchCreateInvoices([])).rejects.toThrow(BatchTooLargeError);
+      await expect(client.batchCreateInvoices(Array(21).fill({}))).rejects.toThrow(BatchTooLargeError);
+    });
+
+    it("should accept a batch at the lower boundary (1)", async () => {
+      const client = new StellarSplitClient(config);
+      const invoices: CreateInvoiceParams[] = [
+        { creator: "test", token: "test", deadline: 1000, recipients: [] },
+      ];
+      // Boundary of 1 must not be rejected by the size guard.
+      await expect(client.batchCreateInvoices(invoices)).rejects.not.toThrow(BatchTooLargeError);
+    });
+
+    it("should accept a batch at the upper boundary (20)", async () => {
+      const client = new StellarSplitClient(config);
+      const invoices: CreateInvoiceParams[] = Array.from({ length: 20 }, () => ({
+        creator: "test",
+        token: "test",
+        deadline: 1000,
+        recipients: [],
+      }));
+      await expect(client.batchCreateInvoices(invoices)).rejects.not.toThrow(BatchTooLargeError);
     });
 
     it("should validate all invoices before RPC call", async () => {
@@ -27,7 +47,7 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
         { creator: "", token: "test", deadline: 1000, recipients: [] },
       ];
 
-      expect(() => client.batchCreateInvoices(invoices)).rejects.toThrow();
+      await expect(client.batchCreateInvoices(invoices)).rejects.toThrow();
     });
   });
 
@@ -66,6 +86,18 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
 
       const result = await promise;
       expect(result).toEqual({ value: 42 });
+    });
+
+    it("should only fire once subscriptions a single time", () => {
+      const emitter = new TypedEventEmitter<{ test: { value: number } }>();
+      const handler = vi.fn();
+      emitter.once("test", handler);
+
+      emitter.emit("test", { value: 1 });
+      emitter.emit("test", { value: 2 });
+
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(handler).toHaveBeenCalledWith({ value: 1 });
     });
   });
 
@@ -122,6 +154,14 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
 
       plugin.afterCall("createInvoice", { invoiceId: "test2", txHash: "hash2" });
       expect(plugin.getMetrics()).toEqual({ createInvoice: 2 });
+    });
+
+    it("should track distinct methods independently", () => {
+      const plugin = new MetricsPlugin();
+      plugin.afterCall("createInvoice", { invoiceId: "test", txHash: "hash" });
+      plugin.afterCall("pay", { txHash: "hash" });
+
+      expect(plugin.getMetrics()).toEqual({ createInvoice: 1, pay: 1 });
     });
 
     it("should reset metrics", () => {
