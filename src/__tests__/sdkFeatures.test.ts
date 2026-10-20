@@ -5,13 +5,102 @@ import { MetricsPlugin, PluginRegistry } from "../plugin.js";
 import { BatchTooLargeError } from "../errors.js";
 import type { CreateInvoiceParams } from "../types.js";
 
-describe("SDK Features (#854, #855, #856, #857)", () => {
-  // Mock config
-  const config = {
+/**
+ * SDK test utilities and mocking (#1183)
+ *
+ * Lightweight, dependency-free helpers for exercising the SDK in tests:
+ * - MockProvider: records calls and returns queued responses (RPC/horizon-style)
+ * - fixtures: reusable, valid SDK payloads
+ * - assertions: focused helpers for SDK responses/errors
+ * - hooks: beforeEach/afterEach style setup + teardown
+ */
+
+interface MockCall {
+  method: string;
+  args: unknown[];
+}
+
+class MockProvider {
+  readonly calls: MockCall[] = [];
+  private responses: unknown[] = [];
+  private error: unknown = null;
+
+  queueResponse(response: unknown): this {
+    this.responses.push(response);
+    return this;
+  }
+
+  queueError(error: unknown): this {
+    this.error = error;
+    return this;
+  }
+
+  async call(method: string, ...args: unknown[]): Promise<unknown> {
+    this.calls.push({ method, args });
+    if (this.error) {
+      const err = this.error;
+      this.error = null;
+      throw err;
+    }
+    return this.responses.length > 0 ? this.responses.shift() : undefined;
+  }
+
+  getCallCount(method?: string): number {
+    return method ? this.calls.filter((c) => c.method === method).length : this.calls.length;
+  }
+
+  reset(): void {
+    this.calls.length = 0;
+    this.responses = [];
+    this.error = null;
+  }
+}
+
+const fixtures = {
+  config: {
     rpcUrl: "http://localhost:8000",
     networkPassphrase: "Test SDF Network ; September 2015",
     contractId: "CBND2TWUC3BVVK4IEUA6O3DC7RNWXO5EAUWK5F2BXBDKP2I7BLXVKZDS",
+  },
+  invoice(overrides: Partial<CreateInvoiceParams> = {}): CreateInvoiceParams {
+    return {
+      creator: "GCREATOR",
+      token: "CTOKEN",
+      deadline: 1000,
+      recipients: [],
+      ...overrides,
+    };
+  },
+  paymentEvent(overrides: Record<string, unknown> = {}) {
+    return { invoiceId: 1n, amount: 100n, payer: "GPAYER", timestamp: 1_700_000_000, ...overrides };
+  },
+};
+
+const assertions = {
+  toBeSuccessfulResponse(response: unknown): void {
+    expect(response).toBeDefined();
+    expect(response).not.toBeNull();
+  },
+  async toRejectWith(promise: Promise<unknown>, errorType: new (...args: any[]) => Error): Promise<void> {
+    await expect(promise).rejects.toBeInstanceOf(errorType);
+  },
+  toHaveBeenCalledWithMethod(provider: MockProvider, method: string): void {
+    expect(provider.calls.some((c) => c.method === method)).toBe(true);
+  },
+};
+
+function createTestHooks() {
+  const provider = new MockProvider();
+  return {
+    provider,
+    beforeEach: () => provider.reset(),
+    afterEach: () => provider.reset(),
   };
+}
+
+describe("SDK Features (#854, #855, #856, #857)", () => {
+  // Mock config
+  const config = fixtures.config;
 
   describe("Issue #855 - batchCreateInvoices", () => {
     it("should validate batch size limit (1-20)", () => {
@@ -23,8 +112,8 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
     it("should validate all invoices before RPC call", async () => {
       const client = new StellarSplitClient(config);
       const invoices: CreateInvoiceParams[] = [
-        { creator: "test", token: "test", deadline: 1000, recipients: [] },
-        { creator: "", token: "test", deadline: 1000, recipients: [] },
+        fixtures.invoice({ creator: "test", token: "test" }),
+        fixtures.invoice({ creator: "", token: "test" }),
       ];
 
       expect(() => client.batchCreateInvoices(invoices)).rejects.toThrow();
@@ -185,6 +274,49 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
       };
       expect(stats.totalInvoices).toBe(5);
       expect(stats.successRate).toBe(100);
+    });
+  });
+
+  describe("Issue #1183 - SDK test utilities and mocking", () => {
+    let hooks: ReturnType<typeof createTestHooks>;
+
+    beforeEach(() => {
+      hooks = createTestHooks();
+      hooks.beforeEach();
+    });
+
+    it("MockProvider records calls and returns queued responses", async () => {
+      hooks.provider.queueResponse({ invoiceId: "inv-1" });
+      const result = await hooks.provider.call("createInvoice", fixtures.invoice());
+
+      expect(result).toEqual({ invoiceId: "inv-1" });
+      expect(hooks.provider.getCallCount("createInvoice")).toBe(1);
+      assertions.toHaveBeenCalledWithMethod(hooks.provider, "createInvoice");
+    });
+
+    it("MockProvider surfaces queued errors", async () => {
+      hooks.provider.queueError(new BatchTooLargeError("too many"));
+      await assertions.toRejectWith(hooks.provider.call("batchCreateInvoices"), BatchTooLargeError);
+    });
+
+    it("fixtures produce valid invoice payloads", () => {
+      const invoice = fixtures.invoice({ creator: "GOVERRIDE" });
+      expect(invoice.creator).toBe("GOVERRIDE");
+      expect(invoice.token).toBe("CTOKEN");
+      expect(invoice.deadline).toBe(1000);
+    });
+
+    it("assertion helpers validate successful responses", () => {
+      assertions.toBeSuccessfulResponse({ txHash: "hash" });
+      expect(() => assertions.toBeSuccessfulResponse(null)).toThrow();
+    });
+
+    it("test hooks reset provider state between runs", async () => {
+      await hooks.provider.call("pay");
+      expect(hooks.provider.getCallCount()).toBe(1);
+
+      hooks.afterEach();
+      expect(hooks.provider.getCallCount()).toBe(0);
     });
   });
 });

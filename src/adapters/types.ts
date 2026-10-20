@@ -201,3 +201,46 @@ export interface RequestDeduplicator {
   /** Subscribe to deduplication events; returns an unsubscribe function. */
   onEvent(listener: DeduplicationEventListener): () => void;
 }
+
+/**
+ * A single recorded call made against a mock provider.
+ */
+export interface MockCall {
+  /** Method name that was invoked. */
+  method: string;
+  /** Arguments the method was invoked with. */
+  args: unknown[];
+  /** Timestamp of the call (ms since epoch). */
+  timestamp: number;
+}
+
+/**
+ * A programmable mock provider for SDK testing.
+ *
+ * Responses are registered per method and returned (or thrown) when the
+ * method is invoked. All calls are recorded for later assertions.
+ */
+export interface MockProvider {
+  /** Register a resolved response for a method. */
+  on(method: string, response: unknown): MockProvider;
+  /** Register a rejected response (error) for a method. */
+  onError(method: string, error: Error | string): MockProvider;
+  /** Invoke a mocked method, returning its configured response. */
+  call<T = unknown>(method: string, ...args: unknown[]): Promise<T>;
+  /** All calls recorded so far, in invocation order. */
+  readonly calls: MockCall[];
+  /** Calls recorded for a specific method. */
+  callsFor(method: string): MockCall[];
+  /** Reset recorded calls and configured responses. */
+  reset(): void;
+}
+
+/**
+ * A test hook that runs before/after each test in a suite.
+ */
+export interface TestHook {
+  /** Hook name for diagnostics. */
+  name: string;
+  /** Run the hook. */
+  run(): void | Promise<void>;
+}
