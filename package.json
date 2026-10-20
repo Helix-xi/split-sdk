@@ -66,6 +66,8 @@
     "test:contract:provider": "vitest run tests/contract/provider",
     "test:contract:consumer": "vitest run tests/contract/consumer",
     "test:docs": "vitest run tests/docs",
+    "test:regression": "vitest run tests/regression",
+    "test:regression:update": "REGRESSION_UPDATE_BASELINE=true vitest run tests/regression",
     "docs:examples": "tsx scripts/docs-examples.ts",
     "contract:publish": "tsx scripts/publish-contracts.ts",
     "contract:compatibility": "tsx scripts/contract-compatibility.ts",

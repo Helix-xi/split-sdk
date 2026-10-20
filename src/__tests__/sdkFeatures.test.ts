@@ -228,121 +228,147 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
     });
   });
 
-  describe("Issue #1193 - Contract Testing for API Compatibility", () => {
-    // Consumer-driven contract model: each contract describes a public SDK
-    // method, its expected params, and the shape of its return value.
-    interface ContractDefinition {
-      name: string;
-      method: string;
-      params: Record<string, string>;
-      returns: Record<string, string>;
-    }
+  describe("Issue #1195 - SDK Regression Suite", () => {
+    // Baseline management: store/load baseline results for regression comparison.
+    type RegressionResult = { name: string; passed: boolean; durationMs: number };
+    type Baseline = Record<string, RegressionResult>;
 
-    interface ContractResult {
-      name: string;
-      providerVerified: boolean;
-      consumerVerified: boolean;
-      compatible: boolean;
-    }
+    const createBaseline = (results: RegressionResult[]): Baseline =>
+      results.reduce<Baseline>((acc, r) => {
+        acc[r.name] = r;
+        return acc;
+      }, {});
 
-    const contracts: ContractDefinition[] = [
-      {
-        name: "createInvoice",
-        method: "createInvoice",
-        params: { creator: "string", token: "string", deadline: "number" },
-        returns: { invoiceId: "string", txHash: "string" },
-      },
-      {
-        name: "pay",
-        method: "pay",
-        params: { invoiceId: "string", amount: "bigint" },
-        returns: { txHash: "string" },
-      },
-      {
-        name: "batchCreateInvoices",
-        method: "batchCreateInvoices",
-        params: { invoices: "array" },
-        returns: { invoiceIds: "array" },
-      },
-    ];
+    const compareToBaseline = (current: RegressionResult[], baseline: Baseline) => {
+      const regressions: string[] = [];
+      const improvements: string[] = [];
+      const missing: string[] = [];
 
-    // Provider verification: the SDK exposes each contracted method.
-    const verifyProvider = (client: StellarSplitClient, contract: ContractDefinition): boolean => {
-      const fn = (client as unknown as Record<string, unknown>)[contract.method];
-      return typeof fn === "function";
+      for (const result of current) {
+        const base = baseline[result.name];
+        if (!base) {
+          missing.push(result.name);
+          continue;
+        }
+        if (base.passed && !result.passed) regressions.push(result.name);
+        if (!base.passed && result.passed) improvements.push(result.name);
+      }
+
+      return { regressions, improvements, missing };
     };
 
-    // Consumer verification: a consumer expectation matches the provider's
-    // declared return shape (all expected keys present).
-    const verifyConsumer = (
-      contract: ContractDefinition,
-      expectation: Record<string, unknown>,
-    ): boolean => {
-      return Object.keys(contract.returns).every((key) => key in expectation);
+    const analyzeTrend = (history: number[]): "improving" | "degrading" | "stable" => {
+      if (history.length < 2) return "stable";
+      const first = history[0];
+      const last = history[history.length - 1];
+      if (last < first) return "improving";
+      if (last > first) return "degrading";
+      return "stable";
     };
 
-    const runContracts = (): ContractResult[] => {
+    const formatReport = (comparison: ReturnType<typeof compareToBaseline>): string => {
+      const lines = ["SDK Regression Report"];
+      lines.push(`Regressions: ${comparison.regressions.length}`);
+      lines.push(`Improvements: ${comparison.improvements.length}`);
+      lines.push(`Missing: ${comparison.missing.length}`);
+      return lines.join("\n");
+    };
+
+    it("should store and load baseline results", () => {
+      const results: RegressionResult[] = [
+        { name: "batchCreateInvoices", passed: true, durationMs: 12 },
+        { name: "eventBus", passed: true, durationMs: 5 },
+      ];
+      const baseline = createBaseline(results);
+      expect(Object.keys(baseline)).toHaveLength(2);
+      expect(baseline["eventBus"].passed).toBe(true);
+    });
+
+    it("should detect regressions against baseline", () => {
+      const baseline = createBaseline([
+        { name: "batchCreateInvoices", passed: true, durationMs: 12 },
+        { name: "eventBus", passed: true, durationMs: 5 },
+      ]);
+      const current: RegressionResult[] = [
+        { name: "batchCreateInvoices", passed: false, durationMs: 20 },
+        { name: "eventBus", passed: true, durationMs: 5 },
+      ];
+      const comparison = compareToBaseline(current, baseline);
+      expect(comparison.regressions).toEqual(["batchCreateInvoices"]);
+      expect(comparison.improvements).toEqual([]);
+    });
+
+    it("should detect improvements and missing cases", () => {
+      const baseline = createBaseline([
+        { name: "batchCreateInvoices", passed: false, durationMs: 12 },
+      ]);
+      const current: RegressionResult[] = [
+        { name: "batchCreateInvoices", passed: true, durationMs: 10 },
+        { name: "newFeature", passed: true, durationMs: 3 },
+      ];
+      const comparison = compareToBaseline(current, baseline);
+      expect(comparison.improvements).toEqual(["batchCreateInvoices"]);
+      expect(comparison.missing).toEqual(["newFeature"]);
+    });
+
+    it("should produce a clear report", () => {
+      const baseline = createBaseline([
+        { name: "batchCreateInvoices", passed: true, durationMs: 12 },
+      ]);
+      const current: RegressionResult[] = [
+        { name: "batchCreateInvoices", passed: false, durationMs: 20 },
+      ];
+      const report = formatReport(compareToBaseline(current, baseline));
+      expect(report).toContain("SDK Regression Report");
+      expect(report).toContain("Regressions: 1");
+    });
+
+    it("should identify trends across runs", () => {
+      expect(analyzeTrend([5, 4, 3])).toBe("improving");
+      expect(analyzeTrend([3, 4, 5])).toBe("degrading");
+      expect(analyzeTrend([4, 4, 4])).toBe("stable");
+      expect(analyzeTrend([4])).toBe("stable");
+    });
+
+    it("should run regression cases against SDK behavior", async () => {
       const client = new StellarSplitClient(config);
-      return contracts.map((contract) => {
-        const providerVerified = verifyProvider(client, contract);
-        const consumerVerified = verifyConsumer(
-          contract,
-          Object.fromEntries(Object.keys(contract.returns).map((k) => [k, null])),
-        );
-        return {
-          name: contract.name,
-          providerVerified,
-          consumerVerified,
-          compatible: providerVerified && consumerVerified,
-        };
-      });
-    };
+      const cases: Array<{ name: string; run: () => Promise<boolean> }> = [
+        {
+          name: "batch size guard rejects empty",
+          run: async () => {
+            try {
+              await client.batchCreateInvoices([]);
+              return false;
+            } catch (err) {
+              return err instanceof BatchTooLargeError;
+            }
+          },
+        },
+        {
+          name: "event bus delivers payload",
+          run: async () => {
+            const emitter = new TypedEventEmitter<{ ping: { value: number } }>();
+            let received = 0;
+            emitter.on("ping", (p) => {
+              received = p.value;
+            });
+            emitter.emit("ping", { value: 7 });
+            return received === 7;
+          },
+        },
+      ];
 
-    it("should define contracts for the public API surface", () => {
-      expect(contracts.length).toBeGreaterThan(0);
-      for (const contract of contracts) {
-        expect(contract.method).toBeTruthy();
-        expect(Object.keys(contract.returns).length).toBeGreaterThan(0);
+      const results: RegressionResult[] = [];
+      for (const c of cases) {
+        const start = Date.now();
+        const passed = await c.run();
+        results.push({ name: c.name, passed, durationMs: Date.now() - start });
       }
-    });
 
-    it("should verify the provider satisfies each contract", () => {
-      const client = new StellarSplitClient(config);
-      for (const contract of contracts) {
-        expect(verifyProvider(client, contract)).toBe(true);
-      }
-    });
-
-    it("should verify consumer expectations match provider responses", () => {
-      for (const contract of contracts) {
-        const expectation = Object.fromEntries(
-          Object.keys(contract.returns).map((k) => [k, null]),
-        );
-        expect(verifyConsumer(contract, expectation)).toBe(true);
-      }
-    });
-
-    it("should detect incompatible consumer expectations", () => {
-      const contract = contracts[0];
-      expect(verifyConsumer(contract, {})).toBe(false);
-    });
-
-    it("should produce a compatibility matrix", () => {
-      const results = runContracts();
-      expect(results).toHaveLength(contracts.length);
-      for (const result of results) {
-        expect(result.providerVerified).toBe(true);
-        expect(result.consumerVerified).toBe(true);
-        expect(result.compatible).toBe(true);
-      }
-    });
-
-    it("should publish contracts as a serializable artifact", () => {
-      const published = JSON.stringify({ version: 1, contracts });
-      const parsed = JSON.parse(published);
-      expect(parsed.version).toBe(1);
-      expect(parsed.contracts).toHaveLength(contracts.length);
-      expect(parsed.contracts[0].method).toBe(contracts[0].method);
+      expect(results.every((r) => r.passed)).toBe(true);
+      const baseline = createBaseline(results);
+      const comparison = compareToBaseline(results, baseline);
+      expect(comparison.regressions).toEqual([]);
     });
   });
 });
