@@ -265,3 +265,293 @@ export class HealthMonitor {
     }
   }
 }
+
+/**
+ * SDK metrics and statistics collection.
+ *
+ * Provides counters, gauges, and histograms registered in a central registry,
+ * plus export and analysis helpers for monitoring.
+ */
+
+export type MetricType = 'counter' | 'gauge' | 'histogram';
+
+export interface MetricSnapshot {
+  name: string;
+  type: MetricType;
+  value: number | HistogramSummary;
+  labels?: Record<string, string>;
+}
+
+export interface HistogramSummary {
+  count: number;
+  sum: number;
+  min: number;
+  max: number;
+  mean: number;
+  percentiles: Record<string, number>;
+}
+
+export interface MetricAnalysis {
+  totalMetrics: number;
+  byType: Record<MetricType, number>;
+  counters: Record<string, number>;
+  gauges: Record<string, number>;
+  histograms: Record<string, HistogramSummary>;
+}
+
+/** Monotonically increasing counter. */
+export class Counter {
+  readonly type: MetricType = 'counter';
+  private value = 0;
+
+  constructor(readonly name: string, readonly labels?: Record<string, string>) {}
+
+  inc(amount: number = 1): this {
+    if (amount < 0) {
+      throw new Error(`Counter ${this.name} cannot be decremented`);
+    }
+    this.value += amount;
+    return this;
+  }
+
+  get(): number {
+    return this.value;
+  }
+
+  reset(): void {
+    this.value = 0;
+  }
+}
+
+/** Gauge that can be set, incremented, or decremented. */
+export class Gauge {
+  readonly type: MetricType = 'gauge';
+  private value = 0;
+
+  constructor(readonly name: string, readonly labels?: Record<string, string>) {}
+
+  set(value: number): this {
+    this.value = value;
+    return this;
+  }
+
+  inc(amount: number = 1): this {
+    this.value += amount;
+    return this;
+  }
+
+  dec(amount: number = 1): this {
+    this.value -= amount;
+    return this;
+  }
+
+  get(): number {
+    return this.value;
+  }
+}
+
+/** Histogram with configurable buckets and summary statistics. */
+export class Histogram {
+  readonly type: MetricType = 'histogram';
+  private readonly buckets: number[];
+  private readonly counts: number[];
+  private count = 0;
+  private sum = 0;
+  private min = Infinity;
+  private max = -Infinity;
+  private readonly samples: number[] = [];
+
+  constructor(
+    readonly name: string,
+    buckets: number[] = [5, 10, 25, 50, 100, 250, 500, 1000],
+    readonly labels?: Record<string, string>,
+  ) {
+    this.buckets = [...buckets].sort((a, b) => a - b);
+    this.counts = new Array(this.buckets.length + 1).fill(0);
+  }
+
+  observe(value: number): this {
+    this.count++;
+    this.sum += value;
+    if (value < this.min) this.min = value;
+    if (value > this.max) this.max = value;
+    this.samples.push(value);
+    let idx = this.buckets.length;
+    for (let i = 0; i < this.buckets.length; i++) {
+      if (value <= this.buckets[i]) {
+        idx = i;
+        break;
+      }
+    }
+    this.counts[idx]++;
+    return this;
+  }
+
+  summary(percentiles: number[] = [50, 90, 95, 99]): HistogramSummary {
+    const sorted = [...this.samples].sort((a, b) => a - b);
+    const pct: Record<string, number> = {};
+    for (const p of percentiles) {
+      if (sorted.length === 0) {
+        pct[`p${p}`] = 0;
+        continue;
+      }
+      const rank = Math.ceil((p / 100) * sorted.length) - 1;
+      pct[`p${p}`] = sorted[Math.min(Math.max(rank, 0), sorted.length - 1)];
+    }
+    return {
+      count: this.count,
+      sum: this.sum,
+      min: this.count === 0 ? 0 : this.min,
+      max: this.count === 0 ? 0 : this.max,
+      mean: this.count === 0 ? 0 : this.sum / this.count,
+      percentiles: pct,
+    };
+  }
+
+  bucketCounts(): number[] {
+    return [...this.counts];
+  }
+}
+
+/** Central registry for metrics. */
+export class MetricsRegistry {
+  private readonly metrics = new Map<string, Counter | Gauge | Histogram>();
+
+  private key(name: string, labels?: Record<string, string>): string {
+    if (!labels) return name;
+    const parts = Object.keys(labels)
+      .sort()
+      .map((k) => `${k}=${labels[k]}`);
+    return parts.length ? `${name}{${parts.join(',')}}` : name;
+  }
+
+  counter(name: string, labels?: Record<string, string>): Counter {
+    const key = this.key(name, labels);
+    const existing = this.metrics.get(key);
+    if (existing) {
+      if (!(existing instanceof Counter)) {
+        throw new Error(`Metric ${key} already registered with a different type`);
+      }
+      return existing;
+    }
+    const counter = new Counter(name, labels);
+    this.metrics.set(key, counter);
+    return counter;
+  }
+
+  gauge(name: string, labels?: Record<string, string>): Gauge {
+    const key = this.key(name, labels);
+    const existing = this.metrics.get(key);
+    if (existing) {
+      if (!(existing instanceof Gauge)) {
+        throw new Error(`Metric ${key} already registered with a different type`);
+      }
+      return existing;
+    }
+    const gauge = new Gauge(name, labels);
+    this.metrics.set(key, gauge);
+    return gauge;
+  }
+
+  histogram(
+    name: string,
+    buckets?: number[],
+    labels?: Record<string, string>,
+  ): Histogram {
+    const key = this.key(name, labels);
+    const existing = this.metrics.get(key);
+    if (existing) {
+      if (!(existing instanceof Histogram)) {
+        throw new Error(`Metric ${key} already registered with a different type`);
+      }
+      return existing;
+    }
+    const histogram = new Histogram(name, buckets, labels);
+    this.metrics.set(key, histogram);
+    return histogram;
+  }
+
+  remove(name: string, labels?: Record<string, string>): boolean {
+    return this.metrics.delete(this.key(name, labels));
+  }
+
+  clear(): void {
+    this.metrics.clear();
+  }
+
+  /** Snapshot all metrics for export. */
+  snapshot(): MetricSnapshot[] {
+    const out: MetricSnapshot[] = [];
+    for (const metric of this.metrics.values()) {
+      if (metric instanceof Histogram) {
+        out.push({
+          name: metric.name,
+          type: metric.type,
+          value: metric.summary(),
+          labels: metric.labels,
+        });
+      } else {
+        out.push({
+          name: metric.name,
+          type: metric.type,
+          value: metric.get(),
+          labels: metric.labels,
+        });
+      }
+    }
+    return out;
+  }
+
+  /** Export metrics as a JSON string. */
+  exportJson(): string {
+    return JSON.stringify(this.snapshot());
+  }
+
+  /** Export metrics in Prometheus text exposition format. */
+  exportPrometheus(): string {
+    const lines: string[] = [];
+    for (const metric of this.metrics.values()) {
+      const labelStr = metric.labels
+        ? `{${Object.keys(metric.labels)
+            .sort()
+            .map((k) => `${k}="${metric.labels![k]}"`)
+            .join(',')}}`
+        : '';
+      if (metric instanceof Histogram) {
+        const summary = metric.summary();
+        lines.push(`# TYPE ${metric.name} histogram`);
+        lines.push(`${metric.name}_count${labelStr} ${summary.count}`);
+        lines.push(`${metric.name}_sum${labelStr} ${summary.sum}`);
+        lines.push(`${metric.name}_min${labelStr} ${summary.min}`);
+        lines.push(`${metric.name}_max${labelStr} ${summary.max}`);
+      } else {
+        lines.push(`# TYPE ${metric.name} ${metric.type}`);
+        lines.push(`${metric.name}${labelStr} ${metric.get()}`);
+      }
+    }
+    return lines.join('\n');
+  }
+
+  /** Analyze collected metrics into a structured summary. */
+  analyze(): MetricAnalysis {
+    const analysis: MetricAnalysis = {
+      totalMetrics: 0,
+      byType: { counter: 0, gauge: 0, histogram: 0 },
+      counters: {},
+      gauges: {},
+      histograms: {},
+    };
+    for (const metric of this.metrics.values()) {
+      analysis.totalMetrics++;
+      analysis.byType[metric.type]++;
+      if (metric instanceof Counter) {
+        analysis.counters[metric.name] = metric.get();
+      } else if (metric instanceof Gauge) {
+        analysis.gauges[metric.name] = metric.get();
+      } else if (metric instanceof Histogram) {
+        analysis.histograms[metric.name] = metric.summary();
+      }
+    }
+    return analysis;
+  }
+}
