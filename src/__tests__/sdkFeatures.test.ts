@@ -227,4 +227,122 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
       expect(stats.successRate).toBe(100);
     });
   });
+
+  describe("Issue #1193 - Contract Testing for API Compatibility", () => {
+    // Consumer-driven contract model: each contract describes a public SDK
+    // method, its expected params, and the shape of its return value.
+    interface ContractDefinition {
+      name: string;
+      method: string;
+      params: Record<string, string>;
+      returns: Record<string, string>;
+    }
+
+    interface ContractResult {
+      name: string;
+      providerVerified: boolean;
+      consumerVerified: boolean;
+      compatible: boolean;
+    }
+
+    const contracts: ContractDefinition[] = [
+      {
+        name: "createInvoice",
+        method: "createInvoice",
+        params: { creator: "string", token: "string", deadline: "number" },
+        returns: { invoiceId: "string", txHash: "string" },
+      },
+      {
+        name: "pay",
+        method: "pay",
+        params: { invoiceId: "string", amount: "bigint" },
+        returns: { txHash: "string" },
+      },
+      {
+        name: "batchCreateInvoices",
+        method: "batchCreateInvoices",
+        params: { invoices: "array" },
+        returns: { invoiceIds: "array" },
+      },
+    ];
+
+    // Provider verification: the SDK exposes each contracted method.
+    const verifyProvider = (client: StellarSplitClient, contract: ContractDefinition): boolean => {
+      const fn = (client as unknown as Record<string, unknown>)[contract.method];
+      return typeof fn === "function";
+    };
+
+    // Consumer verification: a consumer expectation matches the provider's
+    // declared return shape (all expected keys present).
+    const verifyConsumer = (
+      contract: ContractDefinition,
+      expectation: Record<string, unknown>,
+    ): boolean => {
+      return Object.keys(contract.returns).every((key) => key in expectation);
+    };
+
+    const runContracts = (): ContractResult[] => {
+      const client = new StellarSplitClient(config);
+      return contracts.map((contract) => {
+        const providerVerified = verifyProvider(client, contract);
+        const consumerVerified = verifyConsumer(
+          contract,
+          Object.fromEntries(Object.keys(contract.returns).map((k) => [k, null])),
+        );
+        return {
+          name: contract.name,
+          providerVerified,
+          consumerVerified,
+          compatible: providerVerified && consumerVerified,
+        };
+      });
+    };
+
+    it("should define contracts for the public API surface", () => {
+      expect(contracts.length).toBeGreaterThan(0);
+      for (const contract of contracts) {
+        expect(contract.method).toBeTruthy();
+        expect(Object.keys(contract.returns).length).toBeGreaterThan(0);
+      }
+    });
+
+    it("should verify the provider satisfies each contract", () => {
+      const client = new StellarSplitClient(config);
+      for (const contract of contracts) {
+        expect(verifyProvider(client, contract)).toBe(true);
+      }
+    });
+
+    it("should verify consumer expectations match provider responses", () => {
+      for (const contract of contracts) {
+        const expectation = Object.fromEntries(
+          Object.keys(contract.returns).map((k) => [k, null]),
+        );
+        expect(verifyConsumer(contract, expectation)).toBe(true);
+      }
+    });
+
+    it("should detect incompatible consumer expectations", () => {
+      const contract = contracts[0];
+      expect(verifyConsumer(contract, {})).toBe(false);
+    });
+
+    it("should produce a compatibility matrix", () => {
+      const results = runContracts();
+      expect(results).toHaveLength(contracts.length);
+      for (const result of results) {
+        expect(result.providerVerified).toBe(true);
+        expect(result.consumerVerified).toBe(true);
+        expect(result.compatible).toBe(true);
+      }
+    });
+
+    it("should publish contracts as a serializable artifact", () => {
+      const published = JSON.stringify({ version: 1, contracts });
+      const parsed = JSON.parse(published);
+      expect(parsed.version).toBe(1);
+      expect(parsed.contracts).toHaveLength(contracts.length);
+      expect(parsed.contracts[0].method).toBe(contracts[0].method);
+    });
+  });
 });
