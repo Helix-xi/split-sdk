@@ -68,7 +68,8 @@
     "bundle:update-baseline": "BUNDLE_BASELINE_UPDATE=true tsx scripts/bundle-size-guard.ts"
   },
   "bin": {
-    "stellar-split-sdk-migrate": "./dist/cli/migrate.js"
+    "stellar-split-sdk-migrate": "./dist/cli/migrate.js",
+    "stellar-split-sdk": "./dist/cli/index.js"
   },
   "dependencies": {
     "@ledgerhq/hw-app-str": "^6.29.0",
