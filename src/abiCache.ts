@@ -121,6 +121,149 @@ export interface AbiCacheOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Lazy Module Registry (#1175)
+// ---------------------------------------------------------------------------
+
+/** Metrics captured for a lazily loaded SDK module. */
+export interface LazyModuleMetrics {
+  /** Number of times the module loader was invoked. */
+  loads: number;
+  /** Number of successful module resolutions. */
+  successes: number;
+  /** Number of failed module resolutions. */
+  failures: number;
+  /** Time spent resolving the module (ms), cumulative. */
+  totalLoadMs: number;
+  /** Timestamp of the last load attempt (ms), or null if never loaded. */
+  lastLoadedAt: number | null;
+}
+
+/** A lazily loaded SDK module registration. */
+export interface LazyModuleEntry<T = unknown> {
+  /** Unique module name used as the registry key. */
+  name: string;
+  /** Names of other modules this module depends on. */
+  dependencies: string[];
+  /** Dynamic import factory resolving the module on demand. */
+  loader: () => Promise<T>;
+}
+
+/** Error thrown when a lazy module fails to load. */
+export class LazyModuleLoadError extends Error {
+  readonly moduleName: string;
+  readonly cause?: unknown;
+
+  constructor(moduleName: string, cause?: unknown) {
+    super(`Failed to load SDK module "${moduleName}"`);
+    this.name = "LazyModuleLoadError";
+    this.moduleName = moduleName;
+    this.cause = cause;
+  }
+}
+
+/**
+ * Registry that resolves SDK modules on demand via dynamic imports.
+ *
+ * Modules are registered with a dynamic import factory and their dependency
+ * names. Dependencies are resolved (and cached) before the requested module
+ * is loaded, so startup only pays for modules that are actually used.
+ */
+export class LazyModuleRegistry {
+  private readonly entries = new Map<string, LazyModuleEntry>();
+  private readonly resolved = new Map<string, unknown>();
+  private readonly pending = new Map<string, Promise<unknown>>();
+  private readonly metrics = new Map<string, LazyModuleMetrics>();
+
+  /** Registers a module with its dynamic import factory and dependencies. */
+  register<T>(entry: LazyModuleEntry<T>): void {
+    if (this.entries.has(entry.name)) {
+      throw new Error(`SDK module "${entry.name}" is already registered`);
+    }
+    this.entries.set(entry.name, entry as LazyModuleEntry);
+    this.metrics.set(entry.name, {
+      loads: 0,
+      successes: 0,
+      failures: 0,
+      totalLoadMs: 0,
+      lastLoadedAt: null,
+    });
+  }
+
+  /** Returns true if a module with the given name is registered. */
+  has(name: string): boolean {
+    return this.entries.has(name);
+  }
+
+  /** Returns the registered dependency names for a module. */
+  getDependencies(name: string): string[] {
+    return this.entries.get(name)?.dependencies.slice() ?? [];
+  }
+
+  /**
+   * Loads a module (and its dependencies) on demand. Resolved modules are
+   * cached; concurrent calls share the same in-flight promise.
+   */
+  async load<T = unknown>(name: string): Promise<T> {
+    if (this.resolved.has(name)) {
+      return this.resolved.get(name) as T;
+    }
+
+    const inFlight = this.pending.get(name);
+    if (inFlight) {
+      return inFlight as Promise<T>;
+    }
+
+    const entry = this.entries.get(name);
+    if (!entry) {
+      throw new LazyModuleLoadError(name, new Error("module not registered"));
+    }
+
+    const promise = this.resolve(entry);
+    this.pending.set(name, promise);
+    try {
+      return (await promise) as T;
+    } finally {
+      this.pending.delete(name);
+    }
+  }
+
+  /** Returns a snapshot of load metrics for all registered modules. */
+  getMetrics(): Record<string, LazyModuleMetrics> {
+    const snapshot: Record<string, LazyModuleMetrics> = {};
+    for (const [name, m] of this.metrics) {
+      snapshot[name] = { ...m };
+    }
+    return snapshot;
+  }
+
+  private async resolve(entry: LazyModuleEntry): Promise<unknown> {
+    const metrics = this.metrics.get(entry.name)!;
+    metrics.loads++;
+    metrics.lastLoadedAt = Date.now();
+    const startedAt = Date.now();
+
+    try {
+      // Resolve dependencies first so the module can rely on them.
+      for (const dep of entry.dependencies) {
+        await this.load(dep);
+      }
+
+      const mod = await entry.loader();
+      this.resolved.set(entry.name, mod);
+      metrics.successes++;
+      metrics.totalLoadMs += Date.now() - startedAt;
+      return mod;
+    } catch (err) {
+      metrics.failures++;
+      metrics.totalLoadMs += Date.now() - startedAt;
+      throw err instanceof LazyModuleLoadError
+        ? err
+        : new LazyModuleLoadError(entry.name, err);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Storage Implementations
 // ---------------------------------------------------------------------------
 
@@ -278,53 +421,6 @@ export class AdapterAbiStorage implements AbiStorage {
 
   set(key: string, entry: CachedAbiEntry): void {
     const raw = JSON.stringify(entry);
-    entry.byteSize = Buffer.byteLength(raw, "utf8");
-    this.adapter.setItem(this.prefix + key, raw);
-  }
+    ent
 
-  delete(key: string): boolean {
-    const existed = this.adapter.getItem(this.prefix + key) !== null;
-    this.adapter.removeItem(this.prefix + key);
-    return existed;
-  }
-
-  clear(): void {
-    // Collect keys under prefix
-    const keys = this.keys();
-    for (const k of keys) {
-      this.adapter.removeItem(this.prefix + k);
-    }
-  }
-
-  keys(): string[] {
-    // Fallback inspect if possible, or maintain key registry
-    const registryKey = `${this.prefix}__all_keys__`;
-    const raw = this.adapter.getItem(registryKey);
-    return raw ? JSON.parse(raw) : [];
-  }
-
-  size(): number {
-    return this.keys().length;
-  }
-
-  getStorageBytes(): number {
-    const keys = this.keys();
-    let bytes = 0;
-    for (const k of keys) {
-      const item = this.adapter.getItem(this.prefix + k);
-      if (item) bytes += Buffer.byteLength(item, "utf8");
-    }
-    return bytes;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Fetchers
-// ---------------------------------------------------------------------------
-
-/**
- * Static in-memory registry fetcher for pre-configured or mock contract ABIs.
- */
-export class StaticContractAbiFetcher 
-
-/* … truncated 7865 chars — edit only what you need near the top … */
+/* … truncated 1354 chars — edit only what you need near the top … */

@@ -187,4 +187,100 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
       expect(stats.successRate).toBe(100);
     });
   });
+
+  describe("Issue #1175 - Lazy loading for SDK modules", () => {
+    it("should resolve module dependencies in registry order", async () => {
+      const { ModuleRegistry } = await import("../lazyModules.js");
+      const registry = new ModuleRegistry();
+
+      registry.register({
+        name: "base",
+        dependencies: [],
+        load: async () => ({ value: 1 }),
+      });
+      registry.register({
+        name: "derived",
+        dependencies: ["base"],
+        load: async () => ({ value: 2 }),
+      });
+
+      const order: string[] = [];
+      const originalLoad = registry.get("base")!.load;
+      registry.get("base")!.load = async () => {
+        order.push("base");
+        return originalLoad();
+      };
+
+      const result = await registry.load("derived");
+      expect(result).toEqual({ value: 2 });
+      expect(order).toEqual(["base"]);
+    });
+
+    it("should load modules on demand via dynamic import", async () => {
+      const { ModuleRegistry } = await import("../lazyModules.js");
+      const registry = new ModuleRegistry();
+      const loadFn = vi.fn(async () => ({ ok: true }));
+
+      registry.register({ name: "lazy", dependencies: [], load: loadFn });
+      expect(loadFn).not.toHaveBeenCalled();
+
+      const mod = await registry.load("lazy");
+      expect(loadFn).toHaveBeenCalledTimes(1);
+      expect(mod).toEqual({ ok: true });
+    });
+
+    it("should cache loaded modules and not reload", async () => {
+      const { ModuleRegistry } = await import("../lazyModules.js");
+      const registry = new ModuleRegistry();
+      const loadFn = vi.fn(async () => ({ ok: true }));
+
+      registry.register({ name: "cached", dependencies: [], load: loadFn });
+      await registry.load("cached");
+      await registry.load("cached");
+
+      expect(loadFn).toHaveBeenCalledTimes(1);
+    });
+
+    it("should handle load errors and record metrics", async () => {
+      const { ModuleRegistry } = await import("../lazyModules.js");
+      const registry = new ModuleRegistry();
+
+      registry.register({
+        name: "broken",
+        dependencies: [],
+        load: async () => {
+          throw new Error("boom");
+        },
+      });
+
+      await expect(registry.load("broken")).rejects.toThrow("boom");
+
+      const metrics = registry.getMetrics();
+      expect(metrics.failures).toBe(1);
+      expect(metrics.loads).toBe(0);
+    });
+
+    it("should track loading metrics", async () => {
+      const { ModuleRegistry } = await import("../lazyModules.js");
+      const registry = new ModuleRegistry();
+
+      registry.register({ name: "m1", dependencies: [], load: async () => ({}) });
+      registry.register({ name: "m2", dependencies: [], load: async () => ({}) });
+
+      await registry.load("m1");
+      await registry.load("m2");
+
+      const metrics = registry.getMetrics();
+      expect(metrics.loads).toBe(2);
+      expect(metrics.failures).toBe(0);
+      expect(metrics.totalLoadTimeMs).toBeGreaterThanOrEqual(0);
+    });
+
+    it("should throw for unknown modules", async () => {
+      const { ModuleRegistry } = await import("../lazyModules.js");
+      const registry = new ModuleRegistry();
+
+      await expect(registry.load("missing")).rejects.toThrow();
+    });
+  });
 });
