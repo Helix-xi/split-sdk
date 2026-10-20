@@ -17,6 +17,19 @@ interface Export {
   examples: string[];
 }
 
+interface DocExample {
+  exportName: string;
+  source: string;
+  code: string;
+  expected: string | null;
+}
+
+interface ExampleResult {
+  example: DocExample;
+  passed: boolean;
+  error: string | null;
+}
+
 function extractJSDocText(text: string): { description: string; params: JSDocTag[]; returns: JSDocTag | null; examples: string[] } {
   const lines = text.split("\n");
   let description = "";
@@ -207,6 +220,97 @@ function parseExports(indexContent: string, srcDir: string): Map<string, Export>
   return exports;
 }
 
+// Extract runnable code examples from parsed exports. Each @example block may
+// contain a fenced code snippet and an optional `// => expected` result line.
+function extractExamples(exports: Map<string, Export>): DocExample[] {
+  const examples: DocExample[] = [];
+
+  for (const exp of exports.values()) {
+    for (const raw of exp.examples) {
+      const fenced = raw.match(/```(?:typescript|ts|javascript|js)?\n([\s\S]*?)```/);
+      const source = fenced ? fenced[1] : raw;
+      const lines = source.split("\n");
+      const codeLines: string[] = [];
+      let expected: string | null = null;
+
+      for (const line of lines) {
+        const resultMatch = line.match(/^\s*\/\/\s*=>\s*(.+)$/);
+        if (resultMatch) {
+          expected = resultMatch[1].trim();
+        } else {
+          codeLines.push(line);
+        }
+      }
+
+      const code = codeLines.join("\n").trim();
+      if (!code) continue;
+
+      examples.push({ exportName: exp.name, source: raw, code, expected });
+    }
+  }
+
+  return examples;
+}
+
+// Validate that an example is syntactically valid TypeScript before running it.
+function validateExample(example: DocExample): string | null {
+  const sf = ts.createSourceFile("example.ts", example.code, ts.ScriptTarget.ES2020, true);
+  const diagnostics = (sf as unknown as { parseDiagnostics?: ts.Diagnostic[] }).parseDiagnostics ?? [];
+  if (diagnostics.length > 0) {
+    const first = diagnostics[0];
+    const message = ts.flattenDiagnosticMessageText(first.messageText, "\n");
+    return `Syntax error in example for ${example.exportName}: ${message}`;
+  }
+  return null;
+}
+
+// Run a single example in an isolated function scope and validate its result.
+function runExample(example: DocExample): ExampleResult {
+  const syntaxError = validateExample(example);
+  if (syntaxError) {
+    return { example, passed: false, error: syntaxError };
+  }
+
+  try {
+    // eslint-disable-next-line no-new-func
+    const fn = new Function(`"use strict";\n${example.code}`);
+    const result = fn();
+
+    if (example.expected !== null) {
+      const actual = typeof result === "undefined" ? "undefined" : JSON.stringify(result);
+      const normalizedExpected = example.expected.replace(/^["']|["']$/g, "");
+      const normalizedActual = actual.replace(/^["']|["']$/g, "");
+      if (normalizedActual !== normalizedExpected) {
+        return {
+          example,
+          passed: false,
+          error: `Result mismatch for ${example.exportName}: expected ${example.expected}, got ${actual}`,
+        };
+      }
+    }
+
+    return { example, passed: true, error: null };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { example, passed: false, error: `Runtime error in example for ${example.exportName}: ${message}` };
+  }
+}
+
+function runExamples(examples: DocExample[]): ExampleResult[] {
+  return examples.map(runExample);
+}
+
+function reportFailures(results: ExampleResult[]): string {
+  const failures = results.filter((r) => !r.passed);
+  if (failures.length === 0) return "";
+
+  let report = `\nDocumentation example failures (${failures.length}):\n`;
+  for (const failure of failures) {
+    report += `  - [${failure.example.exportName}] ${failure.error}\n`;
+  }
+  return report;
+}
+
 function renderMarkdown(exports: Export[]): string {
   const sorted = Array.from(exports).sort((a, b) => a.name.localeCompare(b.name));
   let md = "# API Reference\n\n";
@@ -244,7 +348,7 @@ function renderMarkdown(exports: Export[]): string {
 
     if (exp.returns) {
       md += "### Returns\n\n";
-      md += `${exp.returns.text}\n\n`;
+      md += exp.returns.text + "\n\n";
     }
 
     if (exp.examples.length > 0) {
@@ -255,25 +359,35 @@ function renderMarkdown(exports: Export[]): string {
         md += "```\n\n";
       }
     }
-
-    md += "---\n\n";
   }
 
   return md;
 }
 
-function generate(): void {
-  const indexPath = resolve(process.cwd(), "src/index.ts");
-  const srcDir = resolve(process.cwd(), "src");
+function main(): void {
+  const rootDir = resolve(dirname(new URL(import.meta.url).pathname), "..");
+  const srcDir = resolve(rootDir, "src");
+  const indexPath = resolve(srcDir, "index.ts");
+  const outputPath = resolve(rootDir, "docs", "API.md");
 
   const indexContent = readFileSync(indexPath, "utf8");
   const exports = parseExports(indexContent, srcDir);
-  const markdown = renderMarkdown(Array.from(exports.values()));
 
-  const outputPath = resolve(process.cwd(), "docs/API.md");
+  const examples = extractExamples(exports);
+  const results = runExamples(examples);
+  const failureReport = reportFailures(results);
+
+  if (failureReport) {
+    process.stderr.write(failureReport);
+    process.exitCode = 1;
+  }
+
+  const markdown = renderMarkdown(Array.from(exports.values()));
   writeFileSync(outputPath, markdown, "utf8");
-  console.log(`✓ Generated API documentation: ${outputPath}`);
-  console.log(`✓ Documented ${exports.size} exports`);
+
+  process.stdout.write(
+    `Generated docs for ${exports.size} exports; tested ${results.length} examples (${results.filter((r) => r.passed).length} passed).\n`,
+  );
 }
 
-generate();
+main();

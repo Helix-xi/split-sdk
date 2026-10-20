@@ -65,6 +65,8 @@
     "test:contract": "vitest run tests/contract",
     "test:contract:provider": "vitest run tests/contract/provider",
     "test:contract:consumer": "vitest run tests/contract/consumer",
+    "test:docs": "vitest run tests/docs",
+    "docs:examples": "tsx scripts/docs-examples.ts",
     "contract:publish": "tsx scripts/publish-contracts.ts",
     "contract:compatibility": "tsx scripts/contract-compatibility.ts",
     "lint": "tsc --noEmit",
