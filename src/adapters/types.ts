@@ -203,117 +203,112 @@ export interface RequestDeduplicator {
 }
 
 /**
+ * Compression algorithm negotiated for data in transit.
+ *
+ * `none` is the identity codec used as the fallback when no algorithm can be
+ * agreed upon or when compression would not reduce payload size.
+ */
+export type CompressionAlgorithm = 'gzip' | 'deflate' | 'none';
+
+/**
+ * Configuration for the data-transfer compression layer.
+ *
+ * Compression is opt-in: when omitted (or `enabled` is false) payloads pass
+ * through unchanged using the `none` codec.
+ */
+export interface CompressionConfig {
+  /** Whether compression is enabled. Defaults to false. */
+  enabled?: boolean;
+  /**
+   * Algorithms the local peer supports, in order of preference. The first
+   * entry is preferred during negotiation. Defaults to ['gzip', 'deflate'].
+   */
+  algorithms?: CompressionAlgorithm[];
+  /** Compression level (0-9) passed to the codec. Defaults to 6. */
+  level?: number;
+  /**
+   * Minimum payload size in bytes below which compression is skipped and the
+   * `none` codec is used. Defaults to 0 (always attempt compression).
+   */
+  minSizeBytes?: number;
+}
+
+/**
+ * Result of negotiating a compression algorithm between two peers.
+ */
+export interface CompressionNegotiation {
+  /** Algorithm both peers agreed on, or `none` when no overlap exists. */
+  algorithm: CompressionAlgorithm;
+  /** Compression level to use for the agreed algorithm. */
+  level: number;
+  /** Whether the peers share at least one non-identity algorithm. */
+  supported: boolean;
+}
+
+/**
+ * A compressed payload ready for transfer, carrying the metadata needed to
+ * decompress it on the receiving side.
+ */
+export interface CompressedPayload {
+  /** Algorithm used to compress the payload. */
+  algorithm: CompressionAlgorithm;
+  /** Compression level used. */
+  level: number;
+  /** Original (uncompressed) size in bytes. */
+  originalSize: number;
+  /** Compressed size in bytes. */
+  compressedSize: number;
+  /** Compressed bytes (or the original bytes when algorithm is `none`). */
+  data: Uint8Array;
+}
+
+/**
+ * Cumulative compression metrics for the data-transfer layer.
+ */
+export interface CompressionMetrics {
+  /** Number of payloads compressed. */
+  compressedCount: number;
+  /** Number of payloads decompressed. */
+  decompressedCount: number;
+  /** Total original bytes across compressed payloads. */
+  originalBytes: number;
+  /** Total compressed bytes across compressed payloads. */
+  compressedBytes: number;
+  /** Number of payloads that fell back to the `none` codec. */
+  fallbackCount: number;
+  /** Ratio of bytes saved (0-1); 0 when nothing has been compressed. */
+  savingsRatio: number;
+}
+
+/**
+ * Compression layer for data in transit.
+ *
+ * Compresses outbound payloads, decompresses inbound payloads, negotiates an
+ * algorithm with a peer, and tracks cumulative metrics.
+ */
+export interface CompressionLayer {
+  /** Compress an outbound payload using the negotiated algorithm. */
+  compress(data: Uint8Array): CompressedPayload;
+  /** Decompress an inbound payload produced by {@link compress}. */
+  decompress(payload: CompressedPayload): Uint8Array;
+  /**
+   * Negotiate an algorithm given the peer's supported algorithms.
+   *
+   * @param peerAlgorithms - Algorithms the remote peer supports.
+   * @returns The agreed algorithm, or `none` when there is no overlap.
+   */
+  negotiate(peerAlgorithms: CompressionAlgorithm[]): CompressionNegotiation;
+  /** Snapshot of cumulative compression metrics. */
+  getMetrics(): CompressionMetrics;
+}
+
+/**
  * Configuration for the database connection pool.
  *
  * Pooling is opt-in: when omitted, callers acquire a fresh connection per
  * request and no recycling, health checking, or failover occurs.
  */
 export interface ConnectionPoolConfig {
-  /** Whether connection pooling is enabled. Defaults to false. */
-  enabled?: boolean;
-  /** Maximum number of live connections the pool will hold. */
-  maxConnections?: number;
-  /** Minimum number of idle connections kept warm. */
-  minConnections?: number;
-  /**
-   * Maximum age of a connection, in milliseconds, before it is recycled.
-   * When omitted, connections are not recycled by age.
-   */
-  maxConnectionAgeMs?: number;
-  /**
-   * Maximum time a connection may sit idle, in milliseconds, before it is
-   * recycled. When omitted, idle connections are not recycled by time.
-   */
-  maxIdleMs?: number;
-  /** Interval between background health checks, in milliseconds. */
-  healthCheckIntervalMs?: number;
-  /** Maximum time to wait for a connection before failing, in milliseconds. */
-  acquireTimeoutMs?: number;
-  /** Ordered list of failover endpoints tried when the primary is unhealthy. */
-  failoverEndpoints?: string[];
-}
+  /** Whether connection p
 
-/** Lifecycle state of a pooled connection. */
-export type ConnectionState = 'idle' | 'in-use' | 'recycling' | 'closed';
-
-/** A single pooled database connection. */
-export interface PooledConnection {
-  /** Unique connection identifier. */
-  id: string;
-  /** Endpoint the connection is bound to. */
-  endpoint: string;
-  /** Current lifecycle state. */
-  state: ConnectionState;
-  /** Creation timestamp (ms since epoch). */
-  createdAt: number;
-  /** Last time the connection was used (ms since epoch). */
-  lastUsedAt: number;
-}
-
-/** Snapshot of pool statistics for monitoring. */
-export interface ConnectionPoolStats {
-  /** Total connections currently held by the pool. */
-  total: number;
-  /** Connections currently checked out. */
-  inUse: number;
-  /** Connections currently idle and available. */
-  idle: number;
-  /** Connections created since the pool started. */
-  created: number;
-  /** Connections recycled (closed and replaced) since the pool started. */
-  recycled: number;
-  /** Connections closed since the pool started. */
-  closed: number;
-  /** Number of acquire requests that timed out. */
-  acquireTimeouts: number;
-  /** Number of failover switches performed. */
-  failovers: number;
-}
-
-/** Result of a connection health check. */
-export interface ConnectionHealthCheck {
-  /** Whether the connection is healthy. */
-  healthy: boolean;
-  /** Endpoint that was checked. */
-  endpoint: string;
-  /** Check timestamp (ms since epoch). */
-  checkedAt: number;
-  /** Optional error message when unhealthy. */
-  error?: string;
-}
-
-/** Lifecycle events emitted by the connection pool. */
-export type ConnectionPoolEvent =
-  | { type: 'connection-created'; connection: PooledConnection }
-  | { type: 'connection-acquired'; connection: PooledConnection }
-  | { type: 'connection-released'; connection: PooledConnection }
-  | { type: 'connection-recycled'; connection: PooledConnection; reason: 'age' | 'idle' | 'unhealthy' }
-  | { type: 'health-check'; result: ConnectionHealthCheck }
-  | { type: 'failover'; from: string; to: string }
-  | { type: 'stats'; stats: ConnectionPoolStats };
-
-/** Listener invoked for each emitted connection pool event. */
-export type ConnectionPoolEventListener = (event: ConnectionPoolEvent) => void;
-
-/**
- * Database connection pool manager.
- *
- * Hands out pooled connections, recycles stale ones, runs health checks,
- * fails over to alternate endpoints, and exposes statistics for monitoring.
- */
-export interface ConnectionPool {
-  /** Acquire a connection from the pool, waiting up to the configured timeout. */
-  acquire(): Promise<PooledConnection>;
-  /** Return a connection to the pool for reuse. */
-  release(connection: PooledConnection): void;
-  /** Run a health check against a connection (or the active endpoint). */
-  healthCheck(connection?: PooledConnection): Promise<ConnectionHealthCheck>;
-  /** Switch to the next healthy failover endpoint. */
-  failover(): Promise<string>;
-  /** Return a snapshot of current pool statistics. */
-  getStats(): ConnectionPoolStats;
-  /** Close all connections and stop background health checks. */
-  close(): Promise<void>;
-  /** Subscribe to pool lifecycle events; returns an unsubscribe function. */
-  onEvent(listener: ConnectionPoolEventListener): () => void;
-}
+/* … truncated 4185 chars — edit only what you need near the top … */
