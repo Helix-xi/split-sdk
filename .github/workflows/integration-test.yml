@@ -3,6 +3,7 @@ name: Integration Test
 on:
   schedule:
     - cron: '0 0 * * 0' # weekly on Sunday at midnight
+  workflow_dispatch:
 
 jobs:
   integration-test:
@@ -27,3 +28,32 @@ jobs:
           STELLAR_SPLIT_TOKEN_CONTRACT_ID: ${{ secrets.STELLAR_SPLIT_TOKEN_CONTRACT_ID }}
         run: npm run test:integration
 
+  fuzz:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run fuzz targets (input validation)
+        env:
+          FUZZ_TIME: "300"
+          FUZZ_SEED_CORPUS: fuzz/corpus
+          FUZZ_CRASH_DIR: fuzz/crashes
+        run: npm run fuzz
+
+      - name: Upload fuzz crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz/crashes
+          if-no-files-found: ignore

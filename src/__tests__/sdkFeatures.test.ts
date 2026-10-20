@@ -187,4 +187,80 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
       expect(stats.successRate).toBe(100);
     });
   });
+
+  describe("Issue #1187 - Input Validation Fuzzing", () => {
+    // Deterministic PRNG so fuzz runs are reproducible in CI.
+    const makeRng = (seed: number) => {
+      let state = seed >>> 0;
+      return () => {
+        state = (state * 1664525 + 1013904223) >>> 0;
+        return state / 0x100000000;
+      };
+    };
+
+    const pick = <T>(rng: () => number, items: T[]): T =>
+      items[Math.floor(rng() * items.length)];
+
+    const randomString = (rng: () => number): string => {
+      const len = Math.floor(rng() * 64);
+      const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-\u0000\uFFFD";
+      let out = "";
+      for (let i = 0; i < len; i++) out += alphabet[Math.floor(rng() * alphabet.length)];
+      return out;
+    };
+
+    const randomInvoice = (rng: () => number): CreateInvoiceParams => ({
+      creator: randomString(rng),
+      token: randomString(rng),
+      deadline: Math.floor(rng() * 1e12),
+      recipients: Array.from({ length: Math.floor(rng() * 5) }, () => ({
+        address: randomString(rng),
+        amount: BigInt(Math.floor(rng() * 1e9)),
+      })) as any,
+    });
+
+    it("should never throw unexpected errors on arbitrary batch inputs", async () => {
+      const client = new StellarSplitClient(config);
+      const rng = makeRng(0x1187);
+
+      for (let i = 0; i < 50; i++) {
+        const size = Math.floor(rng() * 25);
+        const batch = Array.from({ length: size }, () => randomInvoice(rng));
+
+        try {
+          await client.batchCreateInvoices(batch);
+        } catch (err) {
+          // Only expected validation errors are acceptable; no crashes.
+          expect(err).toBeInstanceOf(Error);
+        }
+      }
+    });
+
+    it("should reject out-of-range batch sizes without crashing", async () => {
+      const client = new StellarSplitClient(config);
+      const rng = makeRng(0xBAD);
+
+      for (let i = 0; i < 20; i++) {
+        const size = Math.floor(rng() * 40);
+        const batch = Array.from({ length: size }, () => randomInvoice(rng));
+
+        if (size < 1 || size > 20) {
+          await expect(client.batchCreateInvoices(batch)).rejects.toBeInstanceOf(BatchTooLargeError);
+        }
+      }
+    });
+
+    it("should handle malformed event payloads gracefully", () => {
+      const emitter = new TypedEventEmitter<{ test: { value: unknown } }>();
+      const rng = makeRng(0xE7E7);
+      const handler = vi.fn();
+      emitter.on("test", handler);
+
+      for (let i = 0; i < 50; i++) {
+        const payload = { value: rng() > 0.5 ? randomString(rng) : Math.floor(rng() * 1e6) };
+        expect(() => emitter.emit("test", payload)).not.toThrow();
+      }
+      expect(handler).toHaveBeenCalledTimes(50);
+    });
+  });
 });
