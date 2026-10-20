@@ -2008,3 +2008,19 @@ export type {
   NonceEventListener,
 } from "./nonceManager.js";
 
+
+// Connection Pooling (#1136)
+export { RpcConnectionPool } from "./connectionPool.js";
+export type { ConnectionPoolConfig, PoolStats, ManagedConnection } from "./connectionPool.js";
+
+// Request Debouncing (#1137)
+export { RequestDebouncer } from "./requestDebouncer.js";
+export type { DebounceConfig } from "./requestDebouncer.js";
+
+// Memory Optimization (#1138)
+export { ObjectPool, MemoryOptimizer } from "./memoryOptimizer.js";
+export type { MemoryReport } from "./memoryOptimizer.js";
+
+// Streaming Datasets (#1139)
+export { StreamingDatasetIterator } from "./streamingDataset.js";
+export type { PageResult, StreamingDatasetOptions } from "./streamingDataset.js";
