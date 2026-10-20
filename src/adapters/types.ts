@@ -15,6 +15,9 @@ export interface WalletAdapter {
 /** Supported source chains for the cross-chain payment bridge. */
 export type BridgeSourceChain = 'ethereum' | 'solana';
 
+/** Supported bridge protocols for cross-chain payments. */
+export type BridgeProtocol = 'wormhole' | 'axelar' | 'layerzero';
+
 /** Lifecycle status of a cross-chain bridge transfer. */
 export type BridgeTransferStatus =
   | 'pending'
@@ -38,6 +41,8 @@ export interface BridgeTransferParams {
   sourceAsset?: string;
   /** Optional Stellar asset to receive (defaults to the bridged asset). */
   destinationAsset?: string;
+  /** Optional preferred bridge protocol; routing selects one when omitted. */
+  protocol?: BridgeProtocol;
 }
 
 /** A cross-chain bridge transfer record. */
@@ -48,6 +53,8 @@ export interface BridgeTransfer {
   status: BridgeTransferStatus;
   /** Parameters the transfer was initiated with. */
   params: BridgeTransferParams;
+  /** Bridge protocol used for the transfer. */
+  protocol?: BridgeProtocol;
   /** Source-chain transaction hash, once submitted. */
   sourceTxHash?: string;
   /** Stellar transaction hash, once submitted. */
@@ -73,6 +80,55 @@ export type BridgeEvent =
 export type BridgeEventListener = (event: BridgeEvent) => void;
 
 /**
+ * Adapter for a single bridge protocol (e.g. Wormhole, Axelar, LayerZero).
+ *
+ * Each adapter knows which source chains it supports and how to submit a
+ * transfer on the source chain and verify its arrival on Stellar.
+ */
+export interface BridgeAdapter {
+  /** Bridge protocol this adapter implements. */
+  readonly protocol: BridgeProtocol;
+  /** Source chains this adapter can bridge from. */
+  readonly supportedChains: readonly BridgeSourceChain[];
+  /** Whether this adapter supports bridging from the given source chain. */
+  supportsChain(chain: BridgeSourceChain): boolean;
+  /** Submit the transfer on the source chain; returns the source tx hash. */
+  submitSourceTransfer(params: BridgeTransferParams): Promise<string>;
+  /** Verify the transfer arrived on Stellar; returns the Stellar tx hash. */
+  verifyDestination(params: BridgeTransferParams, sourceTxHash: string): Promise<string>;
+}
+
+/** A candidate bridge route selected by the router. */
+export interface BridgeRoute {
+  /** Bridge protocol for this route. */
+  protocol: BridgeProtocol;
+  /** Source chain the route bridges from. */
+  sourceChain: BridgeSourceChain;
+  /** Estimated cost of the route, in source asset units. */
+  estimatedCost: string;
+  /** Estimated time to completion, in milliseconds. */
+  estimatedTimeMs: number;
+  /** Relative efficiency score (higher is better). */
+  score: number;
+}
+
+/** Aggregated analytics for bridge transfers. */
+export interface BridgeAnalytics {
+  /** Total number of transfers observed. */
+  totalTransfers: number;
+  /** Number of transfers per lifecycle status. */
+  byStatus: Record<BridgeTransferStatus, number>;
+  /** Number of transfers per bridge protocol. */
+  byProtocol: Partial<Record<BridgeProtocol, number>>;
+  /** Number of transfers per source chain. */
+  bySourceChain: Partial<Record<BridgeSourceChain, number>>;
+  /** Number of completed transfers. */
+  completedTransfers: number;
+  /** Number of failed transfers. */
+  failedTransfers: number;
+}
+
+/**
  * Cross-chain payment bridge client for moving funds from Ethereum/Solana to Stellar.
  */
 export interface BridgeClient {
@@ -82,6 +138,12 @@ export interface BridgeClient {
   getTransfer(id: string): Promise<BridgeTransfer | undefined>;
   /** List all known bridge transfers. */
   listTransfers(): Promise<BridgeTransfer[]>;
+  /** Detect the source chain for an address, when possible. */
+  detectChain(address: string): BridgeSourceChain | undefined;
+  /** Select an efficient bridge route for the given parameters. */
+  selectRoute(params: BridgeTransferParams): BridgeRoute | undefined;
+  /** Aggregate analytics across all known transfers. */
+  getAnalytics(): BridgeAnalytics;
   /** Subscribe to bridge lifecycle events; returns an unsubscribe function. */
   onEvent(listener: BridgeEventListener): () => void;
 }
