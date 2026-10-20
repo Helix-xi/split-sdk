@@ -46,6 +46,16 @@ export interface LedgerAdapterOptions {
    * on-device `GET_VERSION` APDU sent over the transport.
    */
   getFirmwareVersion?: (transport: Transport) => Promise<string>;
+  /**
+   * Maximum number of idle transports kept in the pool. Defaults to `1`
+   * (a single Ledger device can only serve one transport at a time).
+   */
+  maxPoolSize?: number;
+  /**
+   * Maximum age (ms) a pooled transport may be reused before it is recycled.
+   * Defaults to 30 seconds.
+   */
+  maxIdleMs?: number;
 }
 
 /**
@@ -75,33 +85,58 @@ export function compareFirmwareVersions(a: string, b: string): number {
   return 0;
 }
 
+/** A pooled transport together with the timestamp it was created at. */
+interface PooledTransport {
+  transport: Transport;
+  createdAt: number;
+}
+
+/** Snapshot of pool counters exposed via {@link LedgerAdapter.getPoolStats}. */
+export interface LedgerPoolStats {
+  /** Transports currently idle in the pool. */
+  idle: number;
+  /** Transports currently checked out by callers. */
+  inUse: number;
+  /** Total transports created over the adapter lifetime. */
+  created: number;
+  /** Total transports recycled (closed) over the adapter lifetime. */
+  recycled: number;
+  /** Total failed health checks over the adapter lifetime. */
+  healthCheckFailures: number;
+}
+
 /** Ledger hardware wallet adapter implementing WalletAdapter. */
 export class LedgerAdapter implements WalletAdapter {
   private readonly path: string;
   private readonly skipFirmwareCheck: boolean;
   private readonly getFirmwareVersion: (transport: Transport) => Promise<string>;
+  private readonly maxPoolSize: number;
+  private readonly maxIdleMs: number;
+  private readonly pool: PooledTransport[] = [];
+  private inUse = 0;
+  private created = 0;
+  private recycled = 0;
+  private healthCheckFailures = 0;
 
   constructor(path = "44'/148'/0'", options: LedgerAdapterOptions = {}) {
     this.path = path;
     this.skipFirmwareCheck = options.skipFirmwareCheck ?? false;
     this.getFirmwareVersion =
       options.getFirmwareVersion ?? ((transport) => this.queryFirmwareVersion(transport));
+    this.maxPoolSize = Math.max(1, options.maxPoolSize ?? 1);
+    this.maxIdleMs = Math.max(0, options.maxIdleMs ?? 30_000);
   }
 
   async getAddress(): Promise<string> {
-    const transport = await this.openTransport();
-    try {
+    return this.withTransport(async (transport) => {
       const str = new Str(transport);
       const { publicKey } = await str.getPublicKey(this.path);
       return publicKey;
-    } finally {
-      await transport.close();
-    }
+    });
   }
 
   async signTransaction(xdr: string, _network: string): Promise<string> {
-    const transport = await this.openTransport();
-    try {
+    return this.withTransport(async (transport) => {
       await this.assertFirmwareSupported(transport);
       const str = new Str(transport);
       const txBytes = Uint8Array.from(atob(xdr), (c) => c.charCodeAt(0));
@@ -111,8 +146,104 @@ export class LedgerAdapter implements WalletAdapter {
       );
       const sigBytes = signature as unknown as Uint8Array;
       return btoa(String.fromCharCode(...sigBytes));
+    });
+  }
+
+  /**
+   * Current pool statistics. Useful for monitoring and diagnostics.
+   */
+  getPoolStats(): LedgerPoolStats {
+    return {
+      idle: this.pool.length,
+      inUse: this.inUse,
+      created: this.created,
+      recycled: this.recycled,
+      healthCheckFailures: this.healthCheckFailures,
+    };
+  }
+
+  /**
+   * Run `fn` against a pooled transport, recycling the transport afterwards.
+   * On failure the transport is discarded (failover) so the next call opens a
+   * fresh one instead of reusing a possibly broken connection.
+   */
+  private async withTransport<T>(fn: (transport: Transport) => Promise<T>): Promise<T> {
+    const transport = await this.acquire();
+    this.inUse += 1;
+    try {
+      const result = await fn(transport);
+      await this.release(transport);
+      return result;
+    } catch (error) {
+      await this.discard(transport);
+      throw error;
     } finally {
+      this.inUse -= 1;
+    }
+  }
+
+  /**
+   * Check out a transport from the pool. Reuses an idle transport when it is
+   * still healthy and within its max idle age; otherwise opens a new one.
+   */
+  private async acquire(): Promise<Transport> {
+    while (this.pool.length > 0) {
+      const pooled = this.pool.pop() as PooledTransport;
+      if (this.isRecyclable(pooled) && (await this.isHealthy(pooled.transport))) {
+        return pooled.transport;
+      }
+      await this.closeQuietly(pooled.transport);
+      this.recycled += 1;
+    }
+    const transport = await this.openTransport();
+    this.created += 1;
+    return transport;
+  }
+
+  /** Return a healthy transport to the pool, or recycle it when full/stale. */
+  private async release(transport: Transport): Promise<void> {
+    if (this.pool.length < this.maxPoolSize) {
+      this.pool.push({ transport, createdAt: Date.now() });
+      return;
+    }
+    await this.closeQuietly(transport);
+    this.recycled += 1;
+  }
+
+  /** Discard a transport after a failure (failover). */
+  private async discard(transport: Transport): Promise<void> {
+    await this.closeQuietly(transport);
+    this.recycled += 1;
+  }
+
+  /** A pooled transport is recyclable while it is younger than maxIdleMs. */
+  private isRecyclable(pooled: PooledTransport): boolean {
+    return Date.now() - pooled.createdAt < this.maxIdleMs;
+  }
+
+  /**
+   * Lightweight health check: verify the transport still reports as open.
+   * Transports that fail the check are counted and treated as unhealthy.
+   */
+  private async isHealthy(transport: Transport): Promise<boolean> {
+    try {
+      const candidate = transport as unknown as { isOpen?: boolean };
+      if (typeof candidate.isOpen === "boolean" && !candidate.isOpen) {
+        this.healthCheckFailures += 1;
+        return false;
+      }
+      return true;
+    } catch {
+      this.healthCheckFailures += 1;
+      return false;
+    }
+  }
+
+  private async closeQuietly(transport: Transport): Promise<void> {
+    try {
       await transport.close();
+    } catch {
+      // Ignore close errors while recycling.
     }
   }
 
