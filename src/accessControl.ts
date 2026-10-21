@@ -110,6 +110,187 @@ export class AclManager {
   }
 }
 
+/**
+ * Sovereign identity integration (issue #1168).
+ *
+ * Approach: DID-style verifiable credentials (W3C VC data model).
+ * Assumptions:
+ * - Credentials are issued by trusted issuers identified by a DID string.
+ * - Verification is performed off-chain; this module validates structure,
+ *   issuer trust, expiry, and subject binding. Cryptographic signature
+ *   verification is delegated to an injected verifier so callers can plug
+ *   in their preferred DID method / crypto suite.
+ * - Consent is tracked per subject and per credential purpose so that
+ *   KYC/AML data is only used with explicit, revocable consent.
+ */
+
+export interface VerifiableCredential {
+  id: string;
+  issuer: string;
+  subject: string;
+  type: string[];
+  issuanceDate: number;
+  expirationDate?: number;
+  claims: Record<string, unknown>;
+  proof?: string;
+}
+
+export type CredentialVerifier = (
+  credential: VerifiableCredential,
+) => Promise<boolean>;
+
+export interface IdentityVerificationOptions {
+  trustedIssuers?: string[];
+  requiredTypes?: string[];
+  verifier?: CredentialVerifier;
+  now?: () => number;
+}
+
+export interface VerificationResult {
+  valid: boolean;
+  reasons: string[];
+}
+
+export type ConsentPurpose = "kyc" | "aml" | "analytics";
+
+export interface ConsentRecord {
+  subject: string;
+  purpose: ConsentPurpose;
+  granted: boolean;
+  updatedAt: number;
+}
+
+export interface IdentityAnalytics {
+  verifications: number;
+  successes: number;
+  failures: number;
+  consentsGranted: number;
+  consentsRevoked: number;
+}
+
+/**
+ * Manages sovereign identity verification, credential checking, consent,
+ * and privacy-preserving analytics.
+ */
+export class SovereignIdentityManager {
+  private readonly trustedIssuers: Set<string>;
+  private readonly requiredTypes: string[];
+  private readonly verifier?: CredentialVerifier;
+  private readonly now: () => number;
+  private readonly consents = new Map<string, ConsentRecord>();
+  private readonly analytics: IdentityAnalytics = {
+    verifications: 0,
+    successes: 0,
+    failures: 0,
+    consentsGranted: 0,
+    consentsRevoked: 0,
+  };
+
+  constructor(options: IdentityVerificationOptions = {}) {
+    this.trustedIssuers = new Set(options.trustedIssuers ?? []);
+    this.requiredTypes = options.requiredTypes ?? [];
+    this.verifier = options.verifier;
+    this.now = options.now ?? Date.now;
+  }
+
+  /**
+   * Verify a credential for KYC/AML compliance.
+   *
+   * Checks structure, issuer trust, expiry, required types, subject
+   * binding, and (when configured) the injected cryptographic verifier.
+   */
+  async verify(
+    credential: VerifiableCredential,
+    expectedSubject?: string,
+  ): Promise<VerificationResult> {
+    this.analytics.verifications++;
+    const reasons: string[] = [];
+
+    if (!credential.id || !credential.issuer || !credential.subject) {
+      reasons.push("missing required credential fields");
+    }
+    if (this.trustedIssuers.size > 0 && !this.trustedIssuers.has(credential.issuer)) {
+      reasons.push(`untrusted issuer: ${credential.issuer}`);
+    }
+    if (expectedSubject && credential.subject !== expectedSubject) {
+      reasons.push("subject mismatch");
+    }
+    if (
+      credential.expirationDate !== undefined &&
+      credential.expirationDate <= this.now()
+    ) {
+      reasons.push("credential expired");
+    }
+    for (const type of this.requiredTypes) {
+      if (!credential.type.includes(type)) {
+        reasons.push(`missing required type: ${type}`);
+      }
+    }
+    if (this.verifier) {
+      const proofValid = await this.verifier(credential);
+      if (!proofValid) {
+        reasons.push("proof verification failed");
+      }
+    }
+
+    const valid = reasons.length === 0;
+    if (valid) {
+      this.analytics.successes++;
+    } else {
+      this.analytics.failures++;
+    }
+    return { valid, reasons };
+  }
+
+  /**
+   * Grant consent for a subject to use their identity data for a purpose.
+   */
+  grantConsent(subject: string, purpose: ConsentPurpose): ConsentRecord {
+    const record: ConsentRecord = {
+      subject,
+      purpose,
+      granted: true,
+      updatedAt: this.now(),
+    };
+    this.consents.set(this.consentKey(subject, purpose), record);
+    this.analytics.consentsGranted++;
+    return record;
+  }
+
+  /**
+   * Revoke previously granted consent.
+   */
+  revokeConsent(subject: string, purpose: ConsentPurpose): ConsentRecord {
+    const record: ConsentRecord = {
+      subject,
+      purpose,
+      granted: false,
+      updatedAt: this.now(),
+    };
+    this.consents.set(this.consentKey(subject, purpose), record);
+    this.analytics.consentsRevoked++;
+    return record;
+  }
+
+  /**
+   * Check whether consent is currently granted for a purpose.
+   */
+  hasConsent(subject: string, purpose: ConsentPurpose): boolean {
+    return this.consents.get(this.consentKey(subject, purpose))?.granted ?? false;
+  }
+
+  /**
+   * Return a snapshot of identity analytics (no PII included).
+   */
+  getAnalytics(): IdentityAnalytics {
+    return { ...this.analytics };
+  }
+
+  private consentKey(subject: string, purpose: ConsentPurpose): string {
+    return `${subject}:${purpose}`;
+  }
+}
+
 export type WithdrawalStatus =
   | "pending"
   | "approved"

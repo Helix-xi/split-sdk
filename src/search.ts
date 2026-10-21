@@ -20,6 +20,41 @@ export interface SearchResult {
   status: InvoiceStatus;
 }
 
+/** Options for searchByMemo. */
+export interface SearchByMemoOptions {
+  /** When true, requires exact case matching. Default is false (case-insensitive). */
+  caseSensitive?: boolean;
+}
+
+/**
+ * Filter invoices where the memo field contains the query substring.
+ *
+ * @param invoices - Array of invoices to search
+ * @param query - Substring to search for within each invoice's memo
+ * @param opts - Search options (caseSensitive defaults to false)
+ * @returns Filtered array of matching invoices
+ */
+export function searchByMemo(
+  invoices: Invoice[],
+  query: string,
+  opts?: SearchByMemoOptions
+): Invoice[] {
+  if (!query) {
+    return invoices;
+  }
+
+  const caseSensitive = opts?.caseSensitive ?? false;
+  const normalizedQuery = caseSensitive ? query : query.toLowerCase();
+
+  return invoices.filter((invoice) => {
+    if (invoice.memo == null) {
+      return false;
+    }
+    const target = caseSensitive ? invoice.memo : invoice.memo.toLowerCase();
+    return target.includes(normalizedQuery);
+  });
+}
+
 /**
  * Search invoices by partial criteria using Horizon API.
  *

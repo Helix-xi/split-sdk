@@ -15,6 +15,9 @@ export interface WalletAdapter {
 /** Supported source chains for the cross-chain payment bridge. */
 export type BridgeSourceChain = 'ethereum' | 'solana';
 
+/** Supported bridge protocols for cross-chain payments. */
+export type BridgeProtocol = 'wormhole' | 'axelar' | 'layerzero';
+
 /** Lifecycle status of a cross-chain bridge transfer. */
 export type BridgeTransferStatus =
   | 'pending'
@@ -38,6 +41,8 @@ export interface BridgeTransferParams {
   sourceAsset?: string;
   /** Optional Stellar asset to receive (defaults to the bridged asset). */
   destinationAsset?: string;
+  /** Optional preferred bridge protocol; routing selects one when omitted. */
+  protocol?: BridgeProtocol;
 }
 
 /** A cross-chain bridge transfer record. */
@@ -48,6 +53,8 @@ export interface BridgeTransfer {
   status: BridgeTransferStatus;
   /** Parameters the transfer was initiated with. */
   params: BridgeTransferParams;
+  /** Bridge protocol used for the transfer. */
+  protocol?: BridgeProtocol;
   /** Source-chain transaction hash, once submitted. */
   sourceTxHash?: string;
   /** Stellar transaction hash, once submitted. */
@@ -73,6 +80,55 @@ export type BridgeEvent =
 export type BridgeEventListener = (event: BridgeEvent) => void;
 
 /**
+ * Adapter for a single bridge protocol (e.g. Wormhole, Axelar, LayerZero).
+ *
+ * Each adapter knows which source chains it supports and how to submit a
+ * transfer on the source chain and verify its arrival on Stellar.
+ */
+export interface BridgeAdapter {
+  /** Bridge protocol this adapter implements. */
+  readonly protocol: BridgeProtocol;
+  /** Source chains this adapter can bridge from. */
+  readonly supportedChains: readonly BridgeSourceChain[];
+  /** Whether this adapter supports bridging from the given source chain. */
+  supportsChain(chain: BridgeSourceChain): boolean;
+  /** Submit the transfer on the source chain; returns the source tx hash. */
+  submitSourceTransfer(params: BridgeTransferParams): Promise<string>;
+  /** Verify the transfer arrived on Stellar; returns the Stellar tx hash. */
+  verifyDestination(params: BridgeTransferParams, sourceTxHash: string): Promise<string>;
+}
+
+/** A candidate bridge route selected by the router. */
+export interface BridgeRoute {
+  /** Bridge protocol for this route. */
+  protocol: BridgeProtocol;
+  /** Source chain the route bridges from. */
+  sourceChain: BridgeSourceChain;
+  /** Estimated cost of the route, in source asset units. */
+  estimatedCost: string;
+  /** Estimated time to completion, in milliseconds. */
+  estimatedTimeMs: number;
+  /** Relative efficiency score (higher is better). */
+  score: number;
+}
+
+/** Aggregated analytics for bridge transfers. */
+export interface BridgeAnalytics {
+  /** Total number of transfers observed. */
+  totalTransfers: number;
+  /** Number of transfers per lifecycle status. */
+  byStatus: Record<BridgeTransferStatus, number>;
+  /** Number of transfers per bridge protocol. */
+  byProtocol: Partial<Record<BridgeProtocol, number>>;
+  /** Number of transfers per source chain. */
+  bySourceChain: Partial<Record<BridgeSourceChain, number>>;
+  /** Number of completed transfers. */
+  completedTransfers: number;
+  /** Number of failed transfers. */
+  failedTransfers: number;
+}
+
+/**
  * Cross-chain payment bridge client for moving funds from Ethereum/Solana to Stellar.
  */
 export interface BridgeClient {
@@ -82,6 +138,12 @@ export interface BridgeClient {
   getTransfer(id: string): Promise<BridgeTransfer | undefined>;
   /** List all known bridge transfers. */
   listTransfers(): Promise<BridgeTransfer[]>;
+  /** Detect the source chain for an address, when possible. */
+  detectChain(address: string): BridgeSourceChain | undefined;
+  /** Select an efficient bridge route for the given parameters. */
+  selectRoute(params: BridgeTransferParams): BridgeRoute | undefined;
+  /** Aggregate analytics across all known transfers. */
+  getAnalytics(): BridgeAnalytics;
   /** Subscribe to bridge lifecycle events; returns an unsubscribe function. */
   onEvent(listener: BridgeEventListener): () => void;
 }
@@ -203,44 +265,112 @@ export interface RequestDeduplicator {
 }
 
 /**
- * A single recorded call made against a mock provider.
- */
-export interface MockCall {
-  /** Method name that was invoked. */
-  method: string;
-  /** Arguments the method was invoked with. */
-  args: unknown[];
-  /** Timestamp of the call (ms since epoch). */
-  timestamp: number;
-}
-
-/**
- * A programmable mock provider for SDK testing.
+ * Compression algorithm negotiated for data in transit.
  *
- * Responses are registered per method and returned (or thrown) when the
- * method is invoked. All calls are recorded for later assertions.
+ * `none` is the identity codec used as the fallback when no algorithm can be
+ * agreed upon or when compression would not reduce payload size.
  */
-export interface MockProvider {
-  /** Register a resolved response for a method. */
-  on(method: string, response: unknown): MockProvider;
-  /** Register a rejected response (error) for a method. */
-  onError(method: string, error: Error | string): MockProvider;
-  /** Invoke a mocked method, returning its configured response. */
-  call<T = unknown>(method: string, ...args: unknown[]): Promise<T>;
-  /** All calls recorded so far, in invocation order. */
-  readonly calls: MockCall[];
-  /** Calls recorded for a specific method. */
-  callsFor(method: string): MockCall[];
-  /** Reset recorded calls and configured responses. */
-  reset(): void;
+export type CompressionAlgorithm = 'gzip' | 'deflate' | 'none';
+
+/**
+ * Configuration for the data-transfer compression layer.
+ *
+ * Compression is opt-in: when omitted (or `enabled` is false) payloads pass
+ * through unchanged using the `none` codec.
+ */
+export interface CompressionConfig {
+  /** Whether compression is enabled. Defaults to false. */
+  enabled?: boolean;
+  /**
+   * Algorithms the local peer supports, in order of preference. The first
+   * entry is preferred during negotiation. Defaults to ['gzip', 'deflate'].
+   */
+  algorithms?: CompressionAlgorithm[];
+  /** Compression level (0-9) passed to the codec. Defaults to 6. */
+  level?: number;
+  /**
+   * Minimum payload size in bytes below which compression is skipped and the
+   * `none` codec is used. Defaults to 0 (always attempt compression).
+   */
+  minSizeBytes?: number;
 }
 
 /**
- * A test hook that runs before/after each test in a suite.
+ * Result of negotiating a compression algorithm between two peers.
  */
-export interface TestHook {
-  /** Hook name for diagnostics. */
-  name: string;
-  /** Run the hook. */
-  run(): void | Promise<void>;
+export interface CompressionNegotiation {
+  /** Algorithm both peers agreed on, or `none` when no overlap exists. */
+  algorithm: CompressionAlgorithm;
+  /** Compression level to use for the agreed algorithm. */
+  level: number;
+  /** Whether the peers share at least one non-identity algorithm. */
+  supported: boolean;
 }
+
+/**
+ * A compressed payload ready for transfer, carrying the metadata needed to
+ * decompress it on the receiving side.
+ */
+export interface CompressedPayload {
+  /** Algorithm used to compress the payload. */
+  algorithm: CompressionAlgorithm;
+  /** Compression level used. */
+  level: number;
+  /** Original (uncompressed) size in bytes. */
+  originalSize: number;
+  /** Compressed size in bytes. */
+  compressedSize: number;
+  /** Compressed bytes (or the original bytes when algorithm is `none`). */
+  data: Uint8Array;
+}
+
+/**
+ * Cumulative compression metrics for the data-transfer layer.
+ */
+export interface CompressionMetrics {
+  /** Number of payloads compressed. */
+  compressedCount: number;
+  /** Number of payloads decompressed. */
+  decompressedCount: number;
+  /** Total original bytes across compressed payloads. */
+  originalBytes: number;
+  /** Total compressed bytes across compressed payloads. */
+  compressedBytes: number;
+  /** Number of payloads that fell back to the `none` codec. */
+  fallbackCount: number;
+  /** Ratio of bytes saved (0-1); 0 when nothing has been compressed. */
+  savingsRatio: number;
+}
+
+/**
+ * Compression layer for data in transit.
+ *
+ * Compresses outbound payloads, decompresses inbound payloads, negotiates an
+ * algorithm with a peer, and tracks cumulative metrics.
+ */
+export interface CompressionLayer {
+  /** Compress an outbound payload using the negotiated algorithm. */
+  compress(data: Uint8Array): CompressedPayload;
+  /** Decompress an inbound payload produced by {@link compress}. */
+  decompress(payload: CompressedPayload): Uint8Array;
+  /**
+   * Negotiate an algorithm given the peer's supported algorithms.
+   *
+   * @param peerAlgorithms - Algorithms the remote peer supports.
+   * @returns The agreed algorithm, or `none` when there is no overlap.
+   */
+  negotiate(peerAlgorithms: CompressionAlgorithm[]): CompressionNegotiation;
+  /** Snapshot of cumulative compression metrics. */
+  getMetrics(): CompressionMetrics;
+}
+
+/**
+ * Configuration for the database connection pool.
+ *
+ * Pooling is opt-in: when omitted, callers acquire a fresh connection per
+ * request and no recycling, health checking, or failover occurs.
+ */
+export interface ConnectionPoolConfig {
+  /** Whether connection p
+
+/* … truncated 4185 chars — edit only what you need near the top … */

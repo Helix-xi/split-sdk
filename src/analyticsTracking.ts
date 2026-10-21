@@ -9,6 +9,146 @@ import { createHash } from "crypto";
 
 export type PrivacyLevel = "strict" | "anonymized" | "standard";
 
+// ---------------------------------------------------------------------------
+// Debug Mode
+// ---------------------------------------------------------------------------
+
+export type DebugLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
+
+const DEBUG_LEVEL_ORDER: Record<DebugLevel, number> = {
+  off: 0,
+  error: 1,
+  warn: 2,
+  info: 3,
+  debug: 4,
+  trace: 5,
+};
+
+export interface DebugConfig {
+  /** Active debug level threshold. Default: "off". */
+  level?: DebugLevel;
+  /** Sink for formatted debug lines. Default: console. */
+  logger?: (line: string) => void;
+  /** Named breakpoints that should pause/flag execution. */
+  breakpoints?: string[];
+  /** Callback invoked when a breakpoint is hit. */
+  onBreakpoint?: (name: string, context?: Record<string, unknown>) => void;
+}
+
+/**
+ * Debug utilities: level gating, verbose logging, breakpoints, and state inspection.
+ */
+export class DebugController {
+  private level: DebugLevel;
+  private readonly logger: (line: string) => void;
+  private readonly breakpoints = new Set<string>();
+  private readonly onBreakpoint?: (name: string, context?: Record<string, unknown>) => void;
+  private readonly hits = new Map<string, number>();
+
+  constructor(config?: DebugConfig) {
+    this.level = config?.level ?? "off";
+    this.logger = config?.logger ?? ((line) => console.log(line));
+    this.onBreakpoint = config?.onBreakpoint;
+    for (const bp of config?.breakpoints ?? []) {
+      this.breakpoints.add(bp);
+    }
+  }
+
+  get currentLevel(): DebugLevel {
+    return this.level;
+  }
+
+  setLevel(level: DebugLevel): void {
+    this.level = level;
+  }
+
+  enable(level: DebugLevel = "debug"): void {
+    this.level = level;
+  }
+
+  disable(): void {
+    this.level = "off";
+  }
+
+  isEnabled(level: DebugLevel = "debug"): boolean {
+    return DEBUG_LEVEL_ORDER[this.level] >= DEBUG_LEVEL_ORDER[level];
+  }
+
+  /** Emit a verbose log line gated by the active debug level. */
+  log(level: Exclude<DebugLevel, "off">, message: string, context?: Record<string, unknown>): void {
+    if (!this.isEnabled(level)) return;
+    const ts = new Date().toISOString();
+    const suffix = context ? ` ${this.format(context)}` : "";
+    this.logger(`[${ts}] [${level.toUpperCase()}] ${message}${suffix}`);
+  }
+
+  error(message: string, context?: Record<string, unknown>): void {
+    this.log("error", message, context);
+  }
+
+  warn(message: string, context?: Record<string, unknown>): void {
+    this.log("warn", message, context);
+  }
+
+  info(message: string, context?: Record<string, unknown>): void {
+    this.log("info", message, context);
+  }
+
+  debug(message: string, context?: Record<string, unknown>): void {
+    this.log("debug", message, context);
+  }
+
+  trace(message: string, context?: Record<string, unknown>): void {
+    this.log("trace", message, context);
+  }
+
+  addBreakpoint(name: string): void {
+    this.breakpoints.add(name);
+  }
+
+  removeBreakpoint(name: string): void {
+    this.breakpoints.delete(name);
+  }
+
+  /**
+   * Flag execution at a named breakpoint when debug mode is enabled.
+   * Returns true when the breakpoint is active and was hit.
+   */
+  breakpoint(name: string, context?: Record<string, unknown>): boolean {
+    if (!this.isEnabled("debug") || !this.breakpoints.has(name)) return false;
+    this.hits.set(name, (this.hits.get(name) ?? 0) + 1);
+    this.log("debug", `breakpoint hit: ${name}`, context);
+    this.onBreakpoint?.(name, context);
+    return true;
+  }
+
+  getBreakpointHits(): Record<string, number> {
+    return Object.fromEntries(this.hits.entries());
+  }
+
+  /** Format a value for debug output (safe against circular references). */
+  format(value: unknown): string {
+    const seen = new WeakSet<object>();
+    try {
+      return JSON.stringify(value, (_key, val) => {
+        if (typeof val === "object" && val !== null) {
+          if (seen.has(val as object)) return "[Circular]";
+          seen.add(val as object);
+        }
+        if (typeof val === "bigint") return val.toString();
+        return val;
+      });
+    } catch {
+      return String(value);
+    }
+  }
+
+  /** Inspect arbitrary state for debugging. */
+  inspect(label: string, state: unknown): void {
+    this.log("debug", `inspect ${label}`, { state });
+  }
+}
+
 export interface AnalyticsPrivacyConfig {
   /**
    * Overall privacy level:
@@ -82,6 +222,8 @@ export interface AnalyticsTrackerOptions {
   onReport?: (report: AnalyticsReport) => void;
   /** Optional custom fetch implementation for network reporting. */
   fetchFn?: typeof fetch;
+  /** Debug mode configuration for verbose operation logging. */
+  debug?: DebugConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -263,57 +405,36 @@ export class AnalyticsCollector {
 
   private calculatePercentile(sorted: number[], p: number): number {
     if (sorted.length === 0) return 0;
-    const index = Math.ceil((p / 100) * sorted.length) - 1;
-    return sorted[Math.max(0, Math.min(index, sorted.length - 1))] ?? 0;
+    const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+    return sorted[idx];
   }
 
-  generateReport(privacyLevel: PrivacyLevel = "anonymized"): AnalyticsReport {
-    const now = Date.now();
-    const methodsReport: Record<string, MethodMetric> = {};
-
-    let totalMethodCalls = 0;
-    let totalErrors = 0;
-
+  getMethodMetrics(): Record<string, MethodMetric> {
+    const out: Record<string, MethodMetric> = {};
     for (const [method, rec] of this.methods.entries()) {
       const sorted = [...rec.durations].sort((a, b) => a - b);
-      const sum = sorted.reduce((acc, d) => acc + d, 0);
-      const avg = sorted.length > 0 ? Number((sum / sorted.length).toFixed(2)) : 0;
-      const min = sorted.length > 0 ? (sorted[0] ?? 0) : 0;
-      const max = sorted.length > 0 ? (sorted[sorted.length - 1] ?? 0) : 0;
-      const errorRate = rec.count > 0 ? Number((rec.errors / rec.count).toFixed(4)) : 0;
-
-      totalMethodCalls += rec.count;
-      totalErrors += rec.errors;
-
-      methodsReport[method] = {
+      const total = rec.durations.reduce((sum, d) => sum + d, 0);
+      out[method] = {
         calls: rec.count,
         errors: rec.errors,
-        errorRate,
-        avgDurationMs: avg,
-        minDurationMs: min,
-        maxDurationMs: max,
+        errorRate: rec.count === 0 ? 0 : rec.errors / rec.count,
+        avgDurationMs: rec.durations.length === 0 ? 0 : total / rec.durations.length,
+        minDurationMs: sorted.length === 0 ? 0 : sorted[0],
+        maxDurationMs: sorted.length === 0 ? 0 : sorted[sorted.length - 1],
         p50DurationMs: this.calculatePercentile(sorted, 50),
         p95DurationMs: this.calculatePercentile(sorted, 95),
         p99DurationMs: this.calculatePercentile(sorted, 99),
       };
     }
+    return out;
+  }
 
-    const overallErrorRate =
-      totalMethodCalls > 0 ? Number((totalErrors / totalMethodCalls).toFixed(4)) : 0;
+  getCategoryCounts(): Record<string, number> {
+    return Object.fromEntries(this.categoryCounts.entries());
+  }
 
-    return {
-      generatedAt: now,
-      periodMs: now - this.startTime,
-      privacyLevel,
-      totalEvents: this.events.length,
-      totalMethodCalls,
-      totalErrors,
-      overallErrorRate,
-      methods: methodsReport,
-      eventsByCategory: Object.fromEntries(this.categoryCounts.entries()),
-      metrics: Object.fromEntries(this.metrics.entries()),
-      events: [...this.events],
-    };
+  getPeriodMs(): number {
+    return Date.now() - this.startTime;
   }
 
   reset(): void {
@@ -323,226 +444,4 @@ export class AnalyticsCollector {
     this.categoryCounts.clear();
     this.startTime = Date.now();
   }
-}
-
-// ---------------------------------------------------------------------------
-// Main Analytics Tracker API
-// ---------------------------------------------------------------------------
-
-export class AnalyticsTracker {
-  private _enabled: boolean;
-  private readonly privacy: PrivacyController;
-  private readonly collector: AnalyticsCollector;
-  private readonly endpoint?: string;
-  private readonly onReport?: (report: AnalyticsReport) => void;
-  private readonly fetchFn: typeof fetch;
-  private flushTimer: ReturnType<typeof setInterval> | null = null;
-
-  constructor(options: AnalyticsTrackerOptions = {}) {
-    this.privacy = new PrivacyController(options.privacy);
-    // Respect Do Not Track
-    if (this.privacy.isDoNotTrackEnabled()) {
-      this._enabled = false;
-    } else {
-      this._enabled = options.enabled ?? false;
-    }
-
-    this.collector = new AnalyticsCollector(options.maxQueueSize ?? 1000);
-    this.endpoint = options.endpoint;
-    this.onReport = options.onReport;
-    this.fetchFn = options.fetchFn ?? (typeof fetch !== "undefined" ? fetch : (() => Promise.resolve({ ok: true })) as unknown as typeof fetch);
-
-    if (this._enabled && options.flushIntervalMs && options.flushIntervalMs > 0) {
-      this.flushTimer = setInterval(() => void this.flush(), options.flushIntervalMs);
-      if (typeof this.flushTimer === "object" && this.flushTimer !== null && "unref" in this.flushTimer) {
-        (this.flushTimer as NodeJS.Timeout).unref();
-      }
-    }
-  }
-
-  isEnabled(): boolean {
-    return this._enabled && !this.privacy.isDoNotTrackEnabled();
-  }
-
-  optIn(): void {
-    if (!this.privacy.isDoNotTrackEnabled()) {
-      this._enabled = true;
-    }
-  }
-
-  optOut(): void {
-    this._enabled = false;
-    this.collector.reset();
-  }
-
-  getPrivacyLevel(): PrivacyLevel {
-    return this.privacy.level;
-  }
-
-  /**
-   * Track an arbitrary SDK event with privacy scrubbing applied.
-   */
-  track(event: AnalyticsEventInput): void {
-    if (!this.isEnabled()) return;
-
-    const sanitizedProps = this.privacy.sanitizeProperties(event.properties);
-    const sanitizedEvent: AnalyticsEvent = {
-      name: this.privacy.sanitizeString(event.name),
-      category: event.category || "general",
-      properties: sanitizedProps,
-      timestamp: event.timestamp ?? Date.now(),
-    };
-
-    this.collector.recordEvent(sanitizedEvent);
-  }
-
-  /**
-   * Track method execution latency, success/failure status, and metadata.
-   */
-  trackMethod(
-    method: string,
-    durationMs: number,
-    success: boolean,
-    metadata?: Record<string, unknown>,
-  ): void {
-    if (!this.isEnabled()) return;
-
-    this.collector.recordMethod(method, Math.max(0, durationMs), success);
-    this.track({
-      name: `method:${method}`,
-      category: "method_call",
-      properties: {
-        method,
-        durationMs,
-        success,
-        ...metadata,
-      },
-    });
-  }
-
-  /**
-   * Track an error encountered during SDK operation.
-   */
-  trackError(error: Error | string, context?: Record<string, unknown>): void {
-    if (!this.isEnabled()) return;
-
-    const message = typeof error === "string" ? error : error.message;
-    const name = typeof error === "string" ? "Error" : error.name;
-
-    this.track({
-      name: "error_occurred",
-      category: "errors",
-      properties: {
-        errorName: name,
-        errorMessage: message,
-        ...context,
-      },
-    });
-    this.collector.recordMetric("error_count", 1);
-  }
-
-  /**
-   * Track a numerical metric counter or gauge.
-   */
-  trackMetric(name: string, value: number): void {
-    if (!this.isEnabled()) return;
-    this.collector.recordMetric(name, value);
-  }
-
-  /**
-   * Generate a comprehensive analytics report of all metrics accumulated.
-   */
-  generateReport(): AnalyticsReport {
-    const report = this.collector.generateReport(this.privacy.level);
-    if (this.onReport) {
-      try {
-        this.onReport(report);
-      } catch {
-        // Non-blocking report callback
-      }
-    }
-    return report;
-  }
-
-  /**
-   * Dispatch report to configured remote endpoint, notify onReport, and reset counters.
-   */
-  async flush(): Promise<AnalyticsReport | null> {
-    if (!this.isEnabled()) return null;
-
-    const report = this.generateReport();
-    this.collector.reset();
-
-    if (this.endpoint) {
-      try {
-        await this.fetchFn(this.endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(report),
-        });
-      } catch {
-        // Analytics flush failure must never break consumer operations
-      }
-    }
-
-    return report;
-  }
-
-  /**
-   * Cleanup timer resources and reset collector.
-   */
-  destroy(): void {
-    if (this.flushTimer !== null) {
-      clearInterval(this.flushTimer);
-      this.flushTimer = null;
-    }
-    this.collector.reset();
-  }
-}
-
-/**
- * Convenience helper to wrap any client or service with automated analytics tracking.
- */
-export function wrapClientWithAnalytics<T extends object>(
-  client: T,
-  tracker: AnalyticsTracker,
-): T {
-  if (!tracker.isEnabled()) {
-    return client;
-  }
-
-  return new Proxy(client, {
-    get(target, prop, receiver) {
-      const orig = Reflect.get(target, prop, receiver);
-      if (typeof orig === "function" && typeof prop === "string") {
-        return function (this: unknown, ...args: unknown[]) {
-          const start = Date.now();
-          try {
-            const result = (orig as (...a: unknown[]) => unknown).apply(this ?? target, args);
-            if (result && typeof result === "object" && "then" in result && typeof (result as Promise<unknown>).then === "function") {
-              return (result as Promise<unknown>)
-                .then((res) => {
-                  tracker.trackMethod(prop, Date.now() - start, true);
-                  return res;
-                })
-                .catch((err) => {
-                  tracker.trackMethod(prop, Date.now() - start, false, {
-                    errorMessage: (err as Error)?.message,
-                  });
-                  throw err;
-                });
-            }
-            tracker.trackMethod(prop, Date.now() - start, true);
-            return result;
-          } catch (err) {
-            tracker.trackMethod(prop, Date.now() - start, false, {
-              errorMessage: (err as Error)?.message,
-            });
-            throw err;
-          }
-        };
-      }
-      return orig;
-    },
-  });
 }

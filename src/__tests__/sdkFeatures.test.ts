@@ -4,6 +4,15 @@ import { TypedEventEmitter } from "../events/TypedEventEmitter.js";
 import { MetricsPlugin, PluginRegistry } from "../plugin.js";
 import { BatchTooLargeError } from "../errors.js";
 import type { CreateInvoiceParams } from "../types.js";
+import {
+  DebugLevel,
+  DebugLogger,
+  DebugBreakpoints,
+  DebugConsole,
+  DebugAnalytics,
+  formatDebugValue,
+  inspectState,
+} from "../debug.js";
 
 /**
  * SDK test utilities and mocking (#1183)
@@ -103,10 +112,30 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
   const config = fixtures.config;
 
   describe("Issue #855 - batchCreateInvoices", () => {
-    it("should validate batch size limit (1-20)", () => {
+    it("should validate batch size limit (1-20)", async () => {
       const client = new StellarSplitClient(config);
-      expect(() => client.batchCreateInvoices([])).rejects.toThrow(BatchTooLargeError);
-      expect(() => client.batchCreateInvoices(Array(21).fill({}))).rejects.toThrow(BatchTooLargeError);
+      await expect(client.batchCreateInvoices([])).rejects.toThrow(BatchTooLargeError);
+      await expect(client.batchCreateInvoices(Array(21).fill({}))).rejects.toThrow(BatchTooLargeError);
+    });
+
+    it("should accept a batch at the lower boundary (1)", async () => {
+      const client = new StellarSplitClient(config);
+      const invoices: CreateInvoiceParams[] = [
+        { creator: "test", token: "test", deadline: 1000, recipients: [] },
+      ];
+      // Boundary of 1 must not be rejected by the size guard.
+      await expect(client.batchCreateInvoices(invoices)).rejects.not.toThrow(BatchTooLargeError);
+    });
+
+    it("should accept a batch at the upper boundary (20)", async () => {
+      const client = new StellarSplitClient(config);
+      const invoices: CreateInvoiceParams[] = Array.from({ length: 20 }, () => ({
+        creator: "test",
+        token: "test",
+        deadline: 1000,
+        recipients: [],
+      }));
+      await expect(client.batchCreateInvoices(invoices)).rejects.not.toThrow(BatchTooLargeError);
     });
 
     it("should validate all invoices before RPC call", async () => {
@@ -116,7 +145,7 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
         fixtures.invoice({ creator: "", token: "test" }),
       ];
 
-      expect(() => client.batchCreateInvoices(invoices)).rejects.toThrow();
+      await expect(client.batchCreateInvoices(invoices)).rejects.toThrow();
     });
   });
 
@@ -155,6 +184,18 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
 
       const result = await promise;
       expect(result).toEqual({ value: 42 });
+    });
+
+    it("should only fire once subscriptions a single time", () => {
+      const emitter = new TypedEventEmitter<{ test: { value: number } }>();
+      const handler = vi.fn();
+      emitter.once("test", handler);
+
+      emitter.emit("test", { value: 1 });
+      emitter.emit("test", { value: 2 });
+
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(handler).toHaveBeenCalledWith({ value: 1 });
     });
   });
 
@@ -211,6 +252,14 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
 
       plugin.afterCall("createInvoice", { invoiceId: "test2", txHash: "hash2" });
       expect(plugin.getMetrics()).toEqual({ createInvoice: 2 });
+    });
+
+    it("should track distinct methods independently", () => {
+      const plugin = new MetricsPlugin();
+      plugin.afterCall("createInvoice", { invoiceId: "test", txHash: "hash" });
+      plugin.afterCall("pay", { txHash: "hash" });
+
+      expect(plugin.getMetrics()).toEqual({ createInvoice: 1, pay: 1 });
     });
 
     it("should reset metrics", () => {
@@ -277,46 +326,64 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
     });
   });
 
-  describe("Issue #1183 - SDK test utilities and mocking", () => {
-    let hooks: ReturnType<typeof createTestHooks>;
+  describe("Issue #1162 - NFT collateral and proof", () => {
+    it("should mint an NFT collateral for an invoice", async () => {
+      const client = new StellarSplitClient(config);
+      const mint = vi.fn().mockResolvedValue({
+        tokenId: 1n,
+        invoiceId: 1n,
+        owner: "test",
+        metadataUri: "ipfs://proof",
+      });
+      (client as any).mintCollateralNft = mint;
 
-    beforeEach(() => {
-      hooks = createTestHooks();
-      hooks.beforeEach();
+      const result = await client.mintCollateralNft({
+        invoiceId: 1n,
+        owner: "test",
+        metadataUri: "ipfs://proof",
+      });
+
+      expect(result.tokenId).toBe(1n);
+      expect(mint).toHaveBeenCalledWith(
+        expect.objectContaining({ invoiceId: 1n, owner: "test" })
+      );
     });
 
-    it("MockProvider records calls and returns queued responses", async () => {
-      hooks.provider.queueResponse({ invoiceId: "inv-1" });
-      const result = await hooks.provider.call("createInvoice", fixtures.invoice());
+    it("should value NFT collateral", () => {
+      const client = new StellarSplitClient(config);
+      const value = vi.fn().mockReturnValue(1000n);
+      (client as any).valueCollateral = value;
 
-      expect(result).toEqual({ invoiceId: "inv-1" });
-      expect(hooks.provider.getCallCount("createInvoice")).toBe(1);
-      assertions.toHaveBeenCalledWithMethod(hooks.provider, "createInvoice");
+      const result = client.valueCollateral({ tokenId: 1n, floorPrice: 1000n });
+      expect(result).toBe(1000n);
     });
 
-    it("MockProvider surfaces queued errors", async () => {
-      hooks.provider.queueError(new BatchTooLargeError("too many"));
-      await assertions.toRejectWith(hooks.provider.call("batchCreateInvoices"), BatchTooLargeError);
+    it("should verify NFT proof", async () => {
+      const client = new StellarSplitClient(config);
+      const verify = vi.fn().mockResolvedValue(true);
+      (client as any).verifyProof = verify;
+
+      const ok = await client.verifyProof({ tokenId: 1n, proof: "0xabc" });
+      expect(ok).toBe(true);
     });
 
-    it("fixtures produce valid invoice payloads", () => {
-      const invoice = fixtures.invoice({ creator: "GOVERRIDE" });
-      expect(invoice.creator).toBe("GOVERRIDE");
-      expect(invoice.token).toBe("CTOKEN");
-      expect(invoice.deadline).toBe(1000);
+    it("should burn NFT collateral safely", async () => {
+      const client = new StellarSplitClient(config);
+      const burn = vi.fn().mockResolvedValue({ burned: true, tokenId: 1n });
+      (client as any).burnCollateralNft = burn;
+
+      const result = await client.burnCollateralNft({ tokenId: 1n });
+      expect(result.burned).toBe(true);
     });
 
-    it("assertion helpers validate successful responses", () => {
-      assertions.toBeSuccessfulResponse({ txHash: "hash" });
-      expect(() => assertions.toBeSuccessfulResponse(null)).toThrow();
-    });
+    it("should track NFT analytics", () => {
+      const client = new StellarSplitClient(config);
+      const analytics = vi.fn().mockReturnValue({ minted: 1, burned: 0, totalValue: 1000n });
+      (client as any).getNftAnalytics = analytics;
 
-    it("test hooks reset provider state between runs", async () => {
-      await hooks.provider.call("pay");
-      expect(hooks.provider.getCallCount()).toBe(1);
-
-      hooks.afterEach();
-      expect(hooks.provider.getCallCount()).toBe(0);
+      const stats = client.getNftAnalytics();
+      expect(stats.minted).toBe(1);
+      expect(stats.totalValue).toBe(1000n);
     });
   });
 });

@@ -76,6 +76,18 @@ export interface AbiCacheStats {
   evictions: number;
 }
 
+/** Memory pool monitoring snapshot. */
+export interface AbiMemoryStats {
+  entryCount: number;
+  storageBytes: number;
+  maxEntries: number;
+  maxBytes: number;
+  utilization: number;
+  evictions: number;
+  collections: number;
+  lastCollectedAt: number | null;
+}
+
 /** Storage backend for cached contract ABIs. */
 export interface AbiStorage {
   get(key: string): Promise<CachedAbiEntry | null> | CachedAbiEntry | null;
@@ -109,6 +121,149 @@ export interface AbiCacheOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Lazy Module Registry (#1175)
+// ---------------------------------------------------------------------------
+
+/** Metrics captured for a lazily loaded SDK module. */
+export interface LazyModuleMetrics {
+  /** Number of times the module loader was invoked. */
+  loads: number;
+  /** Number of successful module resolutions. */
+  successes: number;
+  /** Number of failed module resolutions. */
+  failures: number;
+  /** Time spent resolving the module (ms), cumulative. */
+  totalLoadMs: number;
+  /** Timestamp of the last load attempt (ms), or null if never loaded. */
+  lastLoadedAt: number | null;
+}
+
+/** A lazily loaded SDK module registration. */
+export interface LazyModuleEntry<T = unknown> {
+  /** Unique module name used as the registry key. */
+  name: string;
+  /** Names of other modules this module depends on. */
+  dependencies: string[];
+  /** Dynamic import factory resolving the module on demand. */
+  loader: () => Promise<T>;
+}
+
+/** Error thrown when a lazy module fails to load. */
+export class LazyModuleLoadError extends Error {
+  readonly moduleName: string;
+  readonly cause?: unknown;
+
+  constructor(moduleName: string, cause?: unknown) {
+    super(`Failed to load SDK module "${moduleName}"`);
+    this.name = "LazyModuleLoadError";
+    this.moduleName = moduleName;
+    this.cause = cause;
+  }
+}
+
+/**
+ * Registry that resolves SDK modules on demand via dynamic imports.
+ *
+ * Modules are registered with a dynamic import factory and their dependency
+ * names. Dependencies are resolved (and cached) before the requested module
+ * is loaded, so startup only pays for modules that are actually used.
+ */
+export class LazyModuleRegistry {
+  private readonly entries = new Map<string, LazyModuleEntry>();
+  private readonly resolved = new Map<string, unknown>();
+  private readonly pending = new Map<string, Promise<unknown>>();
+  private readonly metrics = new Map<string, LazyModuleMetrics>();
+
+  /** Registers a module with its dynamic import factory and dependencies. */
+  register<T>(entry: LazyModuleEntry<T>): void {
+    if (this.entries.has(entry.name)) {
+      throw new Error(`SDK module "${entry.name}" is already registered`);
+    }
+    this.entries.set(entry.name, entry as LazyModuleEntry);
+    this.metrics.set(entry.name, {
+      loads: 0,
+      successes: 0,
+      failures: 0,
+      totalLoadMs: 0,
+      lastLoadedAt: null,
+    });
+  }
+
+  /** Returns true if a module with the given name is registered. */
+  has(name: string): boolean {
+    return this.entries.has(name);
+  }
+
+  /** Returns the registered dependency names for a module. */
+  getDependencies(name: string): string[] {
+    return this.entries.get(name)?.dependencies.slice() ?? [];
+  }
+
+  /**
+   * Loads a module (and its dependencies) on demand. Resolved modules are
+   * cached; concurrent calls share the same in-flight promise.
+   */
+  async load<T = unknown>(name: string): Promise<T> {
+    if (this.resolved.has(name)) {
+      return this.resolved.get(name) as T;
+    }
+
+    const inFlight = this.pending.get(name);
+    if (inFlight) {
+      return inFlight as Promise<T>;
+    }
+
+    const entry = this.entries.get(name);
+    if (!entry) {
+      throw new LazyModuleLoadError(name, new Error("module not registered"));
+    }
+
+    const promise = this.resolve(entry);
+    this.pending.set(name, promise);
+    try {
+      return (await promise) as T;
+    } finally {
+      this.pending.delete(name);
+    }
+  }
+
+  /** Returns a snapshot of load metrics for all registered modules. */
+  getMetrics(): Record<string, LazyModuleMetrics> {
+    const snapshot: Record<string, LazyModuleMetrics> = {};
+    for (const [name, m] of this.metrics) {
+      snapshot[name] = { ...m };
+    }
+    return snapshot;
+  }
+
+  private async resolve(entry: LazyModuleEntry): Promise<unknown> {
+    const metrics = this.metrics.get(entry.name)!;
+    metrics.loads++;
+    metrics.lastLoadedAt = Date.now();
+    const startedAt = Date.now();
+
+    try {
+      // Resolve dependencies first so the module can rely on them.
+      for (const dep of entry.dependencies) {
+        await this.load(dep);
+      }
+
+      const mod = await entry.loader();
+      this.resolved.set(entry.name, mod);
+      metrics.successes++;
+      metrics.totalLoadMs += Date.now() - startedAt;
+      return mod;
+    } catch (err) {
+      metrics.failures++;
+      metrics.totalLoadMs += Date.now() - startedAt;
+      throw err instanceof LazyModuleLoadError
+        ? err
+        : new LazyModuleLoadError(entry.name, err);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Storage Implementations
 // ---------------------------------------------------------------------------
 
@@ -121,6 +276,8 @@ export class MemoryAbiStorage implements AbiStorage {
   private readonly maxEntries: number;
   private readonly maxBytes: number;
   private evictions = 0;
+  private collections = 0;
+  private lastCollectedAt: number | null = null;
   private accessSeq = 0;
 
   constructor(options?: { maxEntries?: number; maxBytes?: number }) {
@@ -186,6 +343,39 @@ export class MemoryAbiStorage implements AbiStorage {
     return this.evictions;
   }
 
+  /**
+   * Garbage-collects entries that have expired (past their `expiresAt`).
+   * Returns the number of entries removed.
+   */
+  collectGarbage(now: number = Date.now()): number {
+    let removed = 0;
+    for (const [key, entry] of this.store) {
+      if (entry.expiresAt > 0 && entry.expiresAt <= now) {
+        this.delete(key);
+        removed++;
+      }
+    }
+    this.collections++;
+    this.lastCollectedAt = now;
+    return removed;
+  }
+
+  /** Returns a snapshot of current memory pool usage. */
+  getMemoryStats(): AbiMemoryStats {
+    const utilization =
+      this.maxBytes > 0 ? Math.min(1, this.totalBytes / this.maxBytes) : 0;
+    return {
+      entryCount: this.store.size,
+      storageBytes: this.totalBytes,
+      maxEntries: this.maxEntries,
+      maxBytes: this.maxBytes,
+      utilization,
+      evictions: this.evictions,
+      collections: this.collections,
+      lastCollectedAt: this.lastCollectedAt,
+    };
+  }
+
   private evictLru(): void {
     let oldestKey: string | null = null;
     let oldestAccess = Infinity;
@@ -231,329 +421,6 @@ export class AdapterAbiStorage implements AbiStorage {
 
   set(key: string, entry: CachedAbiEntry): void {
     const raw = JSON.stringify(entry);
-    entry.byteSize = Buffer.byteLength(raw, "utf8");
-    this.adapter.setItem(this.prefix + key, raw);
-  }
+    ent
 
-  delete(key: string): boolean {
-    const existed = this.adapter.getItem(this.prefix + key) !== null;
-    this.adapter.removeItem(this.prefix + key);
-    return existed;
-  }
-
-  clear(): void {
-    // Collect keys under prefix
-    const keys = this.keys();
-    for (const k of keys) {
-      this.adapter.removeItem(this.prefix + k);
-    }
-  }
-
-  keys(): string[] {
-    // Fallback inspect if possible, or maintain key registry
-    const registryKey = `${this.prefix}__all_keys__`;
-    const raw = this.adapter.getItem(registryKey);
-    return raw ? JSON.parse(raw) : [];
-  }
-
-  size(): number {
-    return this.keys().length;
-  }
-
-  getStorageBytes(): number {
-    const keys = this.keys();
-    let bytes = 0;
-    for (const k of keys) {
-      const item = this.adapter.getItem(this.prefix + k);
-      if (item) bytes += Buffer.byteLength(item, "utf8");
-    }
-    return bytes;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Fetchers
-// ---------------------------------------------------------------------------
-
-/**
- * Static in-memory registry fetcher for pre-configured or mock contract ABIs.
- */
-export class StaticContractAbiFetcher implements ContractAbiFetcher {
-  private readonly registry = new Map<string, ContractAbi>();
-
-  constructor(initialAbis?: Record<string, ContractAbi>) {
-    if (initialAbis) {
-      for (const [id, abi] of Object.entries(initialAbis)) {
-        this.registerAbi(id, abi);
-      }
-    }
-  }
-
-  registerAbi(contractId: string, abi: ContractAbi): this {
-    this.registry.set(contractId, { ...abi, contractId });
-    return this;
-  }
-
-  async fetchAbi(contractId: string): Promise<ContractAbi> {
-    const abi = this.registry.get(contractId);
-    if (!abi) {
-      throw new AbiNotFoundError(contractId);
-    }
-    return { ...abi };
-  }
-}
-
-/**
- * Soroban RPC fetcher for retrieving smart contract ABIs from on-chain contract code.
- */
-export class RpcContractAbiFetcher implements ContractAbiFetcher {
-  private readonly rpcUrl: string;
-
-  constructor(rpcUrl: string) {
-    this.rpcUrl = rpcUrl;
-  }
-
-  async fetchAbi(contractId: string): Promise<ContractAbi> {
-    try {
-      // Perform RPC lookup for contract ledger entry or spec
-      const response = await fetch(this.rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: "get-contract-abi",
-          method: "getContractData",
-          params: { contractId },
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      const body = await response.json();
-      if (body.error) {
-        throw new Error(body.error.message ?? JSON.stringify(body.error));
-      }
-
-      return {
-        contractId,
-        functions: [],
-        fetchedAt: Date.now(),
-      };
-    } catch (err) {
-      throw new AbiFetchError(contractId, err);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// ContractAbiCache System
-// ---------------------------------------------------------------------------
-
-/**
- * High-performance smart contract ABI cache.
- *
- * Implements transparent lookup, sound multi-strategy invalidation,
- * storage quotas, and hit/miss observability metrics.
- */
-export class ContractAbiCache {
-  private readonly storage: AbiStorage;
-  private readonly fetcher?: ContractAbiFetcher;
-  private readonly ttlMs: number;
-  private readonly compact: boolean;
-
-  private hits = 0;
-  private misses = 0;
-  private evictions = 0;
-
-  constructor(options: AbiCacheOptions = {}) {
-    this.storage =
-      options.storage ??
-      new MemoryAbiStorage({
-        maxEntries: options.maxEntries,
-        maxBytes: options.maxStorageBytes,
-      });
-
-    if (typeof options.fetcher === "function") {
-      this.fetcher = { fetchAbi: options.fetcher };
-    } else {
-      this.fetcher = options.fetcher;
-    }
-
-    this.ttlMs = options.ttlMs ?? 60 * 60 * 1000; // 1 hour default
-    this.compact = options.compact ?? false;
-  }
-
-  /**
-   * Retrieve contract ABI. If cached and valid, returns immediately.
-   * If not cached or expired, uses the configured fetcher to fetch and store it.
-   *
-   * @param contractId - Target contract address.
-   * @param options    - Optional overrides for forceRefresh and per-call TTL.
-   */
-  async get(
-    contractId: string,
-    options?: { forceRefresh?: boolean; ttlMs?: number },
-  ): Promise<ContractAbi> {
-    if (!options?.forceRefresh) {
-      const cached = await this.storage.get(contractId);
-      if (cached && cached.expiresAt > Date.now()) {
-        this.hits++;
-        return cached.abi;
-      }
-    }
-
-    this.misses++;
-
-    if (!this.fetcher) {
-      throw new AbiNotFoundError(contractId);
-    }
-
-    const fetched = await this.fetcher.fetchAbi(contractId);
-    const processedAbi = this.compact ? this.compactAbi(fetched) : fetched;
-
-    await this.set(contractId, processedAbi, options?.ttlMs);
-    return processedAbi;
-  }
-
-  /**
-   * Manually insert or replace a contract ABI in the cache.
-   *
-   * @param contractId - Target contract address.
-   * @param abi        - Contract ABI to cache.
-   * @param ttlMs      - Optional entry-specific TTL in milliseconds.
-   */
-  async set(contractId: string, abi: ContractAbi, ttlMs?: number): Promise<void> {
-    const now = Date.now();
-    const duration = ttlMs ?? this.ttlMs;
-    const expiresAt = now + duration;
-
-    const processed = this.compact ? this.compactAbi(abi) : abi;
-    const jsonStr = JSON.stringify(processed);
-    const byteSize = Buffer.byteLength(jsonStr, "utf8");
-
-    const entry: CachedAbiEntry = {
-      contractId,
-      abi: processed,
-      cachedAt: now,
-      expiresAt,
-      lastAccessedAt: now,
-      accessCount: 1,
-      byteSize,
-    };
-
-    await this.storage.set(contractId, entry);
-  }
-
-  /**
-   * Check if an unexpired ABI for `contractId` exists in the cache.
-   */
-  async has(contractId: string): Promise<boolean> {
-    const entry = await this.storage.get(contractId);
-    if (!entry) return false;
-    return entry.expiresAt > Date.now();
-  }
-
-  /**
-   * Invalidate a single contract's cached ABI.
-   *
-   * @param contractId - Target contract to invalidate.
-   * @returns `true` if the entry was removed.
-   */
-  async invalidate(contractId: string): Promise<boolean> {
-    return Boolean(await this.storage.delete(contractId));
-  }
-
-  /**
-   * Invalidate all cached ABIs associated with a specific WASM bytecode hash.
-   *
-   * @param wasmHash - Contract WASM hash to invalidate.
-   * @returns Number of entries invalidated.
-   */
-  async invalidateByWasmHash(wasmHash: string): Promise<number> {
-    return this.invalidateMatching((_, entry) => entry.abi.wasmHash === wasmHash);
-  }
-
-  /**
-   * Invalidate all cached entries matching a predicate function.
-   *
-   * @param predicate - Function returning true for entries to purge.
-   * @returns Number of entries removed.
-   */
-  async invalidateMatching(
-    predicate: (contractId: string, entry: CachedAbiEntry) => boolean,
-  ): Promise<number> {
-    const keys = await this.storage.keys();
-    let count = 0;
-
-    for (const key of keys) {
-      const entry = await this.storage.get(key);
-      if (entry && predicate(key, entry)) {
-        await this.storage.delete(key);
-        count++;
-      }
-    }
-
-    return count;
-  }
-
-  /**
-   * Sweep and remove all expired cache entries.
-   *
-   * @returns Number of expired entries purged.
-   */
-  async invalidateExpired(): Promise<number> {
-    const now = Date.now();
-    return this.invalidateMatching((_, entry) => entry.expiresAt <= now);
-  }
-
-  /**
-   * Purge the entire ABI cache.
-   */
-  async clear(): Promise<void> {
-    await this.storage.clear();
-  }
-
-  /**
-   * Get cache efficiency and health statistics.
-   */
-  async getStats(): Promise<AbiCacheStats> {
-    const totalLookups = this.hits + this.misses;
-    const hitRate = totalLookups > 0 ? Number((this.hits / totalLookups).toFixed(4)) : 0;
-    const entryCount = await this.storage.size();
-    const storageBytes = await this.storage.getStorageBytes();
-
-    const memEvictions =
-      this.storage instanceof MemoryAbiStorage ? this.storage.getEvictions() : this.evictions;
-
-    return {
-      hits: this.hits,
-      misses: this.misses,
-      hitRate,
-      entryCount,
-      storageBytes,
-      evictions: memEvictions,
-    };
-  }
-
-  /**
-   * Strip non-essential metadata (doc comments) to minimize memory/storage footprint.
-   */
-  private compactAbi(abi: ContractAbi): ContractAbi {
-    return {
-      ...abi,
-      functions: abi.functions.map((fn) => ({
-        name: fn.name,
-        inputs: fn.inputs.map((i) => ({ name: i.name, type: i.type })),
-        outputs: fn.outputs?.map((o) => ({ type: o.type })),
-      })),
-      types: abi.types?.map((t) => ({
-        name: t.name,
-        kind: t.kind,
-        fields: t.fields?.map((f) => ({ name: f.name, type: f.type })),
-        cases: t.cases?.map((c) => ({ name: c.name })),
-      })),
-    };
-  }
-}
+/* … truncated 1354 chars — edit only what you need near the top … */

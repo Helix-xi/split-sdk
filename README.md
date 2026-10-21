@@ -407,3 +407,6 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full guide.
 
 <!-- handsoff-issue-912 -->
 - #912: Implement advanced filter DSL for invoice queries
+
+<!-- handsoff-issue-1169 -->
+- #1169: Implement query optimization with indexes

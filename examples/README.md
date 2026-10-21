@@ -17,6 +17,7 @@ This directory contains executable, end-to-end TypeScript examples demonstrating
    - [7. Session Profiling (`profile-session.ts`)](#7-session-profiling)
    - [8. Graceful Shutdown & Drain (`graceful-shutdown-example.ts`)](#8-graceful-shutdown--drain)
 3. [Environment Configuration](#environment-configuration)
+4. [Documentation Testing](#documentation-testing)
 
 ---
 
@@ -161,3 +162,38 @@ The examples support the following environment variables (falling back to public
 | `CONTRACT_ID` | Address of deployed StellarSplit contract | Demo C... contract ID |
 | `SPLIT_SDK_LOG_LEVEL` | Minimum active SDK log level (`debug`, `info`, `warn`, `error`, `none`) | `info` |
 | `WEBHOOK_SECRET` | Secret key for HMAC webhook verification | Example test key |
+
+---
+
+## Documentation Testing
+
+Every runnable snippet in this README and in the example files is verified by the documentation test suite so the docs stay accurate as the SDK evolves.
+
+### How it works
+
+- **Extraction** — fenced `bash`/`ts`/`typescript` blocks are parsed out of the docs and example files.
+- **Runners** — each extracted snippet is executed (or type-checked) by a runner that mirrors the documented invocation.
+- **Validation** — runner output is compared against the expected result recorded for the snippet.
+- **Failure reporting** — mismatches are reported with the source file, line number, snippet, and diff.
+- **Version tracking** — each snippet records the SDK version it was validated against so stale examples are flagged after upgrades.
+
+### Running the documentation tests
+
+```bash
+# Validate all documentation examples
+npm run test:docs
+
+# Validate a single example file
+npm run test:docs -- examples/basic-split-invoice.ts
+```
+
+### Adding a new example
+
+When you add a new example or snippet:
+
+1. Add the example file under `examples/` and reference it in the table above.
+2. Include a runnable `bash` block showing how to execute it.
+3. Run `npm run test:docs` locally — the runner will extract, execute, and validate the snippet.
+4. Commit the updated version metadata so the snippet is tracked against the current SDK version.
+
+If a documentation test fails, the report identifies the exact file and snippet so the example can be corrected before merge.
