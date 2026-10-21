@@ -2,5 +2,19 @@
   "minifiedBytes": 1558823,
   "gzipBytes": 395393,
   "entryPoint": "src/index.ts",
-  "measuredAt": "2026-08-01T18:36:40.236Z"
+  "measuredAt": "2026-08-01T18:36:40.236Z",
+  "regression": {
+    "thresholds": {
+      "minifiedBytes": 0.05,
+      "gzipBytes": 0.05
+    },
+    "baselines": [
+      {
+        "label": "initial",
+        "minifiedBytes": 1558823,
+        "gzipBytes": 395393,
+        "recordedAt": "2026-08-01T18:36:40.236Z"
+      }
+    ]
+  }
 }
