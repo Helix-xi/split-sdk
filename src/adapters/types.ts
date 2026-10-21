@@ -263,3 +263,114 @@ export interface RequestDeduplicator {
   /** Subscribe to deduplication events; returns an unsubscribe function. */
   onEvent(listener: DeduplicationEventListener): () => void;
 }
+
+/**
+ * Compression algorithm negotiated for data in transit.
+ *
+ * `none` is the identity codec used as the fallback when no algorithm can be
+ * agreed upon or when compression would not reduce payload size.
+ */
+export type CompressionAlgorithm = 'gzip' | 'deflate' | 'none';
+
+/**
+ * Configuration for the data-transfer compression layer.
+ *
+ * Compression is opt-in: when omitted (or `enabled` is false) payloads pass
+ * through unchanged using the `none` codec.
+ */
+export interface CompressionConfig {
+  /** Whether compression is enabled. Defaults to false. */
+  enabled?: boolean;
+  /**
+   * Algorithms the local peer supports, in order of preference. The first
+   * entry is preferred during negotiation. Defaults to ['gzip', 'deflate'].
+   */
+  algorithms?: CompressionAlgorithm[];
+  /** Compression level (0-9) passed to the codec. Defaults to 6. */
+  level?: number;
+  /**
+   * Minimum payload size in bytes below which compression is skipped and the
+   * `none` codec is used. Defaults to 0 (always attempt compression).
+   */
+  minSizeBytes?: number;
+}
+
+/**
+ * Result of negotiating a compression algorithm between two peers.
+ */
+export interface CompressionNegotiation {
+  /** Algorithm both peers agreed on, or `none` when no overlap exists. */
+  algorithm: CompressionAlgorithm;
+  /** Compression level to use for the agreed algorithm. */
+  level: number;
+  /** Whether the peers share at least one non-identity algorithm. */
+  supported: boolean;
+}
+
+/**
+ * A compressed payload ready for transfer, carrying the metadata needed to
+ * decompress it on the receiving side.
+ */
+export interface CompressedPayload {
+  /** Algorithm used to compress the payload. */
+  algorithm: CompressionAlgorithm;
+  /** Compression level used. */
+  level: number;
+  /** Original (uncompressed) size in bytes. */
+  originalSize: number;
+  /** Compressed size in bytes. */
+  compressedSize: number;
+  /** Compressed bytes (or the original bytes when algorithm is `none`). */
+  data: Uint8Array;
+}
+
+/**
+ * Cumulative compression metrics for the data-transfer layer.
+ */
+export interface CompressionMetrics {
+  /** Number of payloads compressed. */
+  compressedCount: number;
+  /** Number of payloads decompressed. */
+  decompressedCount: number;
+  /** Total original bytes across compressed payloads. */
+  originalBytes: number;
+  /** Total compressed bytes across compressed payloads. */
+  compressedBytes: number;
+  /** Number of payloads that fell back to the `none` codec. */
+  fallbackCount: number;
+  /** Ratio of bytes saved (0-1); 0 when nothing has been compressed. */
+  savingsRatio: number;
+}
+
+/**
+ * Compression layer for data in transit.
+ *
+ * Compresses outbound payloads, decompresses inbound payloads, negotiates an
+ * algorithm with a peer, and tracks cumulative metrics.
+ */
+export interface CompressionLayer {
+  /** Compress an outbound payload using the negotiated algorithm. */
+  compress(data: Uint8Array): CompressedPayload;
+  /** Decompress an inbound payload produced by {@link compress}. */
+  decompress(payload: CompressedPayload): Uint8Array;
+  /**
+   * Negotiate an algorithm given the peer's supported algorithms.
+   *
+   * @param peerAlgorithms - Algorithms the remote peer supports.
+   * @returns The agreed algorithm, or `none` when there is no overlap.
+   */
+  negotiate(peerAlgorithms: CompressionAlgorithm[]): CompressionNegotiation;
+  /** Snapshot of cumulative compression metrics. */
+  getMetrics(): CompressionMetrics;
+}
+
+/**
+ * Configuration for the database connection pool.
+ *
+ * Pooling is opt-in: when omitted, callers acquire a fresh connection per
+ * request and no recycling, health checking, or failover occurs.
+ */
+export interface ConnectionPoolConfig {
+  /** Whether connection p
+
+/* … truncated 4185 chars — edit only what you need near the top … */
