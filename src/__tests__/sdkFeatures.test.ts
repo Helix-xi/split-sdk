@@ -187,4 +187,65 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
       expect(stats.successRate).toBe(100);
     });
   });
+
+  describe("Issue #1162 - NFT collateral and proof", () => {
+    it("should mint an NFT collateral for an invoice", async () => {
+      const client = new StellarSplitClient(config);
+      const mint = vi.fn().mockResolvedValue({
+        tokenId: 1n,
+        invoiceId: 1n,
+        owner: "test",
+        metadataUri: "ipfs://proof",
+      });
+      (client as any).mintCollateralNft = mint;
+
+      const result = await client.mintCollateralNft({
+        invoiceId: 1n,
+        owner: "test",
+        metadataUri: "ipfs://proof",
+      });
+
+      expect(result.tokenId).toBe(1n);
+      expect(mint).toHaveBeenCalledWith(
+        expect.objectContaining({ invoiceId: 1n, owner: "test" })
+      );
+    });
+
+    it("should value NFT collateral", () => {
+      const client = new StellarSplitClient(config);
+      const value = vi.fn().mockReturnValue(1000n);
+      (client as any).valueCollateral = value;
+
+      const result = client.valueCollateral({ tokenId: 1n, floorPrice: 1000n });
+      expect(result).toBe(1000n);
+    });
+
+    it("should verify NFT proof", async () => {
+      const client = new StellarSplitClient(config);
+      const verify = vi.fn().mockResolvedValue(true);
+      (client as any).verifyProof = verify;
+
+      const ok = await client.verifyProof({ tokenId: 1n, proof: "0xabc" });
+      expect(ok).toBe(true);
+    });
+
+    it("should burn NFT collateral safely", async () => {
+      const client = new StellarSplitClient(config);
+      const burn = vi.fn().mockResolvedValue({ burned: true, tokenId: 1n });
+      (client as any).burnCollateralNft = burn;
+
+      const result = await client.burnCollateralNft({ tokenId: 1n });
+      expect(result.burned).toBe(true);
+    });
+
+    it("should track NFT analytics", () => {
+      const client = new StellarSplitClient(config);
+      const analytics = vi.fn().mockReturnValue({ minted: 1, burned: 0, totalValue: 1000n });
+      (client as any).getNftAnalytics = analytics;
+
+      const stats = client.getNftAnalytics();
+      expect(stats.minted).toBe(1);
+      expect(stats.totalValue).toBe(1000n);
+    });
+  });
 });
