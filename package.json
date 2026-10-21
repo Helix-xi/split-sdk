@@ -43,6 +43,11 @@
       "types": "./dist/telemetryModule.d.ts",
       "import": "./dist/telemetryModule.js",
       "require": "./dist/telemetryModule.cjs"
+    },
+    "./lazy": {
+      "types": "./dist/lazy/index.d.ts",
+      "import": "./dist/lazy/index.js",
+      "require": "./dist/lazy/index.cjs"
     }
   },
   "files": [

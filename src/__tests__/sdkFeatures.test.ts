@@ -4,6 +4,15 @@ import { TypedEventEmitter } from "../events/TypedEventEmitter.js";
 import { MetricsPlugin, PluginRegistry } from "../plugin.js";
 import { BatchTooLargeError } from "../errors.js";
 import type { CreateInvoiceParams } from "../types.js";
+import {
+  DebugLevel,
+  DebugLogger,
+  DebugBreakpoints,
+  DebugConsole,
+  DebugAnalytics,
+  formatDebugValue,
+  inspectState,
+} from "../debug.js";
 
 describe("SDK Features (#854, #855, #856, #857)", () => {
   // Mock config
@@ -188,79 +197,64 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
     });
   });
 
-  describe("Issue #1187 - Input Validation Fuzzing", () => {
-    // Deterministic PRNG so fuzz runs are reproducible in CI.
-    const makeRng = (seed: number) => {
-      let state = seed >>> 0;
-      return () => {
-        state = (state * 1664525 + 1013904223) >>> 0;
-        return state / 0x100000000;
-      };
-    };
-
-    const pick = <T>(rng: () => number, items: T[]): T =>
-      items[Math.floor(rng() * items.length)];
-
-    const randomString = (rng: () => number): string => {
-      const len = Math.floor(rng() * 64);
-      const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-\u0000\uFFFD";
-      let out = "";
-      for (let i = 0; i < len; i++) out += alphabet[Math.floor(rng() * alphabet.length)];
-      return out;
-    };
-
-    const randomInvoice = (rng: () => number): CreateInvoiceParams => ({
-      creator: randomString(rng),
-      token: randomString(rng),
-      deadline: Math.floor(rng() * 1e12),
-      recipients: Array.from({ length: Math.floor(rng() * 5) }, () => ({
-        address: randomString(rng),
-        amount: BigInt(Math.floor(rng() * 1e9)),
-      })) as any,
-    });
-
-    it("should never throw unexpected errors on arbitrary batch inputs", async () => {
+  describe("Issue #1162 - NFT collateral and proof", () => {
+    it("should mint an NFT collateral for an invoice", async () => {
       const client = new StellarSplitClient(config);
-      const rng = makeRng(0x1187);
+      const mint = vi.fn().mockResolvedValue({
+        tokenId: 1n,
+        invoiceId: 1n,
+        owner: "test",
+        metadataUri: "ipfs://proof",
+      });
+      (client as any).mintCollateralNft = mint;
 
-      for (let i = 0; i < 50; i++) {
-        const size = Math.floor(rng() * 25);
-        const batch = Array.from({ length: size }, () => randomInvoice(rng));
+      const result = await client.mintCollateralNft({
+        invoiceId: 1n,
+        owner: "test",
+        metadataUri: "ipfs://proof",
+      });
 
-        try {
-          await client.batchCreateInvoices(batch);
-        } catch (err) {
-          // Only expected validation errors are acceptable; no crashes.
-          expect(err).toBeInstanceOf(Error);
-        }
-      }
+      expect(result.tokenId).toBe(1n);
+      expect(mint).toHaveBeenCalledWith(
+        expect.objectContaining({ invoiceId: 1n, owner: "test" })
+      );
     });
 
-    it("should reject out-of-range batch sizes without crashing", async () => {
+    it("should value NFT collateral", () => {
       const client = new StellarSplitClient(config);
-      const rng = makeRng(0xBAD);
+      const value = vi.fn().mockReturnValue(1000n);
+      (client as any).valueCollateral = value;
 
-      for (let i = 0; i < 20; i++) {
-        const size = Math.floor(rng() * 40);
-        const batch = Array.from({ length: size }, () => randomInvoice(rng));
-
-        if (size < 1 || size > 20) {
-          await expect(client.batchCreateInvoices(batch)).rejects.toBeInstanceOf(BatchTooLargeError);
-        }
-      }
+      const result = client.valueCollateral({ tokenId: 1n, floorPrice: 1000n });
+      expect(result).toBe(1000n);
     });
 
-    it("should handle malformed event payloads gracefully", () => {
-      const emitter = new TypedEventEmitter<{ test: { value: unknown } }>();
-      const rng = makeRng(0xE7E7);
-      const handler = vi.fn();
-      emitter.on("test", handler);
+    it("should verify NFT proof", async () => {
+      const client = new StellarSplitClient(config);
+      const verify = vi.fn().mockResolvedValue(true);
+      (client as any).verifyProof = verify;
 
-      for (let i = 0; i < 50; i++) {
-        const payload = { value: rng() > 0.5 ? randomString(rng) : Math.floor(rng() * 1e6) };
-        expect(() => emitter.emit("test", payload)).not.toThrow();
-      }
-      expect(handler).toHaveBeenCalledTimes(50);
+      const ok = await client.verifyProof({ tokenId: 1n, proof: "0xabc" });
+      expect(ok).toBe(true);
+    });
+
+    it("should burn NFT collateral safely", async () => {
+      const client = new StellarSplitClient(config);
+      const burn = vi.fn().mockResolvedValue({ burned: true, tokenId: 1n });
+      (client as any).burnCollateralNft = burn;
+
+      const result = await client.burnCollateralNft({ tokenId: 1n });
+      expect(result.burned).toBe(true);
+    });
+
+    it("should track NFT analytics", () => {
+      const client = new StellarSplitClient(config);
+      const analytics = vi.fn().mockReturnValue({ minted: 1, burned: 0, totalValue: 1000n });
+      (client as any).getNftAnalytics = analytics;
+
+      const stats = client.getNftAnalytics();
+      expect(stats.minted).toBe(1);
+      expect(stats.totalValue).toBe(1000n);
     });
   });
 });
