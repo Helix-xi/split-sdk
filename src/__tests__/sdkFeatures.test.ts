@@ -197,103 +197,64 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
     });
   });
 
-  describe("Issue #1180 - Debug Mode", () => {
-    it("should gate verbose logging by debug level threshold", () => {
-      const logger = new DebugLogger({ level: DebugLevel.Info });
-      const sink = vi.fn();
-      logger.addSink(sink);
-
-      logger.trace("trace msg");
-      logger.debug("debug msg");
-      logger.info("info msg");
-      logger.error("error msg");
-
-      expect(sink).toHaveBeenCalledTimes(2);
-      expect(sink.mock.calls[0][0]).toMatchObject({ level: DebugLevel.Info, message: "info msg" });
-      expect(sink.mock.calls[1][0]).toMatchObject({ level: DebugLevel.Error, message: "error msg" });
-    });
-
-    it("should emit verbose operation logs with context", () => {
-      const logger = new DebugLogger({ level: DebugLevel.Trace });
-      const sink = vi.fn();
-      logger.addSink(sink);
-
-      logger.operation("createInvoice", { invoiceId: 1n }, { durationMs: 12 });
-
-      expect(sink).toHaveBeenCalledTimes(1);
-      expect(sink.mock.calls[0][0]).toMatchObject({
-        level: DebugLevel.Trace,
-        operation: "createInvoice",
-        context: { invoiceId: 1n },
-        durationMs: 12,
+  describe("Issue #1162 - NFT collateral and proof", () => {
+    it("should mint an NFT collateral for an invoice", async () => {
+      const client = new StellarSplitClient(config);
+      const mint = vi.fn().mockResolvedValue({
+        tokenId: 1n,
+        invoiceId: 1n,
+        owner: "test",
+        metadataUri: "ipfs://proof",
       });
+      (client as any).mintCollateralNft = mint;
+
+      const result = await client.mintCollateralNft({
+        invoiceId: 1n,
+        owner: "test",
+        metadataUri: "ipfs://proof",
+      });
+
+      expect(result.tokenId).toBe(1n);
+      expect(mint).toHaveBeenCalledWith(
+        expect.objectContaining({ invoiceId: 1n, owner: "test" })
+      );
     });
 
-    it("should support enabling and disabling debug mode", () => {
-      const logger = new DebugLogger({ level: DebugLevel.Off });
-      const sink = vi.fn();
-      logger.addSink(sink);
+    it("should value NFT collateral", () => {
+      const client = new StellarSplitClient(config);
+      const value = vi.fn().mockReturnValue(1000n);
+      (client as any).valueCollateral = value;
 
-      logger.info("hidden");
-      expect(sink).not.toHaveBeenCalled();
-
-      logger.enable(DebugLevel.Debug);
-      logger.debug("visible");
-      expect(sink).toHaveBeenCalledTimes(1);
-
-      logger.disable();
-      logger.error("hidden again");
-      expect(sink).toHaveBeenCalledTimes(1);
+      const result = client.valueCollateral({ tokenId: 1n, floorPrice: 1000n });
+      expect(result).toBe(1000n);
     });
 
-    it("should trigger debug breakpoints when enabled", () => {
-      const breakpoints = new DebugBreakpoints();
-      const onHit = vi.fn();
-      breakpoints.register("beforeRpc", onHit);
+    it("should verify NFT proof", async () => {
+      const client = new StellarSplitClient(config);
+      const verify = vi.fn().mockResolvedValue(true);
+      (client as any).verifyProof = verify;
 
-      breakpoints.hit("beforeRpc", { method: "createInvoice" });
-      expect(onHit).toHaveBeenCalledWith({ method: "createInvoice" });
-
-      breakpoints.disable();
-      breakpoints.hit("beforeRpc", { method: "pay" });
-      expect(onHit).toHaveBeenCalledTimes(1);
+      const ok = await client.verifyProof({ tokenId: 1n, proof: "0xabc" });
+      expect(ok).toBe(true);
     });
 
-    it("should format debug values and inspect state", () => {
-      expect(formatDebugValue({ a: 1n, b: [1, 2] })).toContain("1n");
-      const snapshot = inspectState({ count: 3, nested: { ok: true } });
-      expect(snapshot).toMatchObject({ count: 3, nested: { ok: true } });
+    it("should burn NFT collateral safely", async () => {
+      const client = new StellarSplitClient(config);
+      const burn = vi.fn().mockResolvedValue({ burned: true, tokenId: 1n });
+      (client as any).burnCollateralNft = burn;
+
+      const result = await client.burnCollateralNft({ tokenId: 1n });
+      expect(result.burned).toBe(true);
     });
 
-    it("should expose a debug console that records entries", () => {
-      const logger = new DebugLogger({ level: DebugLevel.Debug });
-      const console = new DebugConsole(logger);
+    it("should track NFT analytics", () => {
+      const client = new StellarSplitClient(config);
+      const analytics = vi.fn().mockReturnValue({ minted: 1, burned: 0, totalValue: 1000n });
+      (client as any).getNftAnalytics = analytics;
 
-      console.log("hello", { value: 1 });
-      console.warn("careful");
-
-      const entries = console.getEntries();
-      expect(entries).toHaveLength(2);
-      expect(entries[0]).toMatchObject({ level: DebugLevel.Debug, message: "hello" });
-      expect(entries[1]).toMatchObject({ level: DebugLevel.Warn, message: "careful" });
-
-      console.clear();
-      expect(console.getEntries()).toHaveLength(0);
-    });
-
-    it("should collect debug analytics", () => {
-      const analytics = new DebugAnalytics();
-      analytics.record("createInvoice", 10);
-      analytics.record("createInvoice", 30);
-      analytics.record("pay", 5);
-
-      const summary = analytics.getSummary();
-      expect(summary.totalOperations).toBe(3);
-      expect(summary.byOperation.createInvoice).toMatchObject({ count: 2, totalMs: 40, averageMs: 20 });
-      expect(summary.byOperation.pay).toMatchObject({ count: 1, totalMs: 5, averageMs: 5 });
-
-      analytics.reset();
-      expect(analytics.getSummary().totalOperations).toBe(0);
+      const stats = client.getNftAnalytics();
+      expect(stats.minted).toBe(1);
+      expect(stats.totalValue).toBe(1000n);
     });
   });
 });

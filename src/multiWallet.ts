@@ -31,6 +31,9 @@ export {
   WalletConnectAdapter,
   LedgerAdapter,
   LedgerFirmwareTooOldError,
+  FreighterAdapter,
+  FreighterNotInstalledError,
+  FreighterConnectionError,
 };
 export type { WalletAdapter };
 
