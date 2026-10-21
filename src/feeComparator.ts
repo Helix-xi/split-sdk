@@ -14,6 +14,22 @@ import {
   scValToNative,
 } from "@stellar/stellar-sdk";
 import type { Invoice } from "./types.js";
+import { SimulationFailedError, NoReturnValueError } from "./errors.js";
+
+export interface ComparableFee {
+  amount: number;
+  asset: string;
+}
+
+export type ExchangeRateProvider = (fromAsset: string, toAsset: string) => number;
+
+export class DivisionByZeroError extends Error {
+  constructor(fromAsset: string, toAsset: string) {
+    super(`Exchange rate from ${fromAsset} to ${toAsset} cannot be zero`);
+    this.name = "DivisionByZeroError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
 
 export interface CostEstimate {
   resourceFee: bigint;
@@ -32,6 +48,37 @@ export interface FeeComparatorConfig {
   networkPassphrase: string;
   contractId: string;
   dexContractId?: string;
+}
+
+export function compareFees(
+  left: ComparableFee,
+  right: ComparableFee,
+  getRate: ExchangeRateProvider,
+): number {
+  const leftAmount = left.amount;
+  const rightAmount =
+    left.asset === right.asset
+      ? right.amount
+      : convertFeeAmount(right, left.asset, getRate);
+
+  if (leftAmount === rightAmount) {
+    return 0;
+  }
+
+  return leftAmount < rightAmount ? -1 : 1;
+}
+
+function convertFeeAmount(
+  fee: ComparableFee,
+  targetAsset: string,
+  getRate: ExchangeRateProvider,
+): number {
+  const rate = getRate(fee.asset, targetAsset);
+  if (rate === 0) {
+    throw new DivisionByZeroError(fee.asset, targetAsset);
+  }
+
+  return fee.amount * rate;
 }
 
 async function simulateResourceFee(
@@ -60,7 +107,7 @@ async function simulateResourceFee(
 
   const simResult = await server.simulateTransaction(tx);
   if (SorobanRpc.Api.isSimulationError(simResult)) {
-    throw new Error(`Simulation failed: ${simResult.error}`);
+    throw new SimulationFailedError(`Simulation failed: ${simResult.error}`, method, simResult.error);
   }
 
   const successResult = simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse;
@@ -100,11 +147,11 @@ async function getDexSwapQuote(
 
   const simResult = await server.simulateTransaction(tx);
   if (SorobanRpc.Api.isSimulationError(simResult)) {
-    throw new Error(`DEX quote simulation failed: ${simResult.error}`);
+    throw new SimulationFailedError(`DEX quote simulation failed: ${simResult.error}`, "quote", simResult.error);
   }
 
   const returnVal = (simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse).result?.retval;
-  if (!returnVal) throw new Error("No return value from DEX quote");
+  if (!returnVal) throw new NoReturnValueError("DEX quote");
 
   const outputAmount = BigInt(scValToNative(returnVal));
   const slippage = amount > outputAmount ? amount - outputAmount : 0n;

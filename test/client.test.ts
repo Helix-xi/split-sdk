@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { Keypair, StrKey } from "@stellar/stellar-sdk";
+import { Keypair, StrKey, Contract, xdr, TransactionBuilder } from "@stellar/stellar-sdk";
 import {
   formatAmount,
   parseAmount,
-  isValidAddress,
+  isValidStellarAddress,
   deadlineFromDays,
   isExpired,
   truncateAddress,
@@ -14,6 +14,7 @@ import { TelemetryCollector } from "../src/telemetryCollector.js";
 import { DIContainer } from "../src/container.js";
 import { StellarSplitClient } from "../src/client.js";
 import { WalletConnectAdapter } from "../src/adapters/walletconnect.js";
+import { KeypairSigner } from "../src/signing/adapters/KeypairSigner.js";
 import { buildSchema } from "graphql";
 import { generateGraphQLSchema } from "../src/graphql.js";
 
@@ -61,17 +62,17 @@ describe("parseAmount", () => {
 describe("isValidAddress", () => {
   it("accepts valid G address", () => {
     expect(
-      isValidAddress("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN")
+      isValidStellarAddress(Keypair.random().publicKey())
     ).toBe(true);
   });
 
   it("rejects short address", () => {
-    expect(isValidAddress("GABC")).toBe(false);
+    expect(isValidStellarAddress("GABC")).toBe(false);
   });
 
   it("rejects non-G prefix", () => {
     expect(
-      isValidAddress("SAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN")
+      isValidStellarAddress("SAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN")
     ).toBe(false);
   });
 });
@@ -177,7 +178,7 @@ describe("generateReceipt", () => {
     } as any);
 
     await expect(client.generateReceipt("123")).rejects.toThrow(
-      "Invoice must be Released to generate a receipt"
+      "Invoice 123 is not in Released status"
     );
   });
 });
@@ -460,7 +461,7 @@ describe("generateReceipt", () => {
     } as any);
 
     await expect(client.generateReceipt("123")).rejects.toThrow(
-      "Invoice must be Released to generate a receipt"
+      "Invoice 123 is not in Released status"
     );
   });
 });
@@ -701,7 +702,7 @@ describe("validatePayment", () => {
       status: "Released" as const,
       payments: [],
     } as any);
-    vi.spyOn(client as any, "_getTokenBalance").mockResolvedValue(50n);
+    vi.spyOn(client as any, "_getTokenBalance").mockResolvedValue(10n);
 
     const validation = await client.validatePayment("123", 100n);
 
@@ -846,7 +847,12 @@ describe("cloneInvoice", () => {
       clear: vi.fn(),
     };
 
-    const result = await client.cloneInvoice("123", { newDeadline: 1_800_000_000 });
+    // The fixture invoice (2023 deadline, unfunded recipient) is not cloneable;
+    // these tests exercise the submission path, so validation is skipped.
+    const result = await client.cloneInvoice("123", {
+      newDeadline: 1_800_000_000,
+      skipValidation: true,
+    });
 
     expect(result).toBe("456");
     expect(submitSpy).toHaveBeenCalledTimes(1);
@@ -886,7 +892,9 @@ describe("cloneInvoice", () => {
     };
     (client as any)._cache = cache;
 
-    await expect(client.cloneInvoice("123")).rejects.toThrow("network error");
+    await expect(
+      client.cloneInvoice("123", { skipValidation: true }),
+    ).rejects.toThrow("network error");
     expect(cache.set).not.toHaveBeenCalled();
     expect(cache.invalidate).not.toHaveBeenCalled();
   });
@@ -953,6 +961,453 @@ describe("resolveCloneChain", () => {
       });
     });
 
-    await expect(client.resolveCloneChain("x")).rejects.toThrow("clone chain depth exceeded");
+    await expect(client.resolveCloneChain("x")).rejects.toThrow("Clone chain depth exceeded");
+  });
+});
+
+describe("trackVelocity", () => {
+  it("calculates payments per day from payment timestamps", async () => {
+    const { trackVelocity } = await import("../src/velocityTracker.js");
+
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    const now = Math.floor(Date.now() / 1000);
+    const creatorAddr = "GCREATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+
+    vi.spyOn(client, "getInvoicesByCreator").mockResolvedValue({
+      items: ["inv1"],
+      nextCursor: null,
+      total: 1,
+    });
+
+    vi.spyOn(client, "getInvoice").mockResolvedValue({
+      id: "inv1",
+      creator: creatorAddr,
+      recipients: [],
+      token: "GUSDCXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      deadline: now + 86_400,
+      funded: 1_000_000n,
+      status: "Pending" as const,
+      payments: [
+        { payer: "GPAYER1", amount: 100_000n, timestamp: now },
+        { payer: "GPAYER2", amount: 100_000n, timestamp: now + 43_200 }, // 12 hours later
+        { payer: "GPAYER3", amount: 100_000n, timestamp: now + 86_400 }, // 1 day later
+      ],
+    } as any);
+
+    const report = await trackVelocity(creatorAddr, client);
+
+    expect(report.address).toBe(creatorAddr);
+    expect(report.invoices).toHaveLength(1);
+    expect(report.invoices[0]!.invoiceId).toBe("inv1");
+    expect(report.invoices[0]!.paymentsPerDay).toBeGreaterThan(0);
+    expect(report.invoices[0]!.paymentsPerDay).toBeLessThan(10);
+  });
+
+  it("classifies stalling trend for decreasing payment rate", async () => {
+    const { trackVelocity } = await import("../src/velocityTracker.js");
+
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    const now = Math.floor(Date.now() / 1000);
+    const creatorAddr = "GCREATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+
+    vi.spyOn(client, "getInvoicesByCreator").mockResolvedValue({
+      items: ["inv1"],
+      nextCursor: null,
+      total: 1,
+    });
+
+    // Payments concentrated early (stalling pattern)
+    vi.spyOn(client, "getInvoice").mockResolvedValue({
+      id: "inv1",
+      creator: creatorAddr,
+      recipients: [],
+      token: "GUSDCXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      deadline: now + 864_000,
+      funded: 1_000_000n,
+      status: "Pending" as const,
+      payments: [
+        { payer: "GPAYER1", amount: 100_000n, timestamp: now },
+        { payer: "GPAYER2", amount: 100_000n, timestamp: now + 3_600 },
+        { payer: "GPAYER3", amount: 100_000n, timestamp: now + 7_200 },
+        { payer: "GPAYER4", amount: 100_000n, timestamp: now + 432_000 }, // 5 days later
+        { payer: "GPAYER5", amount: 100_000n, timestamp: now + 435_600 },
+      ],
+    } as any);
+
+    const report = await trackVelocity(creatorAddr, client);
+
+    expect(report.invoices[0]!.trend).toBe("stalling");
+  });
+
+  it("classifies accelerating trend for increasing payment rate", async () => {
+    const { trackVelocity } = await import("../src/velocityTracker.js");
+
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    const now = Math.floor(Date.now() / 1000);
+    const creatorAddr = "GCREATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+
+    vi.spyOn(client, "getInvoicesByCreator").mockResolvedValue({
+      items: ["inv1"],
+      nextCursor: null,
+      total: 1,
+    });
+
+    // Payments concentrated later (accelerating pattern)
+    vi.spyOn(client, "getInvoice").mockResolvedValue({
+      id: "inv1",
+      creator: creatorAddr,
+      recipients: [],
+      token: "GUSDCXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      deadline: now + 864_000,
+      funded: 1_000_000n,
+      status: "Pending" as const,
+      payments: [
+        { payer: "GPAYER1", amount: 100_000n, timestamp: now },
+        { payer: "GPAYER2", amount: 100_000n, timestamp: now + 172_800 }, // First half ends here (5 payments / 2 = 2.5)
+        { payer: "GPAYER3", amount: 100_000n, timestamp: now + 345_600 },
+        { payer: "GPAYER4", amount: 100_000n, timestamp: now + 432_000 },
+        { payer: "GPAYER5", amount: 100_000n, timestamp: now + 439_200 },
+      ],
+    } as any);
+
+    const report = await trackVelocity(creatorAddr, client);
+
+    expect(report.invoices[0]!.trend).toBe("accelerating");
+  });
+
+  it("classifies steady trend for constant payment rate", async () => {
+    const { trackVelocity } = await import("../src/velocityTracker.js");
+
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    const now = Math.floor(Date.now() / 1000);
+    const creatorAddr = "GCREATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+
+    vi.spyOn(client, "getInvoicesByCreator").mockResolvedValue({
+      items: ["inv1"],
+      nextCursor: null,
+      total: 1,
+    });
+
+    // Evenly distributed payments
+    vi.spyOn(client, "getInvoice").mockResolvedValue({
+      id: "inv1",
+      creator: creatorAddr,
+      recipients: [],
+      token: "GUSDCXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      deadline: now + 864_000,
+      funded: 1_000_000n,
+      status: "Pending" as const,
+      payments: [
+        { payer: "GPAYER1", amount: 100_000n, timestamp: now },
+        { payer: "GPAYER2", amount: 100_000n, timestamp: now + 86_400 },
+        { payer: "GPAYER3", amount: 100_000n, timestamp: now + 172_800 },
+        { payer: "GPAYER4", amount: 100_000n, timestamp: now + 259_200 },
+      ],
+    } as any);
+
+    const report = await trackVelocity(creatorAddr, client);
+
+    expect(report.invoices[0]!.trend).toBe("steady");
+  });
+});
+
+describe("getPaymentHistory", () => {
+  it("fetches all 8 shards in parallel and merges results sorted chronologically", async () => {
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    const payer1 = Keypair.random().publicKey();
+    const payer2 = Keypair.random().publicKey();
+    const payer3 = Keypair.random().publicKey();
+    const payer4 = Keypair.random().publicKey();
+
+    const shard0 = [
+      { payer: payer1, amount: "10000000", ledger: 100, timestamp: 1000 },
+      { payer: payer2, amount: "5000000", ledger: 101, timestamp: 1001 },
+    ];
+    const shard1 = [
+      { payer: payer3, amount: "2000000", ledger: 150, timestamp: 1500 },
+    ];
+    const shard7 = [
+      { payer: payer4, amount: "8000000", ledger: 200, timestamp: 2000 },
+    ];
+    const emptyShard: unknown[] = [];
+
+    const allCalls = [
+      Promise.resolve(shard0),
+      Promise.resolve(shard1),
+      ...Array.from({ length: 5 }, () => Promise.resolve(emptyShard)),
+      Promise.resolve(shard7),
+    ];
+
+    let callIndex = 0;
+    vi.spyOn(client as any, "_simulateView").mockImplementation(() => {
+      return allCalls[callIndex++] ?? Promise.resolve(emptyShard);
+    });
+
+    const payments = await client.getPaymentHistory("42");
+
+    expect(payments).toHaveLength(4);
+    expect(payments[0]!.payer).toBe(payer1);
+    expect(payments[1]!.payer).toBe(payer2);
+    expect(payments[2]!.payer).toBe(payer3);
+    expect(payments[3]!.payer).toBe(payer4);
+  });
+
+  it("handles missing shards gracefully", async () => {
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    vi.spyOn(client as any, "_simulateView").mockResolvedValue([]);
+
+    const payments = await client.getPaymentHistory("42");
+    expect(payments).toEqual([]);
+  });
+});
+
+describe("adminFreeze / adminUnfreeze", () => {
+  const admin = Keypair.random().publicKey();
+
+  it("adminFreeze submits transaction and returns txHash", async () => {
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    vi.spyOn(client as any, "_submitTx").mockResolvedValue({
+      txHash: "freeze-tx-hash",
+      returnValue: {} as any,
+    });
+
+    const result = await client.adminFreeze("42", admin);
+    expect(result.txHash).toBe("freeze-tx-hash");
+  });
+
+  it("adminUnfreeze submits transaction and returns txHash", async () => {
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    vi.spyOn(client as any, "_submitTx").mockResolvedValue({
+      txHash: "unfreeze-tx-hash",
+      returnValue: {} as any,
+    });
+
+    const result = await client.adminUnfreeze("42", admin);
+    expect(result.txHash).toBe("unfreeze-tx-hash");
+  });
+
+  it("passes admin address as source to _submitTx", async () => {
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    const submitSpy = vi.spyOn(client as any, "_submitTx").mockResolvedValue({
+      txHash: "tx",
+      returnValue: {} as any,
+    });
+
+    await client.adminFreeze("42", admin);
+    expect(submitSpy).toHaveBeenCalledWith(admin, expect.anything());
+  });
+});
+
+describe("getCrossChainRef / setCrossChainRef", () => {
+  const creator = Keypair.random().publicKey();
+
+  it("getCrossChainRef returns null when no ref is set", async () => {
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    vi.spyOn(client as any, "_simulateView").mockResolvedValue(null);
+
+    const result = await client.getCrossChainRef("42");
+    expect(result).toBeNull();
+  });
+
+  it("getCrossChainRef parses cross-chain ref correctly", async () => {
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    vi.spyOn(client as any, "_simulateView").mockResolvedValue({
+      chain: "ethereum",
+      tx_hash: "0xabc123",
+      block_number: "12345678",
+    });
+
+    const result = await client.getCrossChainRef("42");
+
+    expect(result).not.toBeNull();
+    expect(result!.chain).toBe("ethereum");
+    expect(result!.transactionHash).toBe("0xabc123");
+    expect(result!.blockNumber).toBe("12345678");
+  });
+
+  it("setCrossChainRef submits transaction and returns txHash", async () => {
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    vi.spyOn(client as any, "_submitTx").mockResolvedValue({
+      txHash: "cross-chain-tx",
+      returnValue: {} as any,
+    });
+
+    const result = await client.setCrossChainRef({
+      invoiceId: "42",
+      creator,
+      ref: {
+        chain: "solana",
+        transactionHash: "0xsol123",
+        blockNumber: "987654",
+      },
+    });
+
+    expect(result.txHash).toBe("cross-chain-tx");
+  });
+
+  it("setCrossChainRef passes creator as source to _submitTx", async () => {
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    const submitSpy = vi.spyOn(client as any, "_submitTx").mockResolvedValue({
+      txHash: "tx",
+      returnValue: {} as any,
+    });
+
+    await client.setCrossChainRef({
+      invoiceId: "42",
+      creator,
+      ref: {
+        chain: "ethereum",
+        transactionHash: "0xeth123",
+      },
+    });
+
+    expect(submitSpy).toHaveBeenCalledWith(creator, expect.anything());
+  });
+});
+
+describe("signer option (issue #589)", () => {
+  it("accepts a pluggable Signer and exposes it via client.signer", () => {
+    const keypair = Keypair.random();
+    const signer = new KeypairSigner(keypair);
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+      signer,
+    });
+
+    expect(client.signer).toBe(signer);
+  });
+
+  it("returns null from client.signer when no signer is configured", () => {
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    expect(client.signer).toBeNull();
+  });
+});
+
+describe("getPaymentCooldown", () => {
+  const payerAddr = Keypair.random().publicKey();
+
+  it("returns cooldown status when payer is in cooldown", async () => {
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    const now = Math.floor(Date.now() / 1000);
+    const mockCooldown = { in_cooldown: true, cooldown_ends_at: now + 3600 };
+    vi.spyOn(client as any, "_simulateView").mockResolvedValue(mockCooldown);
+
+    const result = await client.getPaymentCooldown("42", payerAddr);
+
+    expect(result.inCooldown).toBe(true);
+    expect(result.cooldownEndsAt).toBe(now + 3600);
+  });
+
+  it("returns cooldown false when no cooldown is active", async () => {
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    vi.spyOn(client as any, "_simulateView").mockResolvedValue({
+      in_cooldown: false,
+      cooldown_ends_at: null,
+    });
+
+    const result = await client.getPaymentCooldown("42", payerAddr);
+
+    expect(result.inCooldown).toBe(false);
+    expect(result.cooldownEndsAt).toBeNull();
+  });
+
+  it("handles camelCase keys from scValToNative", async () => {
+    const client = new StellarSplitClient({
+      rpcUrl: "https://example.com",
+      networkPassphrase: "Test Network",
+      contractId: StrKey.encodeContract(Keypair.random().rawPublicKey()),
+    });
+
+    vi.spyOn(client as any, "_simulateView").mockResolvedValue({
+      inCooldown: true,
+      cooldownEndsAt: 1_800_000_000,
+    });
+
+    const result = await client.getPaymentCooldown("42", payerAddr);
+
+    expect(result.inCooldown).toBe(true);
+    expect(result.cooldownEndsAt).toBe(1_800_000_000);
   });
 });

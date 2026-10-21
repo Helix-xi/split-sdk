@@ -1,0 +1,29 @@
+name: Integration Test
+
+on:
+  schedule:
+    - cron: '0 0 * * 0' # weekly on Sunday at midnight
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run integration tests (testnet only)
+        env:
+          STELLAR_NETWORK: testnet
+          STELLAR_SPLIT_CONTRACT_ID: ${{ secrets.STELLAR_SPLIT_CONTRACT_ID }}
+          STELLAR_SPLIT_TOKEN_CONTRACT_ID: ${{ secrets.STELLAR_SPLIT_TOKEN_CONTRACT_ID }}
+        run: npm run test:integration
+

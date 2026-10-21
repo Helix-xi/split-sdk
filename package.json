@@ -14,37 +14,115 @@
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
     },
+    "./ui": {
+      "types": "./dist/ui/index.d.ts",
+      "import": "./dist/ui/index.js",
+      "require": "./dist/ui/index.cjs"
+    },
     "./testing": {
       "types": "./dist/testing/index.d.ts",
       "import": "./dist/testing/index.js",
       "require": "./dist/testing/index.cjs"
+    },
+    "./utils": {
+      "types": "./dist/utils.d.ts",
+      "import": "./dist/utils.js",
+      "require": "./dist/utils.cjs"
+    },
+    "./mock": {
+      "types": "./dist/mock/index.d.ts",
+      "import": "./dist/mock/index.js",
+      "require": "./dist/mock/index.cjs"
+    },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js",
+      "require": "./dist/react/index.cjs"
+    },
+    "./telemetry": {
+      "types": "./dist/telemetryModule.d.ts",
+      "import": "./dist/telemetryModule.js",
+      "require": "./dist/telemetryModule.cjs"
     }
   },
   "files": [
     "dist"
   ],
+  "sideEffects": false,
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "test": "vitest run test/client.test.ts",
+    "test": "vitest run test/client.test.ts test/retryPolicy.test.ts test/network-environment.test.ts",
+    "test:ui": "vitest run test/ui/",
+    "test:integration": "vitest run tests/integration",
+    "test:smoke": "vitest run tests/smoke.test.ts",
+    "test:all": "vitest run",
     "test:e2e": "vitest run test/e2e",
     "test:watch": "vitest",
+    "test:bench": "vitest bench --run",
     "lint": "tsc --noEmit",
-    "changelog": "vite-node scripts/changelog.ts"
+    "changelog": "vite-node scripts/changelog.ts",
+    "docs": "typedoc",
+    "size-audit": "tsx scripts/bundle-size-audit.ts",
+    "bundle:check": "tsx scripts/bundle-size-guard.ts",
+    "bundle:update-baseline": "BUNDLE_BASELINE_UPDATE=true tsx scripts/bundle-size-guard.ts"
+  },
+  "bin": {
+    "stellar-split-sdk-migrate": "./dist/cli/migrate.js"
   },
   "dependencies": {
     "@ledgerhq/hw-app-str": "^6.29.0",
     "@ledgerhq/hw-transport-webhid": "^6.35.2",
+    "@noble/curves": "^2.2.0",
     "@stellar/freighter-api": "^3.1.0",
     "@stellar/stellar-sdk": "^13.3.0",
-    "@walletconnect/sign-client": "^2.23.9"
+    "@walletconnect/sign-client": "^2.23.9",
+    "ajv": "^8.20.0",
+    "commander": "^11.1.0",
+    "ts-morph": "^21.0.0"
   },
   "devDependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-metrics": "^1.30.1",
+    "@opentelemetry/sdk-trace-base": "^1.30.1",
+    "@size-limit/preset-small-lib": "^12.1.0",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/express": "^5.0.6",
     "@types/node": "^25.9.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "esbuild": "^0.27.7",
     "fake-indexeddb": "^6.2.5",
+    "fast-check": "^4.9.0",
     "graphql": "^16.14.0",
+    "jsdom": "^29.1.1",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "size-limit": "^12.1.0",
+    "ts-node": "^10.9.2",
     "tsup": "^8.5.1",
+    "tsx": "^4.23.1",
+    "typedoc": "^0.26.0",
+    "typedoc-plugin-markdown": "^4.0.0",
     "typescript": "^5.9.3",
     "vitest": "^1.6.1"
+  },
+  "peerDependencies": {
+    "@opentelemetry/api": "^1.7",
+    "react": "^18.0.0 || ^19.0.0",
+    "react-dom": "^18.0.0 || ^19.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentelemetry/api": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    }
   }
 }

@@ -3,11 +3,17 @@
  * No PII (addresses, amounts) is collected.
  */
 
-interface TelemetryEvent {
+export interface TelemetryEvent {
   method: string;
   success: boolean;
   durationMs: number;
   timestamp: number;
+  /**
+   * ID of the span this event was emitted within, enabling tracing backends to
+   * reconstruct parent-child relationships. `undefined` when the event was
+   * emitted outside of any active span.
+   */
+  parentSpanId?: string;
 }
 
 interface TelemetryConfig {
@@ -15,11 +21,25 @@ interface TelemetryConfig {
   optOut?: boolean;
 }
 
+/**
+ * Aggregated counters for a single method, used for Prometheus export.
+ */
+interface MethodMetrics {
+  calls: number;
+  successes: number;
+  failures: number;
+  durationMsSum: number;
+}
+
 class Telemetry {
   private config: TelemetryConfig | null = null;
   private events: TelemetryEvent[] = [];
   private flushInterval: ReturnType<typeof setInterval> | null = null;
   private readonly FLUSH_INTERVAL_MS = 60000;
+  /** Stack of active span IDs; the top is the current span for new events. */
+  private spanStack: string[] = [];
+  /** Per-method aggregated metrics, keyed by method name. */
+  private metrics = new Map<string, MethodMetrics>();
 
   /**
    * Initialize telemetry with configuration.
@@ -35,6 +55,56 @@ class Telemetry {
   }
 
   /**
+   * Mark a span as active. Events recorded until the matching {@link endSpan}
+   * (or {@link runInSpan} scope exit) inherit `spanId` as their `parentSpanId`.
+   */
+  startSpan(spanId: string): void {
+    this.spanStack.push(spanId);
+  }
+
+  /**
+   * End the most recently started span. When `spanId` is given, entries are
+   * popped up to and including its first match from the top, tolerating a
+   * missed `endSpan` call.
+   */
+  endSpan(spanId?: string): void {
+    if (spanId === undefined) {
+      this.spanStack.pop();
+      return;
+    }
+    const idx = this.spanStack.lastIndexOf(spanId);
+    if (idx !== -1) {
+      this.spanStack.length = idx;
+    }
+  }
+
+  /**
+   * Run `fn` with `spanId` active, so any telemetry events it records inherit
+   * that span as their parent. Works for sync and async `fn`; the span is
+   * always ended, including on throw or rejection.
+   */
+  runInSpan<T>(spanId: string, fn: () => T): T {
+    this.startSpan(spanId);
+    let result: T;
+    try {
+      result = fn();
+    } catch (error) {
+      this.endSpan(spanId);
+      throw error;
+    }
+    if (result instanceof Promise) {
+      return result.finally(() => this.endSpan(spanId)) as T;
+    }
+    this.endSpan(spanId);
+    return result;
+  }
+
+  /** The span ID new events currently inherit, or `undefined` outside any span. */
+  private currentSpanId(): string | undefined {
+    return this.spanStack.length > 0 ? this.spanStack[this.spanStack.length - 1] : undefined;
+  }
+
+  /**
    * Record a method call.
    */
   recordMethod(method: string, success: boolean, durationMs: number): void {
@@ -47,7 +117,79 @@ class Telemetry {
       success,
       durationMs,
       timestamp: Date.now(),
+      parentSpanId: this.currentSpanId(),
     });
+
+    this.recordMetric(method, success, durationMs);
+  }
+
+  /**
+   * Update the aggregated per-method metrics for a recorded call.
+   */
+  private recordMetric(method: string, success: boolean, durationMs: number): void {
+    let entry = this.metrics.get(method);
+    if (!entry) {
+      entry = { calls: 0, successes: 0, failures: 0, durationMsSum: 0 };
+      this.metrics.set(method, entry);
+    }
+    entry.calls += 1;
+    if (success) {
+      entry.successes += 1;
+    } else {
+      entry.failures += 1;
+    }
+    entry.durationMsSum += durationMs;
+  }
+
+  /**
+   * Escape a Prometheus label value per the text exposition format.
+   */
+  private escapeLabelValue(value: string): string {
+    return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+  }
+
+  /**
+   * Export the collected SDK metrics in the Prometheus text exposition format.
+   * Returns an empty string when telemetry is disabled or no metrics exist.
+   */
+  exportPrometheus(): string {
+    if (!this.config || this.config.optOut || this.metrics.size === 0) {
+      return "";
+    }
+
+    const lines: string[] = [];
+
+    lines.push("# HELP sdk_method_calls_total Total number of SDK method calls.");
+    lines.push("# TYPE sdk_method_calls_total counter");
+    for (const [method, m] of this.metrics) {
+      lines.push(`sdk_method_calls_total{method="${this.escapeLabelValue(method)}"} ${m.calls}`);
+    }
+
+    lines.push("# HELP sdk_method_successes_total Total number of successful SDK method calls.");
+    lines.push("# TYPE sdk_method_successes_total counter");
+    for (const [method, m] of this.metrics) {
+      lines.push(
+        `sdk_method_successes_total{method="${this.escapeLabelValue(method)}"} ${m.successes}`,
+      );
+    }
+
+    lines.push("# HELP sdk_method_failures_total Total number of failed SDK method calls.");
+    lines.push("# TYPE sdk_method_failures_total counter");
+    for (const [method, m] of this.metrics) {
+      lines.push(
+        `sdk_method_failures_total{method="${this.escapeLabelValue(method)}"} ${m.failures}`,
+      );
+    }
+
+    lines.push("# HELP sdk_method_duration_ms_sum Total duration of SDK method calls in milliseconds.");
+    lines.push("# TYPE sdk_method_duration_ms_sum counter");
+    for (const [method, m] of this.metrics) {
+      lines.push(
+        `sdk_method_duration_ms_sum{method="${this.escapeLabelValue(method)}"} ${m.durationMsSum}`,
+      );
+    }
+
+    return lines.join("\n") + "\n";
   }
 
   /**

@@ -1,5 +1,6 @@
 import { Horizon } from "@stellar/stellar-sdk";
-import type { Invoice, InvoiceStatus } from "./types.js";
+import type { InvoiceStatus } from "./types.js";
+import { SearchFailedError } from "./errors.js";
 
 /** Query parameters for searching invoices. */
 export interface SearchQuery {
@@ -77,6 +78,6 @@ export async function searchInvoices(
     // and Horizon doesn't directly support contract event filtering in the current API
     return results;
   } catch (error) {
-    throw new Error(`Search failed: ${error instanceof Error ? error.message : String(error)}`);
+    throw new SearchFailedError(error instanceof Error ? error.message : String(error));
   }
 }

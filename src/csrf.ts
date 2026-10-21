@@ -1,0 +1,348 @@
+/**
+ * CSRF protection utilities (issue #1059).
+ *
+ * Provides a small, dependency-free token system for defending state-changing
+ * requests against Cross-Site Request Forgery:
+ *
+ * - {@link generateCsrfToken} creates cryptographically random tokens
+ *   (256-bit default) encoded as base64url for safe transport in headers,
+ *   cookies, and forms.
+ * - {@link hashCsrfToken} produces a SHA-256 digest for storing tokens
+ *   server-side, so a leaked session store never exposes usable tokens.
+ * - {@link csrfTokensMatch} compares two tokens in constant time (both sides
+ *   are hashed to fixed-length digests first, so `timingSafeEqual` never
+ *   observes differing lengths).
+ * - {@link extractCsrfToken} reads a token from a case-insensitive header
+ *   record (string or first value of an array header).
+ * - {@link CsrfTokenManager} ties it together: per-session tokens with TTL,
+ *   optional single-use consumption, rotation, revocation, LRU-bounded
+ *   storage, and expired-entry cleanup. Only token *hashes* are retained.
+ *
+ * The default header (`x-csrf-token`) and cookie (`xsrf-token`) names follow
+ * the synchronizer-token / double-submit-cookie patterns; both are exported
+ * so server integrations stay consistent.
+ *
+ * Issue #1059
+ */
+
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { StellarSplitError } from "./errors.js";
+
+/** Default request header carrying the CSRF token. */
+export const CSRF_HEADER_NAME = "x-csrf-token";
+/** Default cookie carrying the CSRF token (double-submit-cookie pattern). */
+export const CSRF_COOKIE_NAME = "xsrf-token";
+
+/** Default token entropy: 32 random bytes (256 bits). */
+const DEFAULT_TOKEN_BYTES = 32;
+/** Minimum accepted token entropy: 16 random bytes (128 bits). */
+const MIN_TOKEN_BYTES = 16;
+/** Default token lifetime: 30 minutes. */
+const DEFAULT_TTL_MS = 30 * 60_000;
+/** Default cap on concurrently tracked sessions (LRU-evicted above this). */
+const DEFAULT_MAX_SESSIONS = 10_000;
+/** Longest accepted session identifier. */
+const MAX_SESSION_ID_LENGTH = 256;
+
+/** Thrown when CSRF configuration or session identifiers are invalid. */
+export class CsrfError extends StellarSplitError {
+  constructor(message: string, context?: Record<string, unknown>) {
+    super(message, "CSRF_ERROR", context);
+    this.name = "CsrfError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Token helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate a cryptographically random CSRF token.
+ *
+ * @param tokenBytes - Entropy in bytes (≥ 16). Defaults to 32 (256 bits).
+ * @returns A base64url-encoded random token.
+ * @throws {CsrfError} If `tokenBytes` is not an integer ≥ 16.
+ *
+ * @example
+ * generateCsrfToken();      // "3q2+7w==…" style base64url string
+ * generateCsrfToken(64);    // 512-bit token
+ */
+export function generateCsrfToken(tokenBytes: number = DEFAULT_TOKEN_BYTES): string {
+  if (!Number.isInteger(tokenBytes) || tokenBytes < MIN_TOKEN_BYTES) {
+    throw new CsrfError(
+      `tokenBytes must be an integer of at least ${MIN_TOKEN_BYTES}`,
+      { tokenBytes },
+    );
+  }
+  return randomBytes(tokenBytes).toString("base64url");
+}
+
+/**
+ * Hash a CSRF token with SHA-256 for storage.
+ *
+ * @param token - Raw token produced by {@link generateCsrfToken}.
+ * @returns Lowercase hex SHA-256 digest (64 chars).
+ *
+ * @example
+ * hashCsrfToken(token); // store this, never the raw token
+ */
+export function hashCsrfToken(token: string): string {
+  return createHash("sha256").update(token, "utf8").digest("hex");
+}
+
+/**
+ * Compare two CSRF tokens in constant time.
+ *
+ * Both operands are hashed to fixed-length 32-byte digests before
+ * `timingSafeEqual` runs, so neither the tokens' contents nor their lengths
+ * leak through response timing.
+ *
+ * @param a - First token.
+ * @param b - Second token.
+ * @returns `true` when both tokens are identical strings.
+ */
+export function csrfTokensMatch(a: string, b: string): boolean {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length === 0 || b.length === 0) return false;
+  const digestA = createHash("sha256").update(a, "utf8").digest();
+  const digestB = createHash("sha256").update(b, "utf8").digest();
+  return timingSafeEqual(digestA, digestB);
+}
+
+/**
+ * Extract a CSRF token from a request-header record.
+ *
+ * Lookup is case-insensitive and array-valued headers use their first entry.
+ *
+ * @param headers    - Header record (e.g. from Express/Node `req.headers`).
+ * @param headerName - Header to read. Defaults to {@link CSRF_HEADER_NAME}.
+ * @returns The trimmed token, or `null` when absent/empty.
+ *
+ * @example
+ * extractCsrfToken({ "X-CSRF-Token": "abc" }); // "abc"
+ */
+export function extractCsrfToken(
+  headers: Record<string, string | string[] | undefined>,
+  headerName: string = CSRF_HEADER_NAME,
+): string | null {
+  const wanted = headerName.toLowerCase();
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() !== wanted) continue;
+    const raw = Array.isArray(value) ? value[0] : value;
+    if (typeof raw !== "string") return null;
+    const token = raw.trim();
+    return token.length > 0 ? token : null;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Session-bound token manager
+// ---------------------------------------------------------------------------
+
+/** Options for {@link CsrfTokenManager}. */
+export interface CsrfTokenManagerOptions {
+  /** Token lifetime in milliseconds. Defaults to 30 minutes. */
+  ttlMs?: number;
+  /** Entropy per token in bytes (≥ 16). Defaults to 32. */
+  tokenBytes?: number;
+  /** Maximum tracked sessions before least-recently-used eviction. Defaults to 10 000. */
+  maxSessions?: number;
+}
+
+interface StoredCsrfToken {
+  /** SHA-256 digest of the issued token — the raw token is never retained. */
+  hash: string;
+  /** Absolute expiry in epoch milliseconds. */
+  expiresAt: number;
+}
+
+function normalizeSessionId(sessionId: unknown): string {
+  if (typeof sessionId !== "string" || sessionId.trim().length === 0) {
+    throw new CsrfError("sessionId must be a non-empty string", {
+      received: typeof sessionId,
+    });
+  }
+  const sid = sessionId.trim();
+  if (sid.length > MAX_SESSION_ID_LENGTH) {
+    throw new CsrfError(
+      `sessionId exceeds maximum length of ${MAX_SESSION_ID_LENGTH} characters`,
+      { length: sid.length },
+    );
+  }
+  return sid;
+}
+
+function hashMatches(storedHash: string, token: string): boolean {
+  // Both sides are SHA-256 hex digests (fixed 64 chars) before the
+  // constant-time comparison runs.
+  if (storedHash.length !== 64) return false;
+  try {
+    return timingSafeEqual(
+      Buffer.from(storedHash, "hex"),
+      Buffer.from(hashCsrfToken(token), "hex"),
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Session-scoped CSRF token store.
+ *
+ * Issues one token per session, validates submissions against the stored
+ * SHA-256 digest in constant time, and supports rotation, revocation,
+ * optional single-use consumption, and expired-entry cleanup. Storage is
+ * bounded by `maxSessions` with least-recently-used eviction so an attacker
+ * cannot grow memory unboundedly by spamming session identifiers.
+ *
+ * @example
+ * const csrf = new CsrfTokenManager({ ttlMs: 60_000 });
+ * const token = csrf.issueToken("session-42");
+ * csrf.validateToken("session-42", token);                  // true
+ * csrf.validateToken("session-42", token, { consume: true }); // consumes it
+ * csrf.validateToken("session-42", token);                  // false afterwards
+ */
+export class CsrfTokenManager {
+  private readonly _tokens = new Map<string, StoredCsrfToken>();
+  private readonly _ttlMs: number;
+  private readonly _tokenBytes: number;
+  private readonly _maxSessions: number;
+
+  constructor(options: CsrfTokenManagerOptions = {}) {
+    this._ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
+    this._tokenBytes = options.tokenBytes ?? DEFAULT_TOKEN_BYTES;
+    this._maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
+
+    if (!Number.isFinite(this._ttlMs) || this._ttlMs <= 0) {
+      throw new CsrfError("ttlMs must be a positive number", { ttlMs: this._ttlMs });
+    }
+    if (!Number.isInteger(this._tokenBytes) || this._tokenBytes < MIN_TOKEN_BYTES) {
+      throw new CsrfError(
+        `tokenBytes must be an integer of at least ${MIN_TOKEN_BYTES}`,
+        { tokenBytes: this._tokenBytes },
+      );
+    }
+    if (!Number.isInteger(this._maxSessions) || this._maxSessions < 1) {
+      throw new CsrfError("maxSessions must be an integer of at least 1", {
+        maxSessions: this._maxSessions,
+      });
+    }
+  }
+
+  /** Number of sessions currently tracked (including unexpired bookkeeping). */
+  get size(): number {
+    return this._tokens.size;
+  }
+
+  /**
+   * Issue (or replace) the CSRF token for `sessionId`.
+   *
+   * @param sessionId - Session the token is bound to.
+   * @returns The raw token — return it to the client, store only its hash.
+   * @throws {CsrfError} If `sessionId` is empty or too long.
+   */
+  issueToken(sessionId: string): string {
+    const sid = normalizeSessionId(sessionId);
+    const token = generateCsrfToken(this._tokenBytes);
+    this._evictIfNeeded();
+    this._tokens.delete(sid);
+    this._tokens.set(sid, {
+      hash: hashCsrfToken(token),
+      expiresAt: Date.now() + this._ttlMs,
+    });
+    return token;
+  }
+
+  /**
+   * Validate a submitted token against the session's stored hash.
+   *
+   * @param sessionId - Session the token was issued for.
+   * @param token     - Token submitted by the client.
+   * @param options   - `consume: true` makes the token single-use (replay
+   *                    protection for state-changing requests).
+   * @returns `true` when the token exists, is unexpired, and matches.
+   * @throws {CsrfError} If `sessionId` is empty or too long.
+   */
+  validateToken(
+    sessionId: string,
+    token: string,
+    options: { consume?: boolean } = {},
+  ): boolean {
+    const sid = normalizeSessionId(sessionId);
+    if (typeof token !== "string" || token.length === 0) return false;
+
+    const stored = this._tokens.get(sid);
+    if (!stored) return false;
+    if (stored.expiresAt <= Date.now()) {
+      this._tokens.delete(sid);
+      return false;
+    }
+    if (!hashMatches(stored.hash, token)) return false;
+
+    // Re-insert so a successful validation counts as a recent use for LRU
+    // eviction; consumption drops the entry entirely.
+    this._tokens.delete(sid);
+    if (!options.consume) {
+      this._tokens.set(sid, stored);
+    }
+    return true;
+  }
+
+  /**
+   * Issue a fresh token for `sessionId`, invalidating the previous one.
+   *
+   * @param sessionId - Session to rotate.
+   * @returns The new raw token.
+   * @throws {CsrfError} If `sessionId` is empty or too long.
+   */
+  rotateToken(sessionId: string): string {
+    return this.issueToken(sessionId);
+  }
+
+  /**
+   * Revoke the token bound to `sessionId`.
+   *
+   * @param sessionId - Session to revoke.
+   * @returns `true` when a token was actually removed.
+   */
+  revokeToken(sessionId: string): boolean {
+    if (typeof sessionId !== "string") return false;
+    return this._tokens.delete(sessionId.trim());
+  }
+
+  /** Revoke every tracked token (e.g. on logout or global invalidation). */
+  revokeAll(): void {
+    this._tokens.clear();
+  }
+
+  /**
+   * Drop all expired entries.
+   *
+   * @returns Number of entries removed.
+   */
+  cleanup(): number {
+    const now = Date.now();
+    let removed = 0;
+    for (const [sid, stored] of this._tokens) {
+      if (stored.expiresAt <= now) {
+        this._tokens.delete(sid);
+        removed++;
+      }
+    }
+    return removed;
+  }
+
+  private _evictIfNeeded(): void {
+    // Map iteration order is insertion order; successful validations
+    // re-insert, so the first key is the least recently used.
+    while (this._tokens.size >= this._maxSessions) {
+      const oldest = this._tokens.keys().next();
+      if (oldest.done) break;
+      this._tokens.delete(oldest.value);
+    }
+  }
+}
+
+

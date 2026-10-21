@@ -1,8 +1,9 @@
 import type { StellarSplitClientConfig } from "./client.js";
-import { isValidAddress } from "./utils.js";
+import { isValidStellarAddress } from "./utils.js";
 import { StrKey } from "@stellar/stellar-sdk";
+import { StellarSplitError } from "./errors.js";
 
-export interface ConfigValidationIssue {
+export interface ConfigValidationErrorType {
   field: string;
   message: string;
   severity: "error" | "warning";
@@ -12,7 +13,7 @@ export type ConfigValidationErrorType = ConfigValidationIssue;
 
 export interface ConfigValidation {
   valid: boolean;
-  errors: ConfigValidationIssue[];
+  errors: ConfigValidationErrorType[];
 }
 
 const KNOWN_NETWORKS = [
@@ -22,10 +23,64 @@ const KNOWN_NETWORKS = [
   "Soroban Future Network ; October 2024",
 ];
 
+const KNOWN_CONFIG_KEYS = new Set([
+  "rpcUrl",
+  "networkPassphrase",
+  "contractId",
+  "adapter",
+  "container",
+  "signingKeypair",
+  "retry",
+  "maxRetries",
+  "horizonUrl",
+  "sponsorAccount",
+  "cache",
+  "hooks",
+  "idempotency",
+  "timeout",
+  "degradation",
+  "rateLimit",
+  "telemetry",
+  "traceIdGenerator",
+  "signer",
+  "validatePassphrase",
+  "otel",
+  "rpcClient",
+  "adminKeypair",
+  "dexContractId",
+  "circuitBreaker",
+  "optimisticCache",
+  "offlineQueue",
+]);
+
+export class UnknownConfigKeyError extends StellarSplitError {
+  readonly unknownKeys: string[];
+
+  constructor(unknownKeys: string[]) {
+    super(
+      `Unknown configuration keys: ${unknownKeys.join(", ")}`,
+      "UNKNOWN_CONFIG_KEY",
+      { unknownKeys },
+    );
+    this.name = "UnknownConfigKeyError";
+    this.unknownKeys = unknownKeys;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 export function validateClientConfig(
   config: StellarSplitClientConfig
 ): ConfigValidation {
-  const errors: ConfigValidationIssue[] = [];
+  const errors: ConfigValidationErrorType[] = [];
+  const unknownKeys = Object.keys(config).filter((key) => !KNOWN_CONFIG_KEYS.has(key));
+
+  if (unknownKeys.length > 0) {
+    errors.push({
+      field: unknownKeys.join(","),
+      message: `Unknown top-level config keys: ${unknownKeys.join(", ")}`,
+      severity: "error",
+    });
+  }
 
   if (!config.rpcUrl) {
     errors.push({
@@ -155,25 +210,26 @@ export function validateClientConfig(
   }
 
   if (config.retry) {
-    const retry = config.retry as any;
-    if (
-      retry.maxRetries !== undefined &&
-      typeof retry.maxRetries !== "number"
-    ) {
+    if (typeof config.retry.maxAttempts !== "number" || config.retry.maxAttempts < 1) {
       errors.push({
-        field: "retry.maxRetries",
-        message: "retry.maxRetries must be a number",
+        field: "retry.maxAttempts",
+        message: "retry.maxAttempts must be a positive number",
         severity: "error",
       });
     }
 
-    if (
-      retry.baseDelayMs !== undefined &&
-      typeof retry.baseDelayMs !== "number"
-    ) {
+    if (typeof config.retry.baseDelayMs !== "number" || config.retry.baseDelayMs < 0) {
       errors.push({
         field: "retry.baseDelayMs",
-        message: "retry.baseDelayMs must be a number",
+        message: "retry.baseDelayMs must be a non-negative number",
+        severity: "error",
+      });
+    }
+
+    if (typeof config.retry.maxDelayMs !== "number" || config.retry.maxDelayMs < 0) {
+      errors.push({
+        field: "retry.maxDelayMs",
+        message: "retry.maxDelayMs must be a non-negative number",
         severity: "error",
       });
     }
@@ -199,7 +255,7 @@ export function validateClientConfig(
     }
   }
 
-  if (config.sponsorAccount && !isValidAddress(config.sponsorAccount)) {
+  if (config.sponsorAccount && !isValidStellarAddress(config.sponsorAccount)) {
     errors.push({
       field: "sponsorAccount",
       message: `sponsorAccount "${config.sponsorAccount}" is not a valid Stellar G... address`,
@@ -235,6 +291,11 @@ export function validateClientConfig(
 export function validateOrThrow(config: StellarSplitClientConfig): void {
   const validation = validateClientConfig(config);
 
+  const unknownKeys = Object.keys(config).filter((key) => !KNOWN_CONFIG_KEYS.has(key));
+  if (unknownKeys.length > 0) {
+    throw new UnknownConfigKeyError(unknownKeys);
+  }
+
   if (!validation.valid) {
     const errorMessages = validation.errors
       .filter((e) => e.severity === "error")
@@ -257,17 +318,180 @@ export function validateOrThrow(config: StellarSplitClientConfig): void {
       );
     }
 
-    throw new ConfigValidationError(parts.join("\n"), validation.errors);
+    throw new InvalidConfigError(parts.join("\n"), validation.errors);
   }
 }
 
-export class ConfigValidationError extends Error {
-  readonly validationErrors: ConfigValidationIssue[];
+export function validateConfig(config: StellarSplitClientConfig): void {
+  validateOrThrow(config);
+}
 
-  constructor(message: string, validationErrors: ConfigValidationIssue[]) {
-    super(message);
-    this.name = "ConfigValidationError";
+export class InvalidConfigError extends StellarSplitError {
+  readonly validationErrors: ConfigValidationErrorType[];
+
+  constructor(message: string, validationErrors: ConfigValidationErrorType[]) {
+    super(message, "CONFIG_VALIDATION_ERROR", { fieldErrors: validationErrors.length }, message);
+    this.name = "InvalidConfigError";
     this.validationErrors = validationErrors;
     Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// #883 — ConfigurationError with structured field / value / hint fields
+// ---------------------------------------------------------------------------
+
+/**
+ * The network shorthand accepted by {@link ConfigurationError} and the
+ * enhanced strict validators.
+ */
+export type NetworkShorthand = "testnet" | "mainnet";
+
+/** Map from shorthand to official Stellar network passphrases. */
+export const NETWORK_PASSPHRASE_MAP: Record<NetworkShorthand, string> = {
+  testnet: "Test SDF Network ; September 2015",
+  mainnet: "Public Global Stellar Network ; September 2015",
+};
+
+/**
+ * Structured configuration error that pinpoints exactly which field is wrong,
+ * what value was supplied, and how to fix it.
+ *
+ * @example
+ * ```ts
+ * throw new ConfigurationError({
+ *   field: 'rpcUrl',
+ *   value: 'ftp://example.com',
+ *   hint: 'rpcUrl must use the https:// scheme.',
+ * });
+ * ```
+ */
+export class ConfigurationError extends StellarSplitError {
+  /** The name of the misconfigured field. */
+  readonly field: string;
+  /** The value that was supplied (stringified). */
+  readonly value: unknown;
+  /** A human-readable suggestion for how to fix the problem. */
+  readonly hint: string;
+
+  constructor(params: { field: string; value?: unknown; hint: string }) {
+    const { field, value, hint } = params;
+    const valueStr =
+      value === undefined ? "(not provided)" : JSON.stringify(value);
+    const message = `Configuration error on field "${field}": ${hint} (got ${valueStr})`;
+    super(message, "CONFIGURATION_ERROR", { field, value, hint });
+    this.name = "ConfigurationError";
+    this.field = field;
+    this.value = value;
+    this.hint = hint;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Extended strict-validation helpers (required by issue #883)
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate a raw config object against the strict rules introduced in #883.
+ *
+ * Throws {@link ConfigurationError} on the first invalid field so the
+ * developer gets a clear, actionable message.
+ *
+ * Rules checked (in order):
+ *  1. `rpcUrl` — must be a valid **https** URL (http not allowed in strict mode)
+ *  2. `contractId` — must be a valid Stellar C-address (56 chars, C-prefix)
+ *  3. `network` — must be `"testnet"` or `"mainnet"` when provided
+ *  4. `networkPassphrase` vs `network` — must match if both are provided
+ */
+export function validateConfigStrict(config: {
+  rpcUrl: unknown;
+  contractId: unknown;
+  network?: unknown;
+  networkPassphrase?: unknown;
+}): void {
+  // ---- rpcUrl ---------------------------------------------------------------
+  if (!config.rpcUrl || typeof config.rpcUrl !== "string") {
+    throw new ConfigurationError({
+      field: "rpcUrl",
+      value: config.rpcUrl,
+      hint: "rpcUrl is required and must be a non-empty string with an https:// URL.",
+    });
+  }
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(config.rpcUrl as string);
+  } catch {
+    throw new ConfigurationError({
+      field: "rpcUrl",
+      value: config.rpcUrl,
+      hint: "rpcUrl must be a valid URL, e.g. https://soroban-testnet.stellar.org",
+    });
+  }
+
+  if (parsedUrl.protocol !== "https:") {
+    throw new ConfigurationError({
+      field: "rpcUrl",
+      value: config.rpcUrl,
+      hint: `rpcUrl must use the https:// scheme. Received "${parsedUrl.protocol}". Example: https://soroban-testnet.stellar.org`,
+    });
+  }
+
+  // ---- contractId -----------------------------------------------------------
+  if (!config.contractId || typeof config.contractId !== "string") {
+    throw new ConfigurationError({
+      field: "contractId",
+      value: config.contractId,
+      hint: "contractId is required and must be a valid Stellar C-address (56 characters, starts with 'C').",
+    });
+  }
+
+  if (
+    !(config.contractId as string).startsWith("C") ||
+    (config.contractId as string).length !== 56
+  ) {
+    throw new ConfigurationError({
+      field: "contractId",
+      value: config.contractId,
+      hint: "contractId must be a 56-character Stellar contract address starting with 'C'. Use StrKey.encodeContract() to generate one.",
+    });
+  }
+
+  try {
+    StrKey.decodeContract(config.contractId as string);
+  } catch {
+    throw new ConfigurationError({
+      field: "contractId",
+      value: config.contractId,
+      hint: "contractId failed Stellar StrKey validation. Ensure you are using a properly encoded C-address.",
+    });
+  }
+
+  // ---- network --------------------------------------------------------------
+  if (config.network !== undefined) {
+    if (
+      config.network !== "testnet" &&
+      config.network !== "mainnet"
+    ) {
+      throw new ConfigurationError({
+        field: "network",
+        value: config.network,
+        hint: 'network must be either "testnet" or "mainnet".',
+      });
+    }
+
+    // ---- networkPassphrase vs network mismatch --------------------------------
+    if (config.networkPassphrase !== undefined) {
+      const expected =
+        NETWORK_PASSPHRASE_MAP[config.network as NetworkShorthand];
+      if (config.networkPassphrase !== expected) {
+        throw new ConfigurationError({
+          field: "networkPassphrase",
+          value: config.networkPassphrase,
+          hint: `networkPassphrase does not match the selected network "${config.network}". Expected: "${expected}"`,
+        });
+      }
+    }
   }
 }
