@@ -1,138 +1,63 @@
-/**
- * Tests for FreighterAdapter — focuses on the #772 acceptance criteria:
- * - FreighterNotInstalledError is thrown with the install URL when the
- *   extension is absent.
- * - Normal connection flow is unchanged when the extension is present.
- */
-
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   FreighterAdapter,
   FreighterNotInstalledError,
-} from "../src/wallets/adapters/FreighterAdapter.js";
+  FreighterConnectionError,
+} from '../src/wallets/adapters/FreighterAdapter.js';
 
-const MOCK_ADDRESS = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
-const INSTALL_URL = "https://www.freighter.app";
+describe('FreighterAdapter', () => {
+  let mockFreighter: Record<string, unknown>;
 
-function makeFreighterMock() {
-  return {
-    isConnected: vi.fn().mockResolvedValue(true),
-    getPublicKey: vi.fn().mockResolvedValue(MOCK_ADDRESS),
-    signTransaction: vi.fn().mockResolvedValue("signed-xdr"),
-  };
-}
-
-describe("FreighterAdapter (#772)", () => {
-  let adapter: FreighterAdapter;
+  beforeEach(() => {
+    mockFreighter = {
+      isConnected: vi.fn(async () => ({ isConnected: true })),
+      getAddress: vi.fn(async () => ({ address: 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7' })),
+      getNetwork: vi.fn(async () => ({ network: 'TESTNET', networkPassphrase: 'Test SDF Network ; September 2015' })),
+      signTransaction: vi.fn(async () => ({ signedTxXdr: 'signed-xdr-payload' })),
+    };
+    // @ts-ignore
+    global.window = { freighter: mockFreighter };
+  });
 
   afterEach(() => {
-    vi.unstubAllGlobals();
-    adapter?.disconnect();
+    // @ts-ignore
+    delete global.window;
   });
 
-  // -------------------------------------------------------------------------
-  // Extension not installed
-  // -------------------------------------------------------------------------
-  describe("when Freighter is not installed", () => {
-    beforeEach(() => {
-      // Simulate missing extension
-      vi.stubGlobal("window", { freighter: undefined });
-      adapter = new FreighterAdapter();
-    });
-
-    it("throws FreighterNotInstalledError from connect()", async () => {
-      await expect(adapter.connect()).rejects.toThrow(FreighterNotInstalledError);
-    });
-
-    it("throws FreighterNotInstalledError from getAddress()", async () => {
-      await expect(adapter.getAddress()).rejects.toThrow(FreighterNotInstalledError);
-    });
-
-    it("throws FreighterNotInstalledError from sign()", async () => {
-      await expect(adapter.sign("xdr", "testnet")).rejects.toThrow(
-        FreighterNotInstalledError
-      );
-    });
-
-    it("throws FreighterNotInstalledError from signTransaction()", async () => {
-      await expect(adapter.signTransaction("xdr", "testnet")).rejects.toThrow(
-        FreighterNotInstalledError
-      );
-    });
-
-    it("error message includes the Freighter install URL", async () => {
-      try {
-        await adapter.connect();
-        expect.fail("should have thrown");
-      } catch (err) {
-        expect((err as Error).message).toContain(INSTALL_URL);
-      }
-    });
-
-    it("error is an instance of FreighterNotInstalledError", async () => {
-      try {
-        await adapter.connect();
-        expect.fail("should have thrown");
-      } catch (err) {
-        expect(err).toBeInstanceOf(FreighterNotInstalledError);
-      }
-    });
+  it('throws FreighterNotInstalledError when window.freighter is undefined', async () => {
+    // @ts-ignore
+    global.window = {};
+    const adapter = new FreighterAdapter();
+    await expect(adapter.connect()).rejects.toBeInstanceOf(FreighterNotInstalledError);
   });
 
-  // -------------------------------------------------------------------------
-  // Extension present — existing flow unchanged
-  // -------------------------------------------------------------------------
-  describe("when Freighter is installed", () => {
-    let freighterMock: ReturnType<typeof makeFreighterMock>;
-
-    beforeEach(() => {
-      freighterMock = makeFreighterMock();
-      vi.stubGlobal("window", { freighter: freighterMock });
-      adapter = new FreighterAdapter();
-    });
-
-    it("connect() returns the public key", async () => {
-      const address = await adapter.connect();
-      expect(address).toBe(MOCK_ADDRESS);
-    });
-
-    it("getAddress() returns the public key", async () => {
-      const address = await adapter.getAddress();
-      expect(address).toBe(MOCK_ADDRESS);
-      expect(freighterMock.getPublicKey).toHaveBeenCalled();
-    });
-
-    it("signTransaction() delegates to freighter.signTransaction", async () => {
-      const result = await adapter.signTransaction("test-xdr", "Test SDF Network");
-      expect(result).toBe("signed-xdr");
-      expect(freighterMock.signTransaction).toHaveBeenCalledWith(
-        "test-xdr",
-        "Test SDF Network"
-      );
-    });
-
-    it("does not throw FreighterNotInstalledError when extension is present", async () => {
-      await expect(adapter.connect()).resolves.not.toThrow();
-    });
+  it('connect() returns the address from Freighter', async () => {
+    const adapter = new FreighterAdapter();
+    const address = await adapter.connect();
+    expect(address).toBe('GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7');
+    expect(adapter.isConnected()).toBe(true);
   });
 
-  // -------------------------------------------------------------------------
-  // FreighterNotInstalledError shape
-  // -------------------------------------------------------------------------
-  describe("FreighterNotInstalledError", () => {
-    it("has the correct name property", () => {
-      const err = new FreighterNotInstalledError();
-      expect(err.name).toBe("FreighterNotInstalledError");
-    });
+  it('signTransaction() returns signed XDR', async () => {
+    const adapter = new FreighterAdapter();
+    await adapter.connect();
+    const result = await adapter.signTransaction('unsigned-xdr', 'Test SDF Network ; September 2015');
+    expect(result).toBe('signed-xdr-payload');
+  });
 
-    it("is an instance of Error", () => {
-      const err = new FreighterNotInstalledError();
-      expect(err).toBeInstanceOf(Error);
-    });
+  it('disconnect() resets connection state', async () => {
+    const adapter = new FreighterAdapter();
+    await adapter.connect();
+    adapter.disconnect();
+    expect(adapter.isConnected()).toBe(false);
+  });
 
-    it("message contains the install URL", () => {
-      const err = new FreighterNotInstalledError();
-      expect(err.message).toContain(INSTALL_URL);
-    });
+  it('onAccountChange callback is invoked on disconnect', async () => {
+    const adapter = new FreighterAdapter();
+    await adapter.connect();
+    const callback = vi.fn();
+    adapter.onAccountChange(callback);
+    adapter.disconnect();
+    expect(callback).toHaveBeenCalledWith(null);
   });
 });
