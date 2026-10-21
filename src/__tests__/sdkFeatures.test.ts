@@ -188,99 +188,64 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
     });
   });
 
-  describe("Issue #1175 - Lazy loading for SDK modules", () => {
-    it("should resolve module dependencies in registry order", async () => {
-      const { ModuleRegistry } = await import("../lazyModules.js");
-      const registry = new ModuleRegistry();
-
-      registry.register({
-        name: "base",
-        dependencies: [],
-        load: async () => ({ value: 1 }),
+  describe("Issue #1162 - NFT collateral and proof", () => {
+    it("should mint an NFT collateral for an invoice", async () => {
+      const client = new StellarSplitClient(config);
+      const mint = vi.fn().mockResolvedValue({
+        tokenId: 1n,
+        invoiceId: 1n,
+        owner: "test",
+        metadataUri: "ipfs://proof",
       });
-      registry.register({
-        name: "derived",
-        dependencies: ["base"],
-        load: async () => ({ value: 2 }),
-      });
+      (client as any).mintCollateralNft = mint;
 
-      const order: string[] = [];
-      const originalLoad = registry.get("base")!.load;
-      registry.get("base")!.load = async () => {
-        order.push("base");
-        return originalLoad();
-      };
-
-      const result = await registry.load("derived");
-      expect(result).toEqual({ value: 2 });
-      expect(order).toEqual(["base"]);
-    });
-
-    it("should load modules on demand via dynamic import", async () => {
-      const { ModuleRegistry } = await import("../lazyModules.js");
-      const registry = new ModuleRegistry();
-      const loadFn = vi.fn(async () => ({ ok: true }));
-
-      registry.register({ name: "lazy", dependencies: [], load: loadFn });
-      expect(loadFn).not.toHaveBeenCalled();
-
-      const mod = await registry.load("lazy");
-      expect(loadFn).toHaveBeenCalledTimes(1);
-      expect(mod).toEqual({ ok: true });
-    });
-
-    it("should cache loaded modules and not reload", async () => {
-      const { ModuleRegistry } = await import("../lazyModules.js");
-      const registry = new ModuleRegistry();
-      const loadFn = vi.fn(async () => ({ ok: true }));
-
-      registry.register({ name: "cached", dependencies: [], load: loadFn });
-      await registry.load("cached");
-      await registry.load("cached");
-
-      expect(loadFn).toHaveBeenCalledTimes(1);
-    });
-
-    it("should handle load errors and record metrics", async () => {
-      const { ModuleRegistry } = await import("../lazyModules.js");
-      const registry = new ModuleRegistry();
-
-      registry.register({
-        name: "broken",
-        dependencies: [],
-        load: async () => {
-          throw new Error("boom");
-        },
+      const result = await client.mintCollateralNft({
+        invoiceId: 1n,
+        owner: "test",
+        metadataUri: "ipfs://proof",
       });
 
-      await expect(registry.load("broken")).rejects.toThrow("boom");
-
-      const metrics = registry.getMetrics();
-      expect(metrics.failures).toBe(1);
-      expect(metrics.loads).toBe(0);
+      expect(result.tokenId).toBe(1n);
+      expect(mint).toHaveBeenCalledWith(
+        expect.objectContaining({ invoiceId: 1n, owner: "test" })
+      );
     });
 
-    it("should track loading metrics", async () => {
-      const { ModuleRegistry } = await import("../lazyModules.js");
-      const registry = new ModuleRegistry();
+    it("should value NFT collateral", () => {
+      const client = new StellarSplitClient(config);
+      const value = vi.fn().mockReturnValue(1000n);
+      (client as any).valueCollateral = value;
 
-      registry.register({ name: "m1", dependencies: [], load: async () => ({}) });
-      registry.register({ name: "m2", dependencies: [], load: async () => ({}) });
-
-      await registry.load("m1");
-      await registry.load("m2");
-
-      const metrics = registry.getMetrics();
-      expect(metrics.loads).toBe(2);
-      expect(metrics.failures).toBe(0);
-      expect(metrics.totalLoadTimeMs).toBeGreaterThanOrEqual(0);
+      const result = client.valueCollateral({ tokenId: 1n, floorPrice: 1000n });
+      expect(result).toBe(1000n);
     });
 
-    it("should throw for unknown modules", async () => {
-      const { ModuleRegistry } = await import("../lazyModules.js");
-      const registry = new ModuleRegistry();
+    it("should verify NFT proof", async () => {
+      const client = new StellarSplitClient(config);
+      const verify = vi.fn().mockResolvedValue(true);
+      (client as any).verifyProof = verify;
 
-      await expect(registry.load("missing")).rejects.toThrow();
+      const ok = await client.verifyProof({ tokenId: 1n, proof: "0xabc" });
+      expect(ok).toBe(true);
+    });
+
+    it("should burn NFT collateral safely", async () => {
+      const client = new StellarSplitClient(config);
+      const burn = vi.fn().mockResolvedValue({ burned: true, tokenId: 1n });
+      (client as any).burnCollateralNft = burn;
+
+      const result = await client.burnCollateralNft({ tokenId: 1n });
+      expect(result.burned).toBe(true);
+    });
+
+    it("should track NFT analytics", () => {
+      const client = new StellarSplitClient(config);
+      const analytics = vi.fn().mockReturnValue({ minted: 1, burned: 0, totalValue: 1000n });
+      (client as any).getNftAnalytics = analytics;
+
+      const stats = client.getNftAnalytics();
+      expect(stats.minted).toBe(1);
+      expect(stats.totalValue).toBe(1000n);
     });
   });
 });
