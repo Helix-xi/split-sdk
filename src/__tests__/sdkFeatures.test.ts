@@ -4,6 +4,15 @@ import { TypedEventEmitter } from "../events/TypedEventEmitter.js";
 import { MetricsPlugin, PluginRegistry } from "../plugin.js";
 import { BatchTooLargeError } from "../errors.js";
 import type { CreateInvoiceParams } from "../types.js";
+import {
+  DebugLevel,
+  DebugLogger,
+  DebugBreakpoints,
+  DebugConsole,
+  DebugAnalytics,
+  formatDebugValue,
+  inspectState,
+} from "../debug.js";
 
 describe("SDK Features (#854, #855, #856, #857)", () => {
   // Mock config
