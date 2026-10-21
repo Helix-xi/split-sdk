@@ -65,6 +65,8 @@
     "test:e2e": "vitest run test/e2e",
     "test:watch": "vitest",
     "test:bench": "vitest bench --run",
+    "fuzz": "tsx fuzz/run.ts",
+    "fuzz:ci": "tsx fuzz/run.ts --ci --iterations 5000",
     "lint": "tsc --noEmit",
     "changelog": "vite-node scripts/changelog.ts",
     "docs": "typedoc",
