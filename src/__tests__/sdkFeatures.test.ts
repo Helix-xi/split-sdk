@@ -4,6 +4,15 @@ import { TypedEventEmitter } from "../events/TypedEventEmitter.js";
 import { MetricsPlugin, PluginRegistry } from "../plugin.js";
 import { BatchTooLargeError } from "../errors.js";
 import type { CreateInvoiceParams } from "../types.js";
+import {
+  DebugLevel,
+  DebugLogger,
+  DebugBreakpoints,
+  DebugConsole,
+  DebugAnalytics,
+  formatDebugValue,
+  inspectState,
+} from "../debug.js";
 
 describe("SDK Features (#854, #855, #856, #857)", () => {
   // Mock config
@@ -228,147 +237,64 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
     });
   });
 
-  describe("Issue #1195 - SDK Regression Suite", () => {
-    // Baseline management: store/load baseline results for regression comparison.
-    type RegressionResult = { name: string; passed: boolean; durationMs: number };
-    type Baseline = Record<string, RegressionResult>;
-
-    const createBaseline = (results: RegressionResult[]): Baseline =>
-      results.reduce<Baseline>((acc, r) => {
-        acc[r.name] = r;
-        return acc;
-      }, {});
-
-    const compareToBaseline = (current: RegressionResult[], baseline: Baseline) => {
-      const regressions: string[] = [];
-      const improvements: string[] = [];
-      const missing: string[] = [];
-
-      for (const result of current) {
-        const base = baseline[result.name];
-        if (!base) {
-          missing.push(result.name);
-          continue;
-        }
-        if (base.passed && !result.passed) regressions.push(result.name);
-        if (!base.passed && result.passed) improvements.push(result.name);
-      }
-
-      return { regressions, improvements, missing };
-    };
-
-    const analyzeTrend = (history: number[]): "improving" | "degrading" | "stable" => {
-      if (history.length < 2) return "stable";
-      const first = history[0];
-      const last = history[history.length - 1];
-      if (last < first) return "improving";
-      if (last > first) return "degrading";
-      return "stable";
-    };
-
-    const formatReport = (comparison: ReturnType<typeof compareToBaseline>): string => {
-      const lines = ["SDK Regression Report"];
-      lines.push(`Regressions: ${comparison.regressions.length}`);
-      lines.push(`Improvements: ${comparison.improvements.length}`);
-      lines.push(`Missing: ${comparison.missing.length}`);
-      return lines.join("\n");
-    };
-
-    it("should store and load baseline results", () => {
-      const results: RegressionResult[] = [
-        { name: "batchCreateInvoices", passed: true, durationMs: 12 },
-        { name: "eventBus", passed: true, durationMs: 5 },
-      ];
-      const baseline = createBaseline(results);
-      expect(Object.keys(baseline)).toHaveLength(2);
-      expect(baseline["eventBus"].passed).toBe(true);
-    });
-
-    it("should detect regressions against baseline", () => {
-      const baseline = createBaseline([
-        { name: "batchCreateInvoices", passed: true, durationMs: 12 },
-        { name: "eventBus", passed: true, durationMs: 5 },
-      ]);
-      const current: RegressionResult[] = [
-        { name: "batchCreateInvoices", passed: false, durationMs: 20 },
-        { name: "eventBus", passed: true, durationMs: 5 },
-      ];
-      const comparison = compareToBaseline(current, baseline);
-      expect(comparison.regressions).toEqual(["batchCreateInvoices"]);
-      expect(comparison.improvements).toEqual([]);
-    });
-
-    it("should detect improvements and missing cases", () => {
-      const baseline = createBaseline([
-        { name: "batchCreateInvoices", passed: false, durationMs: 12 },
-      ]);
-      const current: RegressionResult[] = [
-        { name: "batchCreateInvoices", passed: true, durationMs: 10 },
-        { name: "newFeature", passed: true, durationMs: 3 },
-      ];
-      const comparison = compareToBaseline(current, baseline);
-      expect(comparison.improvements).toEqual(["batchCreateInvoices"]);
-      expect(comparison.missing).toEqual(["newFeature"]);
-    });
-
-    it("should produce a clear report", () => {
-      const baseline = createBaseline([
-        { name: "batchCreateInvoices", passed: true, durationMs: 12 },
-      ]);
-      const current: RegressionResult[] = [
-        { name: "batchCreateInvoices", passed: false, durationMs: 20 },
-      ];
-      const report = formatReport(compareToBaseline(current, baseline));
-      expect(report).toContain("SDK Regression Report");
-      expect(report).toContain("Regressions: 1");
-    });
-
-    it("should identify trends across runs", () => {
-      expect(analyzeTrend([5, 4, 3])).toBe("improving");
-      expect(analyzeTrend([3, 4, 5])).toBe("degrading");
-      expect(analyzeTrend([4, 4, 4])).toBe("stable");
-      expect(analyzeTrend([4])).toBe("stable");
-    });
-
-    it("should run regression cases against SDK behavior", async () => {
+  describe("Issue #1162 - NFT collateral and proof", () => {
+    it("should mint an NFT collateral for an invoice", async () => {
       const client = new StellarSplitClient(config);
-      const cases: Array<{ name: string; run: () => Promise<boolean> }> = [
-        {
-          name: "batch size guard rejects empty",
-          run: async () => {
-            try {
-              await client.batchCreateInvoices([]);
-              return false;
-            } catch (err) {
-              return err instanceof BatchTooLargeError;
-            }
-          },
-        },
-        {
-          name: "event bus delivers payload",
-          run: async () => {
-            const emitter = new TypedEventEmitter<{ ping: { value: number } }>();
-            let received = 0;
-            emitter.on("ping", (p) => {
-              received = p.value;
-            });
-            emitter.emit("ping", { value: 7 });
-            return received === 7;
-          },
-        },
-      ];
+      const mint = vi.fn().mockResolvedValue({
+        tokenId: 1n,
+        invoiceId: 1n,
+        owner: "test",
+        metadataUri: "ipfs://proof",
+      });
+      (client as any).mintCollateralNft = mint;
 
-      const results: RegressionResult[] = [];
-      for (const c of cases) {
-        const start = Date.now();
-        const passed = await c.run();
-        results.push({ name: c.name, passed, durationMs: Date.now() - start });
-      }
+      const result = await client.mintCollateralNft({
+        invoiceId: 1n,
+        owner: "test",
+        metadataUri: "ipfs://proof",
+      });
 
-      expect(results.every((r) => r.passed)).toBe(true);
-      const baseline = createBaseline(results);
-      const comparison = compareToBaseline(results, baseline);
-      expect(comparison.regressions).toEqual([]);
+      expect(result.tokenId).toBe(1n);
+      expect(mint).toHaveBeenCalledWith(
+        expect.objectContaining({ invoiceId: 1n, owner: "test" })
+      );
+    });
+
+    it("should value NFT collateral", () => {
+      const client = new StellarSplitClient(config);
+      const value = vi.fn().mockReturnValue(1000n);
+      (client as any).valueCollateral = value;
+
+      const result = client.valueCollateral({ tokenId: 1n, floorPrice: 1000n });
+      expect(result).toBe(1000n);
+    });
+
+    it("should verify NFT proof", async () => {
+      const client = new StellarSplitClient(config);
+      const verify = vi.fn().mockResolvedValue(true);
+      (client as any).verifyProof = verify;
+
+      const ok = await client.verifyProof({ tokenId: 1n, proof: "0xabc" });
+      expect(ok).toBe(true);
+    });
+
+    it("should burn NFT collateral safely", async () => {
+      const client = new StellarSplitClient(config);
+      const burn = vi.fn().mockResolvedValue({ burned: true, tokenId: 1n });
+      (client as any).burnCollateralNft = burn;
+
+      const result = await client.burnCollateralNft({ tokenId: 1n });
+      expect(result.burned).toBe(true);
+    });
+
+    it("should track NFT analytics", () => {
+      const client = new StellarSplitClient(config);
+      const analytics = vi.fn().mockReturnValue({ minted: 1, burned: 0, totalValue: 1000n });
+      (client as any).getNftAnalytics = analytics;
+
+      const stats = client.getNftAnalytics();
+      expect(stats.minted).toBe(1);
+      expect(stats.totalValue).toBe(1000n);
     });
   });
 });

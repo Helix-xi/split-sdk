@@ -1,5 +1,6 @@
 import {
   Account,
+  Address,
   Contract,
   Operation,
   TransactionBuilder,

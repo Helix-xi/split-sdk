@@ -9,6 +9,8 @@ export interface ConfigValidationErrorType {
   severity: "error" | "warning";
 }
 
+export type ConfigValidationErrorType = ConfigValidationIssue;
+
 export interface ConfigValidation {
   valid: boolean;
   errors: ConfigValidationErrorType[];

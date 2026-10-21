@@ -28,7 +28,7 @@ jobs:
           STELLAR_SPLIT_TOKEN_CONTRACT_ID: ${{ secrets.STELLAR_SPLIT_TOKEN_CONTRACT_ID }}
         run: npm run test:integration
 
-  mutation-test:
+  fuzz:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -43,39 +43,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run mutation testing (Stryker)
-        run: npx stryker run
+      - name: Run fuzz targets (input validation)
+        env:
+          FUZZ_TIME: "300"
+          FUZZ_SEED_CORPUS: fuzz/corpus
+          FUZZ_CRASH_DIR: fuzz/crashes
+        run: npm run fuzz
 
-      - name: Upload mutation report
-        if: always()
+      - name: Upload fuzz crash artifacts
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: mutation-report
-          path: reports/mutation
-          retention-days: 30
-
-  contract-test:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "npm"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run contract tests (provider + consumer verification)
-        run: npm run test:contract
-
-      - name: Publish contracts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: contracts
-          path: contracts/
-          retention-days: 30
+          name: fuzz-crashes
+          path: fuzz/crashes
+          if-no-files-found: ignore

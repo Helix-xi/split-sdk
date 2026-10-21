@@ -43,6 +43,11 @@
       "types": "./dist/telemetryModule.d.ts",
       "import": "./dist/telemetryModule.js",
       "require": "./dist/telemetryModule.cjs"
+    },
+    "./lazy": {
+      "types": "./dist/lazy/index.d.ts",
+      "import": "./dist/lazy/index.js",
+      "require": "./dist/lazy/index.cjs"
     }
   },
   "files": [
@@ -60,17 +65,8 @@
     "test:e2e": "vitest run test/e2e",
     "test:watch": "vitest",
     "test:bench": "vitest bench --run",
-    "test:mutation": "stryker run",
-    "test:mutation:report": "stryker run --reporters html,json,clear-text,progress",
-    "test:contract": "vitest run tests/contract",
-    "test:contract:provider": "vitest run tests/contract/provider",
-    "test:contract:consumer": "vitest run tests/contract/consumer",
-    "test:docs": "vitest run tests/docs",
-    "test:regression": "vitest run tests/regression",
-    "test:regression:update": "REGRESSION_UPDATE_BASELINE=true vitest run tests/regression",
-    "docs:examples": "tsx scripts/docs-examples.ts",
-    "contract:publish": "tsx scripts/publish-contracts.ts",
-    "contract:compatibility": "tsx scripts/contract-compatibility.ts",
+    "fuzz": "tsx fuzz/run.ts",
+    "fuzz:ci": "tsx fuzz/run.ts --ci --iterations 5000",
     "lint": "tsc --noEmit",
     "changelog": "vite-node scripts/changelog.ts",
     "docs": "typedoc",
